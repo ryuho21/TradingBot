@@ -93,10 +93,23 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 log = logging.getLogger("bridge_interface")
 
+
+
+# ── Safe env parsing ──────────────────────────────────────────────────────────
+def _env_int(key: str, default: int) -> int:
+    raw = os.environ.get(key, "")
+    if raw is None or raw == "":
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        log.warning("Invalid int for %s=%r; using default=%s", key, raw, default)
+        return int(default)
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 BRIDGE_HOST            = "127.0.0.1"
-BRIDGE_PORT            = int(os.environ.get("BRIDGE_PORT", "7878"))
+BRIDGE_PORT = _env_int("BRIDGE_PORT", 7878)
 BRIDGE_BINARY_NAME     = "okx_bridge"
 BRIDGE_RECONNECT_DELAY = 2.0      # seconds between reconnect attempts
 BRIDGE_CONNECT_TIMEOUT = 10.0     # seconds to wait for connection
@@ -142,6 +155,10 @@ class BridgeClient:
 
         # Event handler registry:  event_name → list of async callbacks
         self._handlers: Dict[str, List[EventHandler]] = defaultdict(list)
+
+        # Shared-state lock (equity cache + pending map).  Required because
+        # handlers may read cached state concurrently with the read loop.
+        self._state_lock = asyncio.Lock()
 
         # Cached equity state — updated on every account_update / ghost_healed event
         self._equity: float            = 0.0
@@ -240,47 +257,66 @@ class BridgeClient:
             log.warning("[BRIDGE] Read error: %s", e)
             self._connected = False
 
-    async def _dispatch(self, msg: Dict[str, Any]) -> None:
-        """Route an inbound bridge event to registered handlers and update cache."""
-        event = msg.get("event", "")
+async def _dispatch(self, msg: Dict[str, Any]) -> None:
+    """Route an inbound bridge event to registered handlers and update cache."""
+    event = msg.get("event", "")
 
-        # ── Built-in cache updates ────────────────────────────────────────────
-        if event == "account_update":
-            self._equity          = float(msg.get("eq", self._equity))
-            self._equity_is_ghost = bool(msg.get("is_ghost", False))
-            self._ghost_count     = int(msg.get("ghost_count", 0))
+    # ── Built-in cache updates + pending-map resolution (locked) ───────────
+    async with self._state_lock:
+        try:
+            if event == "account_update":
+                try:
+                    self._equity = float(msg.get("eq", self._equity))
+                except Exception as exc:
+                    log.warning("[BRIDGE] account_update eq parse error: %s", exc)
+                try:
+                    self._equity_is_ghost = bool(msg.get("is_ghost", False))
+                except Exception:
+                    self._equity_is_ghost = False
+                try:
+                    self._ghost_count = int(msg.get("ghost_count", 0))
+                except Exception:
+                    self._ghost_count = 0
 
-        elif event == "ghost_healed":
-            raw = float(msg.get("raw_ws_eq", 0.0))
-            healed = float(msg.get("healed_eq", 0.0))
-            source = msg.get("source", "unknown")
-            log.warning(
-                "[GHOST-HEALED] raw_ws_eq=%.4f healed_eq=%.4f source=%s ghost_count=%d",
-                raw, healed, source, msg.get("ghost_count", 0),
-            )
-            self._equity          = healed
-            self._equity_is_ghost = False
-            self._ghost_count     = 0
+            elif event == "ghost_healed":
+                try:
+                    raw = float(msg.get("raw_ws_eq", 0.0))
+                except Exception:
+                    raw = 0.0
+                try:
+                    healed = float(msg.get("healed_eq", 0.0))
+                except Exception:
+                    healed = 0.0
+                source = msg.get("source", "unknown")
+                log.warning(
+                    "[GHOST-HEALED] raw_ws_eq=%.4f healed_eq=%.4f source=%s ghost_count=%d",
+                    raw, healed, source, msg.get("ghost_count", 0),
+                )
+                self._equity = healed
+                self._equity_is_ghost = False
+                self._ghost_count = 0
 
-        elif event == "equity_breach":
-            log.critical(
-                "[EQUITY-BREACH] Bridge confirmed $0.00 equity: %s",
-                msg.get("message", ""),
-            )
+            elif event == "equity_breach":
+                log.critical(
+                    "[EQUITY-BREACH] Bridge confirmed $0.00 equity: %s",
+                    msg.get("message", ""),
+                )
 
-        elif event == "bridge_ready":
-            log.info(
-                "[BRIDGE] Bridge ready — version=%s demo_mode=%s ws_url=%s",
-                msg.get("version"), msg.get("demo_mode"), msg.get("ws_url"),
-            )
+            elif event == "bridge_ready":
+                log.info(
+                    "[BRIDGE] Bridge ready — version=%s demo_mode=%s ws_url=%s",
+                    msg.get("version"), msg.get("demo_mode"), msg.get("ws_url"),
+                )
 
-        elif event == "bridge_error":
-            log.error(
-                "[BRIDGE-ERROR] code=%s message=%s",
-                msg.get("code"), msg.get("message"),
-            )
+            elif event == "bridge_error":
+                log.error(
+                    "[BRIDGE-ERROR] code=%s message=%s",
+                    msg.get("code"), msg.get("message"),
+                )
+        except Exception as exc:
+            log.warning("[BRIDGE] _dispatch cache update error: %s", exc)
 
-        # ── Resolve pending request/response futures ──────────────────────────
+        # ── Resolve pending request/response futures ──────────────────────
         req_id = msg.get("request_id")
         if req_id and req_id in self._pending:
             fut = self._pending.pop(req_id)
@@ -292,15 +328,15 @@ class BridgeClient:
                 else:
                     fut.set_result(msg)
 
-        # ── Registered handlers ───────────────────────────────────────────────
-        for handler in self._handlers.get(event, []):
-            try:
-                if asyncio.iscoroutinefunction(handler):
-                    await handler(msg)
-                else:
-                    handler(msg)
-            except Exception as e:
-                log.exception("[BRIDGE] Handler error for event '%s': %s", event, e)
+    # ── Registered handlers (outside lock) ────────────────────────────────
+    for handler in self._handlers.get(event, []):
+        try:
+            if asyncio.iscoroutinefunction(handler):
+                await handler(msg)
+            else:
+                handler(msg)
+        except Exception as e:
+            log.exception("[BRIDGE] Handler error for event '%s': %s", event, e)
 
     # ── Event subscription ─────────────────────────────────────────────────────
 

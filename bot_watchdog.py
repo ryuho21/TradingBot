@@ -1,5 +1,5 @@
 """
-watchdog.py  —  Phase 30.5 Titan Upgrade: Stale-Data Integrity Monitor
+bot_watchdog.py  —  Phase 30.5 Titan Upgrade: Stale-Data Integrity Monitor
 
 [P30.5-WD] Monitors main.py and automatically restarts it if it exits with
         a non-zero return code or crashes unexpectedly.
@@ -33,8 +33,8 @@ Environment variables
 
 Usage
 -----
-  python watchdog.py [args forwarded to main.py]
-  python watchdog.py --no-p18 --coins BTC ETH
+  python bot_watchdog.py [args forwarded to main.py]
+  python bot_watchdog.py --no-p18 --coins BTC ETH
 """
 from __future__ import annotations
 
@@ -46,14 +46,30 @@ import sys
 import time
 from typing import List, Optional
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        return float(raw)
+    except Exception:
+        logging.getLogger("watchdog").warning("Invalid %s=%r; using %s", name, raw, default)
+        return float(default)
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        return int(raw)
+    except Exception:
+        logging.getLogger("watchdog").warning("Invalid %s=%r; using %s", name, raw, default)
+        return int(default)
+
 # ── Config ─────────────────────────────────────────────────────────────────────
-RESTART_DELAY_SECS           = float(os.environ.get("WATCHDOG_RESTART_DELAY_SECS",        "5.0"))
-MAX_CONSECUTIVE_FAILURES     = int  (os.environ.get("WATCHDOG_MAX_CONSECUTIVE_FAILURES",   "10"))
-MIN_UPTIME_SECS              = float(os.environ.get("WATCHDOG_MIN_UPTIME_SECS",            "30.0"))
+RESTART_DELAY_SECS           = _env_float("WATCHDOG_RESTART_DELAY_SECS", 5.0)
+MAX_CONSECUTIVE_FAILURES     = _env_int("WATCHDOG_MAX_CONSECUTIVE_FAILURES", 10)
+MIN_UPTIME_SECS              = _env_float("WATCHDOG_MIN_UPTIME_SECS", 30.0)
 WATCHDOG_LOG_PATH            = os.environ.get("WATCHDOG_LOG_PATH", "watchdog.log")
 # [P30.5-STALE] Stale data detection — how long without a status file update
 # before the watchdog considers the child deadlocked and forces SIGTERM.
-STALE_DATA_TIMEOUT_SECS      = float(os.environ.get("WATCHDOG_STALE_DATA_TIMEOUT_SECS",  "120.0"))
+STALE_DATA_TIMEOUT_SECS      = _env_float("STALE_DATA_TIMEOUT_SECS", _env_float("WATCHDOG_STALE_DATA_TIMEOUT_SECS", 120.0))
 _SCRIPT_DIR                  = os.path.dirname(os.path.abspath(__file__))
 TRADER_STATUS_PATH           = os.environ.get(
     "WATCHDOG_STATUS_PATH",

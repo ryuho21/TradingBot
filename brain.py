@@ -63,15 +63,58 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import math
 import os
 import pickle
 import time
+from decimal import Decimal, getcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+getcontext().prec = 8
+
 log = logging.getLogger("brain")
+
+
+
+# ── Safe env parsing ──────────────────────────────────────────────────────────
+def _env_float(key: str, default: float) -> float:
+    """Parse float env var safely; fall back to default on bad values."""
+    raw = os.environ.get(key, "")
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        log.warning("Invalid float for %s=%r; using default=%s", key, raw, default)
+        return float(default)
+
+def _env_int(key: str, default: int) -> int:
+    """Parse int env var safely; fall back to default on bad values."""
+    raw = os.environ.get(key, "")
+    if raw is None or raw == "":
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        log.warning("Invalid int for %s=%r; using default=%s", key, raw, default)
+        return int(default)
+
+
+
+def _D(val) -> Decimal:
+    try:
+        if isinstance(val, Decimal):
+            return val
+        if val is None:
+            return Decimal("0")
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return Decimal("0")
+        return Decimal(str(val))
+    except Exception:
+        return Decimal("0")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [P27-OKX] OKX Gateway Post Adapter
@@ -223,59 +266,59 @@ BRAIN_STATE_PATH = os.environ.get(
 )
 
 # ── Sniper config ──────────────────────────────────────────────────────────────
-SNIPER_CONFIDENCE_THRESHOLD = float(os.environ.get("SNIPER_CONFIDENCE_THRESHOLD", "0.80"))
-SNIPER_MIN_MULTIPLIER       = float(os.environ.get("SNIPER_MIN_MULTIPLIER",       "1.5"))
-SNIPER_MAX_MULTIPLIER       = float(os.environ.get("SNIPER_MAX_MULTIPLIER",       "2.0"))
-MAX_ALLOC_PCT               = float(os.environ.get("MAX_ALLOC_PCT",               "0.20"))
+SNIPER_CONFIDENCE_THRESHOLD = _env_float("SNIPER_CONFIDENCE_THRESHOLD", 0.8)
+SNIPER_MIN_MULTIPLIER       = _env_float("SNIPER_MIN_MULTIPLIER", 1.5)
+SNIPER_MAX_MULTIPLIER       = _env_float("SNIPER_MAX_MULTIPLIER", 2.0)
+MAX_ALLOC_PCT               = _env_float("MAX_ALLOC_PCT", 0.2)
 
 # ── [P6-RL] RL config ─────────────────────────────────────────────────────────
-RL_LEARN_RATE = float(os.environ.get("RL_LEARN_RATE", "0.05"))
-RL_MAX_MULT   = float(os.environ.get("RL_MAX_MULT",   "2.0"))
-RL_MIN_MULT   = float(os.environ.get("RL_MIN_MULT",   "0.3"))
-RL_MIN_TRADES = int  (os.environ.get("RL_MIN_TRADES", "3"))
+RL_LEARN_RATE = _env_float("RL_LEARN_RATE", 0.05)
+RL_MAX_MULT   = _env_float("RL_MAX_MULT", 2.0)
+RL_MIN_MULT   = _env_float("RL_MIN_MULT", 0.3)
+RL_MIN_TRADES = _env_int("RL_MIN_TRADES", 3)
 _REGIMES      = ("bull", "bear", "chop")
 
 # ── [P13] Bayesian config ──────────────────────────────────────────────────────
-P13_TRUST_CIRCUIT_BREAKER = float(os.environ.get("P13_TRUST_CIRCUIT_BREAKER", "0.35"))
-P13_TRUST_MIN_SAMPLES     = int  (os.environ.get("P13_TRUST_MIN_SAMPLES",     "5"))
-P13_TRUST_PRIOR_ALPHA     = float(os.environ.get("P13_TRUST_PRIOR_ALPHA",     "2.0"))
-P13_TRUST_PRIOR_BETA      = float(os.environ.get("P13_TRUST_PRIOR_BETA",      "2.0"))
+P13_TRUST_CIRCUIT_BREAKER = _env_float("P13_TRUST_CIRCUIT_BREAKER", 0.35)
+P13_TRUST_MIN_SAMPLES     = _env_int("P13_TRUST_MIN_SAMPLES", 5)
+P13_TRUST_PRIOR_ALPHA     = _env_float("P13_TRUST_PRIOR_ALPHA", 2.0)
+P13_TRUST_PRIOR_BETA      = _env_float("P13_TRUST_PRIOR_BETA", 2.0)
 # [P26-VELOCITY] Number of early samples that receive a boosted update weight
 # so the trust factor moves away from the 0.5 neutral zone faster.
-P13_TRUST_VELOCITY_SAMPLES = int  (os.environ.get("P13_TRUST_VELOCITY_SAMPLES", "5"))
-P13_TRUST_VELOCITY_WEIGHT  = float(os.environ.get("P13_TRUST_VELOCITY_WEIGHT",  "2.0"))
+P13_TRUST_VELOCITY_SAMPLES = _env_int("P13_TRUST_VELOCITY_SAMPLES", 5)
+P13_TRUST_VELOCITY_WEIGHT  = _env_float("P13_TRUST_VELOCITY_WEIGHT", 2.0)
 
 # ── [P26] Slippage Circuit Breaker config ────────────────────────────────────
-P26_SLIP_GUARD_BPS    = float(os.environ.get("P26_SLIP_GUARD_BPS",    "500.0"))
-P26_BBO_CLAMP_BPS     = float(os.environ.get("P26_BBO_CLAMP_BPS",     "1.0"))
-P26_SLIP_WINDOW       = int  (os.environ.get("P26_SLIP_WINDOW",        "20"))
+P26_SLIP_GUARD_BPS    = _env_float("P26_SLIP_GUARD_BPS", 500.0)
+P26_BBO_CLAMP_BPS     = _env_float("P26_BBO_CLAMP_BPS", 1.0)
+P26_SLIP_WINDOW       = _env_int("P26_SLIP_WINDOW", 20)
 
 # ── [P14] Meta-Optimizer config ────────────────────────────────────────────────
-P14_CONVICTION_BOOST       = float(os.environ.get("P14_CONVICTION_BOOST",      "1.2"))
-P14_CONVICTION_PENALTY     = float(os.environ.get("P14_CONVICTION_PENALTY",    "0.5"))
-P14_EMA_FAST               = int  (os.environ.get("P14_EMA_FAST",              "20"))
-P14_EMA_SLOW               = int  (os.environ.get("P14_EMA_SLOW",              "50"))
-P14_RSI_PERIOD             = int  (os.environ.get("P14_RSI_PERIOD",            "14"))
-P14_RSI_OVERBOUGHT         = float(os.environ.get("P14_RSI_OVERBOUGHT",        "65.0"))
-P14_RSI_OVERSOLD           = float(os.environ.get("P14_RSI_OVERSOLD",          "35.0"))
-P14_ATR_PERIOD             = int  (os.environ.get("P14_ATR_PERIOD",            "14"))
-P14_PRUNE_INTERVAL_SECS    = float(os.environ.get("P14_PRUNE_INTERVAL_SECS",   str(6 * 3600)))
-P14_PRUNE_WEIGHT_THRESHOLD = float(os.environ.get("P14_PRUNE_WEIGHT_THRESHOLD","0.20"))
-P14_PRUNE_MAX_PATTERNS     = int  (os.environ.get("P14_PRUNE_MAX_PATTERNS",    "5000"))
+P14_CONVICTION_BOOST       = _env_float("P14_CONVICTION_BOOST", 1.2)
+P14_CONVICTION_PENALTY     = _env_float("P14_CONVICTION_PENALTY", 0.5)
+P14_EMA_FAST               = _env_int("P14_EMA_FAST", 20)
+P14_EMA_SLOW               = _env_int("P14_EMA_SLOW", 50)
+P14_RSI_PERIOD             = _env_int("P14_RSI_PERIOD", 14)
+P14_RSI_OVERBOUGHT         = _env_float("P14_RSI_OVERBOUGHT", 65.0)
+P14_RSI_OVERSOLD           = _env_float("P14_RSI_OVERSOLD", 35.0)
+P14_ATR_PERIOD             = _env_int("P14_ATR_PERIOD", 14)
+P14_PRUNE_INTERVAL_SECS    = _env_float("P14_PRUNE_INTERVAL_SECS", str(6 * 3600))
+P14_PRUNE_WEIGHT_THRESHOLD = _env_float("P14_PRUNE_WEIGHT_THRESHOLD", 0.2)
+P14_PRUNE_MAX_PATTERNS     = _env_int("P14_PRUNE_MAX_PATTERNS", 5000)
 
 # ── [P15-2] Oracle conviction config ──────────────────────────────────────────
-P15_ORACLE_BOOST          = float(os.environ.get("P15_ORACLE_BOOST",         "1.5"))
-P15_ORACLE_PENALTY        = float(os.environ.get("P15_ORACLE_PENALTY",       "0.6"))
-P15_ORACLE_MIN_WHALE_MULT = float(os.environ.get("P15_ORACLE_MIN_WHALE_MULT","10.0"))
+P15_ORACLE_BOOST          = _env_float("P15_ORACLE_BOOST", 1.5)
+P15_ORACLE_PENALTY        = _env_float("P15_ORACLE_PENALTY", 0.6)
+P15_ORACLE_MIN_WHALE_MULT = _env_float("P15_ORACLE_MIN_WHALE_MULT", 10.0)
 
 _P15_SOFT_PENALTY_FACTOR = 0.5
 
 # ── [P20-3] Walk-Forward Shadow Training config ────────────────────────────────
-P20_SHADOW_INTERVAL_SECS  = float(os.environ.get("P20_SHADOW_INTERVAL_SECS",  str(24 * 3600)))
-P20_SHADOW_LOOKBACK_HOURS = int  (os.environ.get("P20_SHADOW_LOOKBACK_HOURS", "48"))
-P20_SHADOW_SWAP_THRESHOLD = float(os.environ.get("P20_SHADOW_SWAP_THRESHOLD", "1.10"))
+P20_SHADOW_INTERVAL_SECS  = _env_float("P20_SHADOW_INTERVAL_SECS", str(24 * 3600))
+P20_SHADOW_LOOKBACK_HOURS = _env_int("P20_SHADOW_LOOKBACK_HOURS", 48)
+P20_SHADOW_SWAP_THRESHOLD = _env_float("P20_SHADOW_SWAP_THRESHOLD", 1.1)
 P20_SHADOW_AUTO_SWAP      = os.environ.get("P20_SHADOW_AUTO_SWAP", "0").strip() == "1"
-P20_SHADOW_MIN_OBS        = int  (os.environ.get("P20_SHADOW_MIN_OBS",        "60"))
+P20_SHADOW_MIN_OBS        = _env_int("P20_SHADOW_MIN_OBS", 60)
 
 # ── Regime modifiers ───────────────────────────────────────────────────────────
 _REGIME_KELLY_MODIFIER: Dict[str, float] = {
@@ -802,9 +845,9 @@ class SlippagePerSymbolTracker:
 
     # These defaults mirror the P32 env vars parsed in executor.py so the
     # tracker can be used standalone (e.g. in unit tests) without the executor.
-    WINDOW_TRADES: int   = int  (os.environ.get("P32_SLIP_WINDOW_TRADES", "3"))
-    LIMIT_BPS:     float = float(os.environ.get("P32_SLIP_LIMIT_BPS",     "10.0"))
-    LIMIT_HOURS:   float = float(os.environ.get("P32_SLIP_LIMIT_HOURS",   "4.0"))
+    WINDOW_TRADES: int   = _env_int("P32_SLIP_WINDOW_TRADES", 3)
+    LIMIT_BPS:     float = _env_float("P32_SLIP_LIMIT_BPS", 10.0)
+    LIMIT_HOURS:   float = _env_float("P32_SLIP_LIMIT_HOURS", 4.0)
 
     def __init__(self) -> None:
         self._slip_history:    Dict[str, object] = {}  # symbol → collections.deque
@@ -2272,7 +2315,7 @@ class IntelligenceEngine:
     ) -> bool:
         if cost_basis <= 0 or len(price_history) < 10:
             return False
-        pnl_pct  = (current_price - cost_basis) / cost_basis * 100
+        pnl_pct  = float((_D(current_price) - _D(cost_basis)) / _D(cost_basis) * Decimal("100"))
         hist_pnl = (price_history - cost_basis) / cost_basis * 100
         z        = _z_score(pnl_pct, hist_pnl)
         if z <= threshold:

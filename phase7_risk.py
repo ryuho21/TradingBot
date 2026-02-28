@@ -53,9 +53,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
+from decimal import Decimal, getcontext, InvalidOperation
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -66,24 +68,65 @@ except ImportError:
     AsyncOpenAI = None                    # type: ignore[assignment,misc]
     _OPENAI_SDK_AVAILABLE = False
 
+getcontext().prec = 8
+
 log = logging.getLogger("phase7_risk")
+
+def _env_float(key: str, default: float) -> float:
+    """Parse float env var safely; fall back to default on missing/invalid."""
+    raw = os.environ.get(key, None)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        logging.getLogger(__name__).warning("Invalid %s=%r; using default %s", key, raw, default)
+        return float(default)
+
+def _env_int(key: str, default: int) -> int:
+    """Parse int env var safely; fall back to default on missing/invalid."""
+    raw = os.environ.get(key, None)
+    if raw is None or raw == "":
+        return int(default)
+    try:
+        return int(float(raw))
+    except Exception:
+        logging.getLogger(__name__).warning("Invalid %s=%r; using default %s", key, raw, default)
+        return int(default)
+
+
+
+def _D(val) -> Decimal:
+    """Coerce val into Decimal safely for financial math."""
+    try:
+        if isinstance(val, Decimal):
+            return val
+        if val is None:
+            return Decimal("0")
+        # reject NaN
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return Decimal("0")
+        return Decimal(str(val))
+    except Exception:
+        return Decimal("0")
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-CB_HOURLY_DRAWDOWN_PCT  = float(os.environ.get("P7_CB_HOURLY_DRAWDOWN_PCT",  "5.0"))
-CB_MONITOR_INTERVAL     = float(os.environ.get("P7_CB_MONITOR_INTERVAL",    "15.0"))
-CB_LOOKBACK_SECS        = float(os.environ.get("P7_CB_LOOKBACK_SECS",      "3600.0"))
-CB_RESET_AFTER_SECS     = float(os.environ.get("P7_CB_RESET_AFTER_SECS",   "1800.0"))
+CB_HOURLY_DRAWDOWN_PCT  = _env_float("P7_CB_HOURLY_DRAWDOWN_PCT", 5.0)
+CB_MONITOR_INTERVAL     = _env_float("P7_CB_MONITOR_INTERVAL", 15.0)
+CB_LOOKBACK_SECS        = _env_float("P7_CB_LOOKBACK_SECS", 3600.0)
+CB_RESET_AFTER_SECS     = _env_float("P7_CB_RESET_AFTER_SECS", 1800.0)
 
-CB_MIN_VALID_EQUITY     = float(os.environ.get("P7_CB_MIN_VALID_EQUITY",    "10.0"))
-CB_MAX_SINGLE_DROP_PCT  = float(os.environ.get("P7_CB_MAX_SINGLE_DROP_PCT", "50.0"))
-CB_GRACE_SECS           = float(os.environ.get("P7_CB_GRACE_SECS",          "60.0"))
+CB_MIN_VALID_EQUITY     = _env_float("P7_CB_MIN_VALID_EQUITY", 10.0)
+CB_MAX_SINGLE_DROP_PCT  = _env_float("P7_CB_MAX_SINGLE_DROP_PCT", 50.0)
+CB_GRACE_SECS           = _env_float("P7_CB_GRACE_SECS", 60.0)
 
-KELLY_BULL_THRESHOLD  = float(os.environ.get("P7_KELLY_BULL_THRESHOLD",  "0.3"))
-KELLY_BEAR_THRESHOLD  = float(os.environ.get("P7_KELLY_BEAR_THRESHOLD", "-0.3"))
-KELLY_BULL_MULTIPLIER = float(os.environ.get("P7_KELLY_BULL_MULTIPLIER", "1.40"))
-KELLY_BEAR_FLOOR      = float(os.environ.get("P7_KELLY_BEAR_FLOOR",      "0.50"))
-KELLY_PANIC_BLOCK     = float(os.environ.get("P7_KELLY_PANIC_BLOCK",    "-0.50"))
+KELLY_BULL_THRESHOLD  = _env_float("P7_KELLY_BULL_THRESHOLD", 0.3)
+KELLY_BEAR_THRESHOLD  = _env_float("P7_KELLY_BEAR_THRESHOLD", -0.3)
+KELLY_BULL_MULTIPLIER = _env_float("P7_KELLY_BULL_MULTIPLIER", 1.4)
+KELLY_BEAR_FLOOR      = _env_float("P7_KELLY_BEAR_FLOOR", 0.5)
+KELLY_PANIC_BLOCK     = _env_float("P7_KELLY_PANIC_BLOCK", -0.5)
 
 OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get(
@@ -93,9 +136,9 @@ OPENROUTER_MODEL    = os.environ.get(
     "OPENROUTER_MODEL",
     "google/gemini-2.0-flash-lite-preview-02-05:free",
 )
-OPENROUTER_TIMEOUT   = float(os.environ.get("OPENROUTER_TIMEOUT",   "8.0"))
-OPENROUTER_CACHE_TTL = float(os.environ.get("OPENROUTER_CACHE_TTL", "60.0"))
-KELLY_NW_CACHE_TTL   = float(os.environ.get("P7_KELLY_NW_CACHE_TTL", "30.0"))
+OPENROUTER_TIMEOUT   = _env_float("OPENROUTER_TIMEOUT", 8.0)
+OPENROUTER_CACHE_TTL = _env_float("OPENROUTER_CACHE_TTL", 60.0)
+KELLY_NW_CACHE_TTL   = _env_float("P7_KELLY_NW_CACHE_TTL", 30.0)
 
 # Minimum equity value that is considered a "real" reading for HWM purposes.
 # Anything at or below this is treated as an uninitialised/transient value and
@@ -319,7 +362,7 @@ class CircuitBreaker:
                 and isinstance(latest_eq, float)
                 and prev_eq > 0.0
             ):
-                single_drop_pct = (prev_eq - latest_eq) / prev_eq * 100.0
+                single_drop_pct = float((_D(prev_eq) - _D(latest_eq)) / _D(prev_eq) * Decimal("100")) if _D(prev_eq) > 0 else 0.0
                 if single_drop_pct > CB_MAX_SINGLE_DROP_PCT:
                     log.warning(
                         "[P7] CircuitBreaker: single-sample drop %.2f%% "
@@ -360,7 +403,7 @@ class CircuitBreaker:
             )
             return 0.0
 
-        drawdown_pct = (peak - latest) / peak * 100.0
+        drawdown_pct = float((_D(peak) - _D(latest)) / _D(peak) * Decimal("100")) if _D(peak) > 0 else 0.0
 
         # ── Update live metrics under lock ───────────────────────────────────
         # [FIX-LOCK-REENTRANT] Capture state into locals, then drop the lock
@@ -750,7 +793,7 @@ class KellySizer:
             )
             return 0.0
 
-        adjusted = max(float(min_alloc), min(float(base_kelly) * multiplier, float(max_alloc)))
+        adjusted = float(max(_D(min_alloc), min(_D(base_kelly) * _D(multiplier), _D(max_alloc))))
         log.debug(
             "[P7] KellySizer — score=%.4f  mult=%.4f  "
             "base=%.4f → adj=%.6f  (min=%.4f  max=%.4f  equity=$%.2f  src=%s)",
@@ -773,7 +816,7 @@ class KellySizer:
             adjusted = 0.0
             label    = "🚫 PANIC BLOCK"
         else:
-            adjusted = max(float(min_alloc), min(float(base_kelly) * multiplier, float(max_alloc)))
+            adjusted = float(max(_D(min_alloc), min(_D(base_kelly) * _D(multiplier), _D(max_alloc))))
             if multiplier >= KELLY_BULL_MULTIPLIER:
                 label = "🚀 Bullish Boost"
             elif multiplier <= KELLY_BEAR_FLOOR:

@@ -209,6 +209,8 @@ import json
 import logging
 import math
 import os
+from decimal import Decimal, getcontext
+
 import time
 import types
 import uuid
@@ -252,7 +254,62 @@ if not os.path.exists(hub_path):
     os.makedirs(hub_path)
     print(f"Created missing directory: {hub_path}")
 
+getcontext().prec = 8
+
 log = logging.getLogger("executor")
+
+
+def _env_float(key: str, default: float) -> float:
+    """Parse float env var safely (falls back to default on missing/bad values)."""
+    raw = os.environ.get(key, "")
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        try:
+            log.warning("Invalid float env %s=%r; using default=%s", key, raw, default)
+        except Exception:
+            pass
+        return float(default)
+
+def _env_int(key: str, default: int) -> int:
+    """Parse int env var safely (falls back to default on missing/bad values)."""
+    raw = os.environ.get(key, "")
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(float(raw))
+    except Exception:
+        try:
+            log.warning("Invalid int env %s=%r; using default=%s", key, raw, default)
+        except Exception:
+            pass
+        return int(default)
+
+
+
+def _D(val) -> Decimal:
+    """Coerce val into Decimal safely for financial math (prec=8)."""
+    try:
+        if isinstance(val, Decimal):
+            return val
+        if val is None:
+            return Decimal("0")
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return Decimal("0")
+        return Decimal(str(val))
+    except Exception:
+        return Decimal("0")
+
+
+def _is_valid_equity(eq) -> bool:
+    """Fail-closed validity check for equity values coming from external JSON."""
+    try:
+        d = _D(eq)
+        return d > 0
+    except Exception:
+        return False
 
 # ── [P32-LOG-FIX] Self-Initializing File Logger ─────────────────────────────
 import logging
@@ -264,6 +321,7 @@ file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
 file_handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s'))
 
 # Attach to the main executor logger
+
 log = logging.getLogger("executor")
 log.addHandler(file_handler)
 log.setLevel(logging.INFO)
@@ -311,21 +369,21 @@ def _safe_float_env(key: str, default: float) -> float:
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-MAX_DRAWDOWN_PCT     = float(os.environ.get("MAX_DRAWDOWN_PCT",         "15.0"))
-DRAWDOWN_WINDOW_HRS  = float(os.environ.get("DRAWDOWN_WINDOW_HOURS",    "24.0"))
-DCA_Z_THRESHOLD      = float(os.environ.get("DCA_Z_THRESHOLD",          "-2.0"))
+MAX_DRAWDOWN_PCT     = _env_float("MAX_DRAWDOWN_PCT", 15.0)
+DRAWDOWN_WINDOW_HRS  = _env_float("DRAWDOWN_WINDOW_HOURS", 24.0)
+DCA_Z_THRESHOLD      = _env_float("DCA_Z_THRESHOLD", -2.0)
 MAX_DCA_PER_24H      = int  (os.environ.get("MAX_DCA_PER_24H",          "2"))
-MIN_SIGNAL_CONF      = float(os.environ.get("MIN_SIGNAL_CONFIDENCE",    "0.45"))
-PM_START_NO_DCA      = float(os.environ.get("PM_START_NO_DCA",          "5.0"))
-PM_START_WITH_DCA    = float(os.environ.get("PM_START_WITH_DCA",        "2.5"))
-TRAILING_GAP_PCT     = float(os.environ.get("TRAILING_GAP_PCT",         "0.5"))
-START_ALLOC_PCT      = float(os.environ.get("START_ALLOC_PCT",          "0.005"))
+MIN_SIGNAL_CONF      = _env_float("MIN_SIGNAL_CONFIDENCE", 0.45)
+PM_START_NO_DCA      = _env_float("PM_START_NO_DCA", 5.0)
+PM_START_WITH_DCA    = _env_float("PM_START_WITH_DCA", 2.5)
+TRAILING_GAP_PCT     = _env_float("TRAILING_GAP_PCT", 0.5)
+START_ALLOC_PCT      = _env_float("START_ALLOC_PCT", 0.005)
 OKX_LEVERAGE         = int  (os.environ.get("OKX_LEVERAGE",             "1"))
 OKX_TD_MODE_SPOT     = os.environ.get("OKX_TD_MODE",                    "cash")
-OKX_CT_VAL           = float(os.environ.get("OKX_CT_VAL",               "0.01"))
-SOR_SPREAD_THRESHOLD = float(os.environ.get("SOR_SPREAD_THRESHOLD",     "0.10"))
-POST_ONLY_RETRY_SECS = float(os.environ.get("POST_ONLY_RETRY_SECS",     "5.0"))
-DEFAULT_MIN_USD      = float(os.environ.get("DEFAULT_MIN_USD_VALUE",    "5.0"))
+OKX_CT_VAL           = _env_float("OKX_CT_VAL", 0.01)
+SOR_SPREAD_THRESHOLD = _env_float("SOR_SPREAD_THRESHOLD", 0.10)
+POST_ONLY_RETRY_SECS = _env_float("POST_ONLY_RETRY_SECS", 5.0)
+DEFAULT_MIN_USD      = _env_float("DEFAULT_MIN_USD_VALUE", 5.0)
 GUI_SETTINGS_PATH    = os.environ.get(
     "POWERTRADER_GUI_SETTINGS",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_settings.json"),
@@ -337,72 +395,72 @@ TRADER_STATUS_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_data", "trader_status.json"),
 )
 
-LIQUIDITY_SLIPPAGE_MAX_PCT   = float(os.environ.get("LIQUIDITY_SLIPPAGE_MAX_PCT",   "0.1"))
+LIQUIDITY_SLIPPAGE_MAX_PCT   = _env_float("LIQUIDITY_SLIPPAGE_MAX_PCT", 0.1)
 LIQUIDITY_CHASE_MAX_ATTEMPTS = int  (os.environ.get("LIQUIDITY_CHASE_MAX_ATTEMPTS", "5"))
-LIQUIDITY_CHASE_WAIT_SECS    = float(os.environ.get("LIQUIDITY_CHASE_WAIT_SECS",    "3.0"))
+LIQUIDITY_CHASE_WAIT_SECS    = _env_float("LIQUIDITY_CHASE_WAIT_SECS", 3.0)
 
-DCA_VOL_LOOKBACK = int(os.environ.get("DCA_VOL_LOOKBACK", "5"))
+DCA_VOL_LOOKBACK = _env_int("DCA_VOL_LOOKBACK", 5)
 
 AUTO_TUNE_WINDOW         = int  (os.environ.get("AUTO_TUNE_WINDOW",         "5"))
-AUTO_TUNE_WIN_RATE_FLOOR = float(os.environ.get("AUTO_TUNE_WIN_RATE_FLOOR", "0.40"))
-AUTO_TUNE_CONF_STEP      = float(os.environ.get("AUTO_TUNE_CONF_STEP",      "0.10"))
-MIN_ALLOC_FLOOR          = float(os.environ.get("MIN_ALLOC_FLOOR",          "0.005"))
-MAX_CONF_OVERRIDE        = float(os.environ.get("MAX_CONF_OVERRIDE",        "0.90"))
+AUTO_TUNE_WIN_RATE_FLOOR = _env_float("AUTO_TUNE_WIN_RATE_FLOOR", 0.40)
+AUTO_TUNE_CONF_STEP      = _env_float("AUTO_TUNE_CONF_STEP", 0.10)
+MIN_ALLOC_FLOOR          = _env_float("MIN_ALLOC_FLOOR", 0.005)
+MAX_CONF_OVERRIDE        = _env_float("MAX_CONF_OVERRIDE", 0.90)
 
-HEDGE_TRIM_PCT      = float(os.environ.get("HEDGE_TRIM_PCT",      "0.50"))
-HEDGE_COOLDOWN_SECS = float(os.environ.get("HEDGE_COOLDOWN_SECS", "300.0"))
+HEDGE_TRIM_PCT      = _env_float("HEDGE_TRIM_PCT", 0.50)
+HEDGE_COOLDOWN_SECS = _env_float("HEDGE_COOLDOWN_SECS", 300.0)
 
-WALL_DEPTH_PCT       = float(os.environ.get("WALL_DEPTH_PCT",       "0.2"))
-WALL_RATIO_THRESHOLD = float(os.environ.get("WALL_RATIO_THRESHOLD", "5.0"))
+WALL_DEPTH_PCT       = _env_float("WALL_DEPTH_PCT", 0.2)
+WALL_RATIO_THRESHOLD = _env_float("WALL_RATIO_THRESHOLD", 5.0)
 
-SQUEEZE_LIQ_THRESHOLD_USD = float(os.environ.get("SQUEEZE_LIQ_THRESHOLD_USD", "500_000"))
-SQUEEZE_DELAY_SECS        = float(os.environ.get("SQUEEZE_DELAY_SECS",        "30.0"))
+SQUEEZE_LIQ_THRESHOLD_USD = _env_float("SQUEEZE_LIQ_THRESHOLD_USD", 500000.0)
+SQUEEZE_DELAY_SECS        = _env_float("SQUEEZE_DELAY_SECS", 30.0)
 
-FUNDING_BRAKE_THRESHOLD = float(os.environ.get("FUNDING_BRAKE_THRESHOLD", "0.0008"))
-FUNDING_BRAKE_CONF_BUMP = float(os.environ.get("FUNDING_BRAKE_CONF_BUMP", "0.15"))
+FUNDING_BRAKE_THRESHOLD = _env_float("FUNDING_BRAKE_THRESHOLD", 0.0008)
+FUNDING_BRAKE_CONF_BUMP = _env_float("FUNDING_BRAKE_CONF_BUMP", 0.15)
 
 # ── [P31-WHALE-TRAIL] Dynamic Whale-Trail config ───────────────────────────────
 # Multiplier thresholds used to widen / tighten the trailing gap based on the
 # whale oracle multiplier embedded in the entry signal.
-P31_WHALE_TRAIL_HIGH_MULT  = float(os.environ.get("P31_WHALE_TRAIL_HIGH_MULT",  "10.0"))
-P31_WHALE_TRAIL_MAX_SCALE  = float(os.environ.get("P31_WHALE_TRAIL_MAX_SCALE",  "2.0"))
-P31_WHALE_TRAIL_MIN_SCALE  = float(os.environ.get("P31_WHALE_TRAIL_MIN_SCALE",  "0.5"))
+P31_WHALE_TRAIL_HIGH_MULT  = _env_float("P31_WHALE_TRAIL_HIGH_MULT", 10.0)
+P31_WHALE_TRAIL_MAX_SCALE  = _env_float("P31_WHALE_TRAIL_MAX_SCALE", 2.0)
+P31_WHALE_TRAIL_MIN_SCALE  = _env_float("P31_WHALE_TRAIL_MIN_SCALE", 0.5)
 
 # ── [P31-SMART-RETRY] Smart-Retry Order Engine config ──────────────────────────
 P31_ORDER_RETRY_ATTEMPTS   = int  (os.environ.get("P31_ORDER_RETRY_ATTEMPTS",   "3"))
-P31_ORDER_RETRY_BASE_SECS  = float(os.environ.get("P31_ORDER_RETRY_BASE_SECS",  "0.5"))
+P31_ORDER_RETRY_BASE_SECS  = _env_float("P31_ORDER_RETRY_BASE_SECS", 0.5)
 
 # ── [P32] Phase 32 — Institutional Predator Suite ─────────────────────────────
 # [P32-OBI-PATIENCE] Whale-Aware OBI Patience Timer thresholds
-P32_OBI_PATIENCE_MAX_SECS   = float(os.environ.get("P32_OBI_PATIENCE_MAX_SECS",   "3.0"))
-P32_OBI_PATIENCE_PREDATOR_S = float(os.environ.get("P32_OBI_PATIENCE_PREDATOR_S", "0.1"))
-P32_WHALE_STINGY_THRESH     = float(os.environ.get("P32_WHALE_STINGY_THRESH",     "3.0"))   # [v32.1] lowered from 5.0 → STALKER triggers at 3x
-P32_WHALE_STALKER_THRESH    = float(os.environ.get("P32_WHALE_STALKER_THRESH",    "10.0"))  # [v32.1] lowered from 15.0 → PREDATOR triggers at 10x
+P32_OBI_PATIENCE_MAX_SECS   = _env_float("P32_OBI_PATIENCE_MAX_SECS", 3.0)
+P32_OBI_PATIENCE_PREDATOR_S = _env_float("P32_OBI_PATIENCE_PREDATOR_S", 0.1)
+P32_WHALE_STINGY_THRESH     = _env_float("P32_WHALE_STINGY_THRESH", 3.0)   # [v32.1] lowered from 5.0 → STALKER triggers at 3x
+P32_WHALE_STALKER_THRESH    = _env_float("P32_WHALE_STALKER_THRESH", 10.0)  # [v32.1] lowered from 15.0 → PREDATOR triggers at 10x
 # [P32-STEALTH-TWAP] Stealth TWAP Engine
-P32_TWAP_THRESHOLD_USD  = float(os.environ.get("P32_TWAP_THRESHOLD_USD",  "2000.0"))
+P32_TWAP_THRESHOLD_USD  = _env_float("P32_TWAP_THRESHOLD_USD", 2000.0)
 P32_TWAP_SLICES         = int  (os.environ.get("P32_TWAP_SLICES",         "10"))
-P32_TWAP_WINDOW_SECS    = float(os.environ.get("P32_TWAP_WINDOW_SECS",    "300.0"))
+P32_TWAP_WINDOW_SECS    = _env_float("P32_TWAP_WINDOW_SECS", 300.0)
 # [P32-SLIP-ADAPT] Slippage-Adaptive Execution — per-symbol tracking
 P32_SLIP_WINDOW_TRADES  = int  (os.environ.get("P32_SLIP_WINDOW_TRADES",  "3"))
-P32_SLIP_LIMIT_BPS      = float(os.environ.get("P32_SLIP_LIMIT_BPS",      "10.0"))
-P32_SLIP_LIMIT_HOURS    = float(os.environ.get("P32_SLIP_LIMIT_HOURS",    "4.0"))
+P32_SLIP_LIMIT_BPS      = _env_float("P32_SLIP_LIMIT_BPS", 10.0)
+P32_SLIP_LIMIT_HOURS    = _env_float("P32_SLIP_LIMIT_HOURS", 4.0)
 # [P32-LIQ-MAGNET] Liquidation Magnet Logic — proximity & offset
-P32_LIQ_MAGNET_RANGE_PCT  = float(os.environ.get("P32_LIQ_MAGNET_RANGE_PCT",  "0.5"))
-P32_LIQ_MAGNET_OFFSET_BPS = float(os.environ.get("P32_LIQ_MAGNET_OFFSET_BPS", "5.0"))
+P32_LIQ_MAGNET_RANGE_PCT  = _env_float("P32_LIQ_MAGNET_RANGE_PCT", 0.5)
+P32_LIQ_MAGNET_OFFSET_BPS = _env_float("P32_LIQ_MAGNET_OFFSET_BPS", 5.0)
 
 # ── [P33] Phase 33.1 — Toxic Flow Sniffer & Shadow Liquidity Engine ───────────
 # [P33-SNIFFER] Toxic Flow Detection — rolling cancel/partial-fill tracking
 # Window (seconds) over which order events are counted for toxicity scoring.
-P33_TOXICITY_WINDOW_SECS      = float(os.environ.get("P33_TOXICITY_WINDOW_SECS",      "30.0"))
+P33_TOXICITY_WINDOW_SECS      = _env_float("P33_TOXICITY_WINDOW_SECS", 30.0)
 # Toxicity score above which the TWAPSlicer switches from POST_ONLY to IOC.
-P33_TOXICITY_THRESHOLD        = float(os.environ.get("P33_TOXICITY_THRESHOLD",        "0.75"))
+P33_TOXICITY_THRESHOLD        = _env_float("P33_TOXICITY_THRESHOLD", 0.75)
 # Minimum number of order events in the window before toxicity is meaningful.
 P33_TOXICITY_MIN_EVENTS       = int  (os.environ.get("P33_TOXICITY_MIN_EVENTS",       "4"))
 # [P33-SHADOW] Iceberg Shadowing — wall detection parameters
 # Ratio of best-wall depth to median top-5 depth required to trigger shadowing.
-P33_ICEBERG_WALL_RATIO        = float(os.environ.get("P33_ICEBERG_WALL_RATIO",        "3.0"))
+P33_ICEBERG_WALL_RATIO        = _env_float("P33_ICEBERG_WALL_RATIO", 3.0)
 # Minimum USD value of the detected wall (price × qty) before shadowing is applied.
-P33_ICEBERG_WALL_MIN_USD      = float(os.environ.get("P33_ICEBERG_WALL_MIN_USD",      "50000.0"))
+P33_ICEBERG_WALL_MIN_USD      = _env_float("P33_ICEBERG_WALL_MIN_USD", 50000.0)
 
 # ── [P33.2] Phase 33.2 — Maker-Rebate Optimization & Stealth Layering ────────
 # [P33.2-REBATE] Set to "1" to activate BBO+0.1-tick maker pricing on every TWAP slice.
@@ -411,17 +469,17 @@ P33_MAKER_PRIORITY    = os.environ.get("P33_MAKER_PRIORITY",    "0").strip() == 
 P33_LAYERING_SLICES   = int  (os.environ.get("P33_LAYERING_SLICES",   "3"))
 # [P33.2-CHASE] Whale oracle multiplier threshold above which price chasing is
 # allowed when a maker order fails to fill and the market has moved away.
-P33_CHASE_WHALE_MULT  = float(os.environ.get("P33_CHASE_WHALE_MULT",  "8.0"))
+P33_CHASE_WHALE_MULT  = _env_float("P33_CHASE_WHALE_MULT", 8.0)
 # [P33.2-REBATE] Fractional tick offset added to BBO for maker qualification.
 # 0.1 means the limit is placed 0.1 × tickSz inside the spread.
-P33_MAKER_TICK_OFFSET = float(os.environ.get("P33_MAKER_TICK_OFFSET", "0.1"))
+P33_MAKER_TICK_OFFSET = _env_float("P33_MAKER_TICK_OFFSET", 0.1)
 # [P33.2-CHASE] Seconds to wait for a maker order to fill before evaluating chase.
-P33_MAKER_FILL_WAIT   = float(os.environ.get("P33_MAKER_FILL_WAIT",   "4.0"))
+P33_MAKER_FILL_WAIT   = _env_float("P33_MAKER_FILL_WAIT", 4.0)
 
 # ── [P34.1] Synthetic Mid-Price & Front-Run Protection ────────────────────────
 # [P34-SPEED] Coinbase price velocity threshold (bps/tick) above which all
 # active maker layers are immediately cancelled to avoid HFT pick-off.
-P34_FRONT_RUN_THRESHOLD_BPS = float(os.environ.get("P34_FRONT_RUN_THRESHOLD_BPS", "20.0"))
+P34_FRONT_RUN_THRESHOLD_BPS = _env_float("P34_FRONT_RUN_THRESHOLD_BPS", 20.0)
 
 # [P35.1-HEDGE] Base symbol used for the BTC-SWAP hedge leg.
 # _clean_env strips whitespace + literal quote characters left by .env parsers
@@ -459,7 +517,7 @@ P36_MIMIC_SIZE_USD     = _safe_float_env("P36_MIMIC_SIZE_USD", 5.0)
 # When a computed order price falls outside [sellLmt*(1+buf), buyLmt*(1-buf)],
 # the executor clamps it to the nearest valid band edge to prevent OKX sCode
 # 51006 "Order price is not within the price limit" rejections.
-PRICE_LIMIT_BUFFER = float(os.environ.get("PRICE_LIMIT_BUFFER", "0.0005"))  # 5 bps
+PRICE_LIMIT_BUFFER = _env_float("PRICE_LIMIT_BUFFER", 0.0005)  # 5 bps
 
 # ── [P36.2] Phase 36.2 — Dynamic Clamping, Multi-Level Mimicry, Golden Build ──
 # [P36.2-DYNCLAMP] Rolling window (seconds) over which PriceVelocity is measured
@@ -474,7 +532,7 @@ P362_VELOCITY_THRESHOLD_PCT = _safe_float_env("P362_VELOCITY_THRESHOLD_PCT", 0.5
 P362_DYNAMIC_BUFFER_HIGH   = _safe_float_env("P362_DYNAMIC_BUFFER_HIGH",   0.0010)
 # [P36.2-GOLDEN] Number of consecutive successful cycles (zero 51006 + zero
 # IndexError) required to generate the GOLDEN_BUILD_REPORT.txt.
-P362_GOLDEN_BUILD_CYCLES   = int(os.environ.get("P362_GOLDEN_BUILD_CYCLES", "1000"))
+P362_GOLDEN_BUILD_CYCLES   = _env_int("P362_GOLDEN_BUILD_CYCLES", 1000)
 # [P36.2-GOLDEN] Output path for the Golden Build Report.
 P362_GOLDEN_REPORT_PATH    = os.environ.get(
     "P362_GOLDEN_REPORT_PATH",
@@ -490,8 +548,8 @@ P37_TOXICITY_THRESHOLD       = _safe_float_env("P37_TOXICITY_THRESHOLD",       0
 # Must be strictly higher than P37_TOXICITY_THRESHOLD (0.95 > 0.80 default).
 P37_EMERGENCY_EXIT_TOXICITY  = _safe_float_env("P37_EMERGENCY_EXIT_TOXICITY",  0.95)
 
-ICEBERG_MIN_USD      = float(os.environ.get("P9_ICEBERG_MIN_USD",      "500.0"))
-ICEBERG_FILL_TIMEOUT = float(os.environ.get("P9_ICEBERG_FILL_TIMEOUT", "45.0"))
+ICEBERG_MIN_USD      = _env_float("P9_ICEBERG_MIN_USD", 500.0)
+ICEBERG_FILL_TIMEOUT = _env_float("P9_ICEBERG_FILL_TIMEOUT", 45.0)
 
 # ── [P9-ICEBERG-DISPLAY] Fraction of total order shown per iceberg slice ────────
 # _safe_float_env is defined at module top (Sanitizer section) so this is safe.
@@ -499,53 +557,53 @@ ICEBERG_FILL_TIMEOUT = float(os.environ.get("P9_ICEBERG_FILL_TIMEOUT", "45.0"))
 ICEBERG_DISPLAY_PCT  = _safe_float_env("P9_ICEBERG_DISPLAY_PCT",  0.10)
 
 SHADOW_REGIMES       = set(os.environ.get("P9_SHADOW_REGIMES", "chop").split(","))
-SHADOW_POLL_SECS     = float(os.environ.get("P9_SHADOW_POLL_SECS",  "0.5"))
-SHADOW_EXPIRY_SECS   = float(os.environ.get("P9_SHADOW_EXPIRY_SECS","120.0"))
-SHADOW_HIT_BPS       = float(os.environ.get("P9_SHADOW_HIT_BPS",    "5.0"))
+SHADOW_POLL_SECS     = _env_float("P9_SHADOW_POLL_SECS", 0.5)
+SHADOW_EXPIRY_SECS   = _env_float("P9_SHADOW_EXPIRY_SECS", 120.0)
+SHADOW_HIT_BPS       = _env_float("P9_SHADOW_HIT_BPS", 5.0)
 
-POST_ONLY_MAX_RETRIES = int(os.environ.get("P9_POST_ONLY_MAX_RETRIES", "3"))
+POST_ONLY_MAX_RETRIES = _env_int("P9_POST_ONLY_MAX_RETRIES", 3)
 OKX_TAKER_REJECT_CODE = os.environ.get("P9_TAKER_REJECT_CODE", "51503")
 
-P10_PRIORITY_CONF_REDUCTION    = float(os.environ.get("P10_PRIORITY_CONF_REDUCTION",    "0.10"))
-P10_AGGRESSIVE_ICEBERG_MIN_USD = float(os.environ.get("P10_AGGRESSIVE_ICEBERG_MIN_USD", "100.0"))
+P10_PRIORITY_CONF_REDUCTION    = _env_float("P10_PRIORITY_CONF_REDUCTION", 0.10)
+P10_AGGRESSIVE_ICEBERG_MIN_USD = _env_float("P10_AGGRESSIVE_ICEBERG_MIN_USD", 100.0)
 
 # ── [P12] Microstructure config ────────────────────────────────────────────────
-OBI_BUY_BLOCK_THRESHOLD     = float(os.environ.get("P12_OBI_BUY_BLOCK",    "-0.6"))
-OBI_SELL_BLOCK_THRESHOLD    = float(os.environ.get("P12_OBI_SELL_BLOCK",   "0.6"))
+OBI_BUY_BLOCK_THRESHOLD     = _env_float("P12_OBI_BUY_BLOCK", -0.6)
+OBI_SELL_BLOCK_THRESHOLD    = _env_float("P12_OBI_SELL_BLOCK", 0.6)
 OBI_LEVELS                  = int  (os.environ.get("P12_OBI_LEVELS",       "10"))
-TAPE_VELOCITY_HFT_THRESHOLD = float(os.environ.get("P12_HFT_VELOCITY_TPS", "100.0"))
-TAPE_MONITOR_INTERVAL_SECS  = float(os.environ.get("P12_TAPE_MONITOR_SECS", "1.0"))
-SWEEP_SIGNAL_TTL_SECS       = float(os.environ.get("P12_SWEEP_TTL_SECS",   "15.0"))
+TAPE_VELOCITY_HFT_THRESHOLD = _env_float("P12_HFT_VELOCITY_TPS", 100.0)
+TAPE_MONITOR_INTERVAL_SECS  = _env_float("P12_TAPE_MONITOR_SECS", 1.0)
+SWEEP_SIGNAL_TTL_SECS       = _env_float("P12_SWEEP_TTL_SECS", 15.0)
 
 # ── [P13] Dead Alpha Decay config ─────────────────────────────────────────────
-P13_DEAD_ALPHA_HOURS    = float(os.environ.get("P13_DEAD_ALPHA_HOURS",    "4.0"))
-P13_DEAD_ALPHA_BAND_PCT = float(os.environ.get("P13_DEAD_ALPHA_BAND_PCT", "0.1"))
+P13_DEAD_ALPHA_HOURS    = _env_float("P13_DEAD_ALPHA_HOURS", 4.0)
+P13_DEAD_ALPHA_BAND_PCT = _env_float("P13_DEAD_ALPHA_BAND_PCT", 0.1)
 
 # ── [P16] Atomic Express Trade config ─────────────────────────────────────────
-P16_BBO_OFFSET_BPS       = float(os.environ.get("P16_BBO_OFFSET_BPS",      "10.0"))
-P16_EXPRESS_ALLOC_PCT    = float(os.environ.get("P16_EXPRESS_ALLOC_PCT",   "0.01"))
-P16_EXPRESS_MAX_USD      = float(os.environ.get("P16_EXPRESS_MAX_USD",     "500.0"))
-P16_EXPRESS_DEDUPE_SECS  = float(os.environ.get("P16_EXPRESS_DEDUPE_SECS", "30.0"))
-P16_EXPRESS_FILL_TIMEOUT = float(os.environ.get("P16_EXPRESS_FILL_TIMEOUT", "5.0"))
+P16_BBO_OFFSET_BPS       = _env_float("P16_BBO_OFFSET_BPS", 10.0)
+P16_EXPRESS_ALLOC_PCT    = _env_float("P16_EXPRESS_ALLOC_PCT", 0.01)
+P16_EXPRESS_MAX_USD      = _env_float("P16_EXPRESS_MAX_USD", 500.0)
+P16_EXPRESS_DEDUPE_SECS  = _env_float("P16_EXPRESS_DEDUPE_SECS", 30.0)
+P16_EXPRESS_FILL_TIMEOUT = _env_float("P16_EXPRESS_FILL_TIMEOUT", 5.0)
 P16_EXPRESS_TAG          = "P16_ATOMIC_EXPRESS"
 
 # ── [P40.1-LAT] Bridge Latency Failsafe ───────────────────────────────────────
 # If the Rust bridge reports order_ack latency above this threshold, the executor
 # automatically shifts the symbol into LIMIT_ONLY mode and elevates DynamicBuffer
 # (via the LIMIT_ONLY guard) to avoid toxic market fills during IPC spikes.
-P40_LATENCY_FAILSAFE_US       = int(os.environ.get("P40_LATENCY_FAILSAFE_US", "5000"))
-P40_LATENCY_LIMIT_ONLY_SECS   = float(os.environ.get("P40_LATENCY_LIMIT_ONLY_SECS", "900"))  # 15 min
-P40_LATENCY_FAILSAFE_MIN_US   = int(os.environ.get("P40_LATENCY_FAILSAFE_MIN_US", "1"))       # ignore missing/zero latency
+P40_LATENCY_FAILSAFE_US       = _env_int("P40_LATENCY_FAILSAFE_US", 5000)
+P40_LATENCY_LIMIT_ONLY_SECS   = _env_float("P40_LATENCY_LIMIT_ONLY_SECS", 900)  # 15 min
+P40_LATENCY_FAILSAFE_MIN_US   = _env_int("P40_LATENCY_FAILSAFE_MIN_US", 1)       # ignore missing/zero latency
 
 # ── [P17/P18] Intelligence Layer config ───────────────────────────────────────
-P17_CATASTROPHE_THRESHOLD = float(os.environ.get("P17_CATASTROPHE_THRESHOLD", "0.1"))
-P17_BOOST_THRESHOLD       = float(os.environ.get("P17_NARRATIVE_BOOST_THRESHOLD", "0.8"))
+P17_CATASTROPHE_THRESHOLD = _env_float("P17_CATASTROPHE_THRESHOLD", 0.1)
+P17_BOOST_THRESHOLD       = _env_float("P17_NARRATIVE_BOOST_THRESHOLD", 0.8)
 
 # ── [P18] Adaptive Conviction config ──────────────────────────────────────────
 P18_DYNAMIC_SIZING          = os.environ.get("P18_DYNAMIC_SIZING", "1").strip() == "1"
 P18_DIVERGENCE_BEAR_REGIMES = {"bear", "bearish"}
-P18_DIVERGENCE_SCORE_FLOOR  = float(os.environ.get("P18_DIVERGENCE_SCORE_FLOOR", "0.8"))
-P18_DIVERGENCE_HAIRCUT      = float(os.environ.get("P18_DIVERGENCE_HAIRCUT",      "0.6"))
+P18_DIVERGENCE_SCORE_FLOOR  = _env_float("P18_DIVERGENCE_SCORE_FLOOR", 0.8)
+P18_DIVERGENCE_HAIRCUT      = _env_float("P18_DIVERGENCE_HAIRCUT", 0.6)
 
 # ── [P19-2] Shadow Auditor config ─────────────────────────────────────────────
 SHADOW_AUDIT_PATH = os.environ.get(
@@ -560,16 +618,16 @@ _SHADOW_AUDIT_HEADER = [
 ]
 
 # ── [P20-1] Global Drawdown / Zombie Mode config ───────────────────────────────
-P20_DRAWDOWN_ZOMBIE_PCT = float(os.environ.get("P20_DRAWDOWN_ZOMBIE_PCT", "10.0"))
+P20_DRAWDOWN_ZOMBIE_PCT = _env_float("P20_DRAWDOWN_ZOMBIE_PCT", 10.0)
 
 # ── [P23] Phase 23 config ──────────────────────────────────────────────────────
 P23_CB_SUPPRESS_WITH_LKG    = os.environ.get("P23_CB_SUPPRESS_WITH_LKG", "1").strip() == "1"
 P23_GHOST_RECONNECT_THRESH  = int  (os.environ.get("P23_GHOST_RECONNECT_THRESH", "50"))
-P23_FLATTEN_LOG_THROTTLE_S  = float(os.environ.get("P23_FLATTEN_LOG_THROTTLE_S", "60.0"))
-P23_HARD_SYNC_INTERVAL_S    = float(os.environ.get("P23_HARD_SYNC_INTERVAL_S",   "300.0"))
-P23_LLM_TIMEOUT_S           = float(os.environ.get("P23_LLM_TIMEOUT_S",          "2.0"))
-P23_SPREAD_GUARD_PCT        = float(os.environ.get("P23_SPREAD_GUARD_PCT",        "0.10"))
-P23_WHALE_SNIPER_MULT_THRESH= float(os.environ.get("P23_WHALE_SNIPER_MULT_THRESH","10.0"))
+P23_FLATTEN_LOG_THROTTLE_S  = _env_float("P23_FLATTEN_LOG_THROTTLE_S", 60.0)
+P23_HARD_SYNC_INTERVAL_S    = _env_float("P23_HARD_SYNC_INTERVAL_S", 300.0)
+P23_LLM_TIMEOUT_S           = _env_float("P23_LLM_TIMEOUT_S", 2.0)
+P23_SPREAD_GUARD_PCT        = _env_float("P23_SPREAD_GUARD_PCT", 0.10)
+P23_WHALE_SNIPER_MULT_THRESH= _env_float("P23_WHALE_SNIPER_MULT_THRESH", 10.0)
 P23_SMALL_ACCT_FALLBACK_SYMS = [
     s.strip().upper()
     for s in os.environ.get("P23_SMALL_ACCT_FALLBACK_SYMS", "XRP,DOGE").split(",")
@@ -589,9 +647,7 @@ P24_CONTROL_EVENT_PATH = os.environ.get(
 )
 
 # ── [FIX-HWM-RACE] Minimum valid equity floor ─────────────────────────────────
-_EXECUTOR_MIN_VALID_EQUITY = float(
-    os.environ.get("P7_CB_MIN_VALID_EQUITY", "10.0")
-)
+_EXECUTOR_MIN_VALID_EQUITY = _env_float("P7_CB_MIN_VALID_EQUITY", 10.0)
 
 # ── [P25] Phase 25 — Tactical Listener & Liquidation Oracle config ─────────────
 import threading as _threading
@@ -604,11 +660,11 @@ P25_VETO_AUDIT_PATH = os.environ.get(
     "P25_VETO_AUDIT_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_data", "veto_audit.json"),
 )
-P25_LIQUIDATION_CLUSTERS_COUNT = int(os.environ.get("P25_LIQUIDATION_CLUSTERS_COUNT", "5"))
+P25_LIQUIDATION_CLUSTERS_COUNT = _env_int("P25_LIQUIDATION_CLUSTERS_COUNT", 5)
 # SNIPER-ONLY: reject entry if conviction_multiplier < this threshold
-P25_SNIPER_ONLY_CONV_THRESHOLD = float(os.environ.get("P25_SNIPER_ONLY_CONV_THRESHOLD", "1.5"))
+P25_SNIPER_ONLY_CONV_THRESHOLD = _env_float("P25_SNIPER_ONLY_CONV_THRESHOLD", 1.5)
 # SNIPER-ONLY: whale oracle multiplier that bypasses the sniper-only gate
-P25_SNIPER_ONLY_WHALE_MULT     = float(os.environ.get("P25_SNIPER_ONLY_WHALE_MULT", "20.0"))
+P25_SNIPER_ONLY_WHALE_MULT     = _env_float("P25_SNIPER_ONLY_WHALE_MULT", 20.0)
 # Default tactical config (fail-safe values per guardrail #5)
 _P25_TACTICAL_DEFAULTS: dict = {"risk_off": False, "sniper_only": False, "hedge_active": False}
 # Module-level lock for veto_audit writes from executor context
@@ -2041,8 +2097,7 @@ class Executor:
 
             # [P40.1-SHIELD] Ready-Gate opens on first verified equity.
             try:
-                if not self._p40_ready_gate.is_set():
-                    self._p40_ready_gate.set()
+                self._p40_ready_gate.set()
             except Exception:
                 pass
 
@@ -2338,8 +2393,9 @@ class Executor:
             # (line 7203) blocks trading permanently when bridge is connected,
             # because _on_account_update (the legacy WS path) may never fire.
             try:
-                if not self._p40_ready_gate.is_set():
-                    self._p40_ready_gate.set()
+                _was_set = self._p40_ready_gate.is_set()
+                self._p40_ready_gate.set()
+                if not _was_set:
                     log.info(
                         "[P40.1-SHIELD] Ready-Gate OPENED by bridge account_update: "
                         "eq=%.6f — trading cycle will proceed normally.", eq,
@@ -2393,8 +2449,9 @@ class Executor:
             # [P40.1-SHIELD] Ready-Gate: healed_eq is validated Binary Truth.
             # Open the gate outside the equity lock (lock not needed for asyncio.Event).
             try:
-                if not self._p40_ready_gate.is_set():
-                    self._p40_ready_gate.set()
+                _was_set = self._p40_ready_gate.is_set()
+                self._p40_ready_gate.set()
+                if not _was_set:
                     log.info(
                         "[P40.1-SHIELD] Ready-Gate OPENED by ghost_healed: "
                         "healed_eq=%.6f — trading cycle will proceed normally.", healed_eq,
@@ -5942,10 +5999,10 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             if meta and tick.ask > 0:
                 min_lot_usd = float(meta.lot_sz if hasattr(meta, 'lot_sz') else 0.01) * tick.ask
 
-            usd_amount = min(
-                max(self._avail * P16_EXPRESS_ALLOC_PCT, cfg.min_usd_value, min_lot_usd),
-                P16_EXPRESS_MAX_USD,
-            )
+            usd_amount = float(min(
+                max(_D(self._avail) * _D(P16_EXPRESS_ALLOC_PCT), _D(cfg.min_usd_value), _D(min_lot_usd)),
+                _D(P16_EXPRESS_MAX_USD),
+            ))
 
             if usd_amount > self._avail * 0.95:
                 return False
@@ -6433,12 +6490,24 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
         return True
 
     async def _record_close(self, pos: Position, fill_px: float, tag: str):
-        pnl_pct = (
-            (fill_px - pos.cost_basis) / pos.cost_basis * 100
-            if pos.direction == "long"
-            else (pos.cost_basis - fill_px) / pos.cost_basis * 100
-        ) if pos.cost_basis > 0 else 0.0
-        realized = pnl_pct / 100 * pos.usd_cost
+        pnl_pct: float = 0.0
+        realized: float = 0.0
+
+        try:
+            if pos.cost_basis > 0:
+                cb = _D(pos.cost_basis)
+                fp = _D(fill_px)
+                if pos.direction == "long":
+                    pnl_pct_d = (fp - cb) / cb * Decimal("100")
+                else:
+                    pnl_pct_d = (cb - fp) / cb * Decimal("100")
+                pnl_pct = float(pnl_pct_d)
+                realized = float(_D(pnl_pct) / Decimal("100") * _D(pos.usd_cost))
+        except Exception as _pnl_exc:
+            log.debug("[P7] _record_close Decimal pnl calc error: %s", _pnl_exc)
+            pnl_pct = 0.0
+            realized = 0.0
+
         await self.db.insert_trade({
             "ts": int(time.time()), "symbol": pos.symbol,
             "side": "sell" if pos.direction == "long" else "buy",
