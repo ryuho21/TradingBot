@@ -1,0 +1,856 @@
+{
+  "timestamp": 1772269829.3961294,
+  "demo_mode": true,
+  "circuit_breaker": false,
+  "strategy_mode": "\ud83d\udee1\ufe0f WHALE_VETO",
+  "p7_cb_tripped": false,
+  "p20_zombie_mode_active": true,
+  "emergency_pause": false,
+  "pause_remaining": 0.0,
+  "p9_shadow_watches_active": 0,
+  "p9_iceberg_threshold_usd": 500.0,
+  "p10_governor": {
+    "regime": {
+      "personality": "neutral",
+      "vol_score": 0.3729,
+      "trend_score": 0.4764,
+      "n_symbols": 3,
+      "ts": 1772269858.2364998
+    },
+    "allocations": {
+      "BTC": {
+        "target_weight": 0.333333,
+        "corr_penalty": 0.6,
+        "max_usd": 1752.26,
+        "rl_confidence": 0.5,
+        "priority_deploy": false
+      },
+      "XRP": {
+        "target_weight": 0.333333,
+        "corr_penalty": 0.6,
+        "max_usd": 1752.26,
+        "rl_confidence": 0.5,
+        "priority_deploy": false
+      },
+      "ETH": {
+        "target_weight": 0.333333,
+        "corr_penalty": 0.6,
+        "max_usd": 1752.26,
+        "rl_confidence": 0.5,
+        "priority_deploy": false
+      }
+    },
+    "delta_hedge": null,
+    "priority_deploy_queue": [],
+    "p35_hedge": {
+      "hedge_usd": 0.0,
+      "hedge_dir": "none",
+      "rebalancing": false,
+      "net_delta_usd": 0.0,
+      "ord_id": "",
+      "threshold_usd": 100.0,
+      "ratio": 0.85,
+      "min_change_usd": 20.0,
+      "symbol": "BTC-USDT-SWAP",
+      "poll_secs": 60.0,
+      "exclude_symbols": []
+    }
+  },
+  "p10_exec_mode": "neutral",
+  "p11_sentinel": {
+    "flash_crash_fired": false,
+    "flash_crash_symbol": "BTC",
+    "equity_tripped": false,
+    "last_regime": "neutral",
+    "telegram_enabled": true,
+    "shadow_miss_report": {},
+    "mtf_conflict_states": {
+      "BTC": true,
+      "XRP": true,
+      "ETH": false
+    },
+    "p13_report_interval_hours": 24.0,
+    "p13_sniper_hits_since_last_report": 0,
+    "p13_closes_since_last_report": 4,
+    "p13_next_report_in_secs": 86317.09671783447,
+    "p14_conviction_alerts_enabled": true,
+    "p16_express_alerts_enabled": true,
+    "p16_express_fills_this_window": 0
+  },
+  "p12_hft_brake_symbols": [],
+  "p12_sweep_active_symbols": [],
+  "p13_trust_scores": {
+    "BTC:1hour": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "BTC:4hour": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "BTC:1day": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "XRP:1hour": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "XRP:4hour": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "XRP:1day": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "ETH:1hour": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "ETH:4hour": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    },
+    "ETH:1day": {
+      "alpha": 2.0,
+      "beta": 2.0,
+      "trust_factor": 0.5,
+      "samples": 0,
+      "label": "Neutral"
+    }
+  },
+  "p13_dead_alpha_exits": 0,
+  "account": {
+    "total_equity": 1.0,
+    "buying_power": 4336.37,
+    "deployed_capital": 0.0,
+    "avail_balance": 4336.37,
+    "last_valid_equity": 0.0,
+    "pct_deployed": -433537.31,
+    "leverage": 1,
+    "equity_is_ghost": false,
+    "consecutive_ghost_reads": 0
+  },
+  "positions": {
+    "BTC": {
+      "direction": "none",
+      "inst_type": "N/A",
+      "qty": 0.0,
+      "current_bid": 63424.9,
+      "current_ask": 63425.0,
+      "regime": "bull",
+      "regime_modifier": 0.3,
+      "chop_sniper_only": true,
+      "signal_conf": 0.1,
+      "signal_dir": "neutral",
+      "signal_prob": 0.084,
+      "sniper_ready": false,
+      "mtf_aligned": true,
+      "autotune_conf": 0.45,
+      "autotune_alloc": 0.15,
+      "emergency_pause": false,
+      "funding_rate": 0.00375,
+      "net_liq_delta": 0,
+      "funding_brake_active": true,
+      "shadow_watching": false,
+      "shadow_target_px": 0.0,
+      "shadow_expires_in": 0.0,
+      "p10_gov_alloc_weight": 0.333333,
+      "p10_gov_max_usd": 173.45492477673463,
+      "p10_priority_deploy": false,
+      "p10_exec_mode": "neutral",
+      "p12_obi": 0.2495,
+      "p12_obi_blocked": false,
+      "p12_hft_brake": false,
+      "p12_tape_velocity": 1.2,
+      "p12_tape_buy_vol": 293779.56,
+      "p12_tape_sell_vol": 141879.06,
+      "p12_sweep_active": false,
+      "p13_trust_by_tf": {
+        "1hour": 0.5,
+        "4hour": 0.5,
+        "1day": 0.5
+      },
+      "p13_agg_trust": 0.5,
+      "p13_censored": false,
+      "p14_high_conviction": false,
+      "p14_conviction_votes": 1,
+      "p14_spread_offset_bps": 0.5,
+      "p14_fill_rate_1h": null,
+      "p16_express_eligible": false,
+      "p16_last_express_ago": 25.6,
+      "p17_narrative_verdict": "N/A",
+      "p17_narrative_score": null,
+      "p17_narrative_latency_ms": null,
+      "p17_intelligence_active": true,
+      "p18_conviction_multiplier": null,
+      "p18_dynamic_sizing_active": true,
+      "p19_shadow_audit_path": "C:\\Users\\erna\\Downloads\\PowerTrader_AI-main\\Trading AI\\shadow_audit.csv",
+      "p7_cb_tripped": false,
+      "p20_zombie_mode": true,
+      "p20_council_detail": []
+    },
+    "XRP": {
+      "direction": "none",
+      "inst_type": "N/A",
+      "qty": 0.0,
+      "current_bid": 1.2798,
+      "current_ask": 1.283,
+      "regime": "chop",
+      "regime_modifier": 0.3,
+      "chop_sniper_only": true,
+      "signal_conf": 0.1,
+      "signal_dir": "neutral",
+      "signal_prob": 0.2895,
+      "sniper_ready": false,
+      "mtf_aligned": true,
+      "autotune_conf": 0.45,
+      "autotune_alloc": 0.12,
+      "emergency_pause": false,
+      "funding_rate": 0.0075,
+      "net_liq_delta": 0,
+      "funding_brake_active": true,
+      "shadow_watching": false,
+      "shadow_target_px": 0.0,
+      "shadow_expires_in": 0.0,
+      "p10_gov_alloc_weight": 0.333333,
+      "p10_gov_max_usd": 173.45492477673463,
+      "p10_priority_deploy": false,
+      "p10_exec_mode": "neutral",
+      "p12_obi": 0.266,
+      "p12_obi_blocked": false,
+      "p12_hft_brake": false,
+      "p12_tape_velocity": 0.4,
+      "p12_tape_buy_vol": 15.04,
+      "p12_tape_sell_vol": 523932.98,
+      "p12_sweep_active": false,
+      "p13_trust_by_tf": {
+        "1hour": 0.5,
+        "4hour": 0.5,
+        "1day": 0.5
+      },
+      "p13_agg_trust": 0.5,
+      "p13_censored": false,
+      "p14_high_conviction": false,
+      "p14_conviction_votes": 1,
+      "p14_spread_offset_bps": 0.5,
+      "p14_fill_rate_1h": null,
+      "p16_express_eligible": false,
+      "p16_last_express_ago": 42.8,
+      "p17_narrative_verdict": "N/A",
+      "p17_narrative_score": null,
+      "p17_narrative_latency_ms": null,
+      "p17_intelligence_active": true,
+      "p18_conviction_multiplier": null,
+      "p18_dynamic_sizing_active": true,
+      "p19_shadow_audit_path": "C:\\Users\\erna\\Downloads\\PowerTrader_AI-main\\Trading AI\\shadow_audit.csv",
+      "p7_cb_tripped": false,
+      "p20_zombie_mode": true,
+      "p20_council_detail": []
+    },
+    "ETH": {
+      "direction": "none",
+      "inst_type": "N/A",
+      "qty": 0.0,
+      "current_bid": 1846.74,
+      "current_ask": 1846.8,
+      "regime": "chop",
+      "regime_modifier": 0.3,
+      "chop_sniper_only": true,
+      "signal_conf": 0.1,
+      "signal_dir": "neutral",
+      "signal_prob": 0.5,
+      "sniper_ready": false,
+      "mtf_aligned": false,
+      "autotune_conf": 0.45,
+      "autotune_alloc": 0.18,
+      "emergency_pause": false,
+      "funding_rate": 0.0075,
+      "net_liq_delta": 0,
+      "funding_brake_active": true,
+      "shadow_watching": false,
+      "shadow_target_px": 0.0,
+      "shadow_expires_in": 0.0,
+      "p10_gov_alloc_weight": 0.333333,
+      "p10_gov_max_usd": 173.45492477673463,
+      "p10_priority_deploy": false,
+      "p10_exec_mode": "neutral",
+      "p12_obi": 0.6303,
+      "p12_obi_blocked": false,
+      "p12_hft_brake": false,
+      "p12_tape_velocity": 0.2,
+      "p12_tape_buy_vol": 855996.29,
+      "p12_tape_sell_vol": 33517938.52,
+      "p12_sweep_active": false,
+      "p13_trust_by_tf": {
+        "1hour": 0.5,
+        "4hour": 0.5,
+        "1day": 0.5
+      },
+      "p13_agg_trust": 0.5,
+      "p13_censored": false,
+      "p14_high_conviction": false,
+      "p14_conviction_votes": 1,
+      "p14_spread_offset_bps": 0.5,
+      "p14_fill_rate_1h": null,
+      "p16_express_eligible": false,
+      "p16_last_express_ago": 28.1,
+      "p17_narrative_verdict": "N/A",
+      "p17_narrative_score": null,
+      "p17_narrative_latency_ms": null,
+      "p17_intelligence_active": true,
+      "p18_conviction_multiplier": null,
+      "p18_dynamic_sizing_active": true,
+      "p19_shadow_audit_path": "C:\\Users\\erna\\Downloads\\PowerTrader_AI-main\\Trading AI\\shadow_audit.csv",
+      "p7_cb_tripped": false,
+      "p20_zombie_mode": true,
+      "p20_council_detail": []
+    }
+  },
+  "p15_oracle_signals": {
+    "BTC": {
+      "signal": "WHALE_SWEEP_SELL",
+      "mult": 5.31,
+      "valid": true,
+      "size": 0.05310572
+    },
+    "XRP": {
+      "signal": "WHALE_SWEEP_SELL",
+      "mult": 5.16,
+      "valid": true,
+      "size": 4346.888718
+    },
+    "ETH": {
+      "signal": "WHALE_SWEEP_SELL",
+      "mult": 146.23,
+      "valid": true,
+      "size": 134.76248097
+    }
+  },
+  "p15_global_tape": {
+    "coinbase_tps": 22.0,
+    "binance_tps": 0.0,
+    "combined_tps": 22.0,
+    "hv_threshold_tps": 150.0,
+    "high_volatility_mode": false,
+    "hv_stop_extra_pct": 0.0,
+    "cb_credentials": {
+      "api_key_set": true,
+      "pem_key_set": true,
+      "credentials_ok": true,
+      "key_preview": "organizations/0b111cc0-2\u2026"
+    }
+  },
+  "p15_hv_mode": false,
+  "p16_bridge_active": true,
+  "p16_express_fills_total": 3,
+  "p16_bbo_offset_bps": 10.0,
+  "p16_express_alloc_pct": 0.02,
+  "p16_express_max_usd": 500.0,
+  "p16_express_dedupe_secs": 30.0,
+  "p17_intelligence": {
+    "mode": "rss",
+    "council_enabled": true,
+    "openrouter_model": "stepfun/step-3.5-flash:free",
+    "openrouter_active": true,
+    "veto_threshold": 0.3,
+    "boost_threshold": 0.8,
+    "boost_factor": 0.25,
+    "catastrophe_threshold": 0.1,
+    "max_portfolio_heat": 0.25,
+    "p20_obi_veto_threshold": -0.5,
+    "p20_wall_ratio": 4.0,
+    "p20_corr_veto_threshold": 0.85,
+    "p20_corr_warn_threshold": 0.65,
+    "p20_corr_haircut_threshold": 0.95,
+    "p20_corr_haircut_factor": 0.25,
+    "p22_entropy_threshold": 3.5,
+    "p22_entropy_boost": 0.2,
+    "p22_bull_trail_widen": 0.005,
+    "p22_chop_trail_tighten": 0.002,
+    "p25_veto_audit_path": "C:\\Users\\erna\\Downloads\\PowerTrader_AI-main\\Trading AI\\hub_data\\veto_audit.json",
+    "counters": {
+      "veto": 0,
+      "boost": 0,
+      "catastrophe": 0,
+      "timeout": 0
+    },
+    "recent_results": []
+  },
+  "p17_council_enabled": true,
+  "p18_dynamic_sizing": true,
+  "p18_divergence_bear_regimes": [
+    "bearish",
+    "bear"
+  ],
+  "p18_divergence_score_floor": 0.8,
+  "p18_divergence_haircut": 0.6,
+  "p19_shadow_audit_path": "C:\\Users\\erna\\Downloads\\PowerTrader_AI-main\\Trading AI\\shadow_audit.csv",
+  "p19_gc_enabled": true,
+  "p20_global_risk": {
+    "zombie_active": true,
+    "zombie_pct": 99.0,
+    "peak_equity": 4380.66,
+    "current_equity": 4335.08,
+    "drawdown_pct": 1.0403,
+    "zombie_ts": 1772269828.4521701,
+    "zombie_age_secs": 52.7,
+    "in_grace_period": false,
+    "grace_secs": 60.0,
+    "grace_remaining_secs": 0.0,
+    "grace_until_ts": 1772269859.3,
+    "global_peak_equity": 4380.66,
+    "zombie_mode_status": true,
+    "zombie_pct_threshold": 99.0
+  },
+  "p20_zombie_mode": true,
+  "p20_shadow_train": {},
+  "p20_drawdown_zombie_pct": 99.0,
+  "p23_ghost_meter": {
+    "consecutive_ghost_reads": 0,
+    "equity_is_ghost": false,
+    "last_valid_equity": 0.0,
+    "reconnect_threshold": 50,
+    "last_ws_reconnect_ago": null,
+    "cb_suppressed_with_lkg": true
+  },
+  "p23_hard_sync": {
+    "last_sync_ts": 1772269799.6479175,
+    "last_sync_ago_secs": 29.7,
+    "sync_interval_secs": 300.0
+  },
+  "tactical_active": false,
+  "tactical_config": {
+    "risk_off": false,
+    "sniper_only": false,
+    "hedge_active": false,
+    "risk_off_mode": false,
+    "hedge_mode": false,
+    "_written_at": "2026-02-26T21:04:06.125520Z"
+  },
+  "market_data": {
+    "liquidations": {
+      "clusters": [
+        {
+          "price": 571.718,
+          "volume": 2469.8847,
+          "side": "long"
+        },
+        {
+          "price": 580.559,
+          "volume": 1820.5067,
+          "side": "long"
+        },
+        {
+          "price": 586.453,
+          "volume": 998.2845,
+          "side": "long"
+        },
+        {
+          "price": 595.294,
+          "volume": 3072.2596,
+          "side": "short"
+        },
+        {
+          "price": 604.135,
+          "volume": 427.2387,
+          "side": "short"
+        }
+      ]
+    },
+    "whale_tape": {
+      "peak_multiplier": 146.23,
+      "dominant_side": "SELL",
+      "peak_symbol": "ETH"
+    }
+  },
+  "intelligence": {
+    "entropy_history": [
+      1.928,
+      2.1409,
+      1.9627
+    ]
+  },
+  "p32_aggression_mode": "STINGY",
+  "p32_limit_only_symbols": [],
+  "p32_slip_window": {
+    "ETH": [
+      -0.9708523642472789
+    ],
+    "XRP": [
+      -488.5462228482473,
+      -488.5462228482473
+    ],
+    "BTC": [
+      19.51352751388585
+    ]
+  },
+  "p35_hedge": {
+    "hedge_usd": 0.0,
+    "hedge_dir": "",
+    "rebalancing": false,
+    "ord_id": "",
+    "threshold_usd": 100.0,
+    "ratio": 0.85,
+    "min_change_usd": 20.0,
+    "symbol": "BTC-USDT-SWAP"
+  },
+  "heartbeat_ts": 1772269880.4619188,
+  "consecutive_ghost_reads": 22,
+  "equity_is_ghost": true,
+  "brain": {
+    "BTC": {
+      "1hour": {
+        "direction": "short",
+        "prob": 0.444,
+        "regime": "bull",
+        "kelly_f": 0.0,
+        "z_score": 0.15447929823861553,
+        "confidence": 0.23319999999999996
+      },
+      "4hour": {
+        "direction": "neutral",
+        "prob": 0.5,
+        "regime": "bull",
+        "kelly_f": 0.0,
+        "z_score": -0.6274605919367995,
+        "confidence": 0.25
+      },
+      "1day": {
+        "direction": "neutral",
+        "prob": 0.5,
+        "regime": "chop",
+        "kelly_f": 0.0,
+        "z_score": -0.8311630415189625,
+        "confidence": 0.125
+      }
+    },
+    "XRP": {
+      "1hour": {
+        "direction": "short",
+        "prob": 0.542,
+        "regime": "chop",
+        "kelly_f": 0.0,
+        "z_score": -0.5286431197904452,
+        "confidence": 0.13072
+      },
+      "4hour": {
+        "direction": "neutral",
+        "prob": 0.5,
+        "regime": "chop",
+        "kelly_f": 0.0,
+        "z_score": -1.1460074528638766,
+        "confidence": 0.125
+      },
+      "1day": {
+        "direction": "long",
+        "prob": 0.514,
+        "regime": "chop",
+        "kelly_f": 0.0,
+        "z_score": -0.8473455864909365,
+        "confidence": 0.12274
+      }
+    },
+    "ETH": {
+      "1hour": {
+        "direction": "short",
+        "prob": 0.528,
+        "regime": "chop",
+        "kelly_f": 0.0,
+        "z_score": -0.058421356496261866,
+        "confidence": 0.12673
+      },
+      "4hour": {
+        "direction": "long",
+        "prob": 0.542,
+        "regime": "chop",
+        "kelly_f": 0.0,
+        "z_score": -0.6009724554733237,
+        "confidence": 0.13072
+      },
+      "1day": {
+        "direction": "neutral",
+        "prob": 0.5,
+        "regime": "chop",
+        "kelly_f": 0.0,
+        "z_score": -0.6967672865378456,
+        "confidence": 0.125
+      }
+    },
+    "SOL": {},
+    "DOGE": {},
+    "BNB": {}
+  },
+  "correlation_frozen": false,
+  "agents": {
+    "news_wire": {
+      "macro_score": -0.044,
+      "label": "Neutral",
+      "source": "openrouter_failed+vader (err=parse_error:Expecting value: line 1 column 1 (char 0))",
+      "top_headlines": [
+        "Bitcoin price drops to $63K as US, Israel bomb Iran",
+        "OpenAI wins defense contract hours after government ditches Anthropic",
+        "Mt. Gox's former CEO floats hard fork to recover 80K hacked Bitcoin"
+      ],
+      "bearish_block": false,
+      "age_secs": 105.8,
+      "llm_enriched": false,
+      "llm_error": "parse_error:Expecting value: line 1 column 1 (char 0)",
+      "llm_latency_ms": 6844.0
+    },
+    "arbitrator": {
+      "reachable_exchanges": [
+        "binance"
+      ],
+      "opportunities": {}
+    },
+    "rl_brain": {
+      "bull": {
+        "multiplier": 1.0,
+        "wins": 0,
+        "losses": 0,
+        "total_trades": 0,
+        "win_rate": 0.0,
+        "total_pnl": 0.0,
+        "last_updated": 1772269763.0163674
+      },
+      "bear": {
+        "multiplier": 1.0,
+        "wins": 0,
+        "losses": 0,
+        "total_trades": 0,
+        "win_rate": 0.0,
+        "total_pnl": 0.0,
+        "last_updated": 1772269763.0163674
+      },
+      "chop": {
+        "multiplier": 0.95,
+        "wins": 2,
+        "losses": 1,
+        "total_trades": 3,
+        "win_rate": 0.6667,
+        "total_pnl": 4.7,
+        "last_updated": 1772269826.5488145
+      }
+    }
+  },
+  "p7_cb_drawdown": {
+    "drawdown_pct": 0.0,
+    "peak_equity": 0.0,
+    "latest_equity": 0.0,
+    "tripped": false,
+    "tripped_at": 0.0
+  },
+  "p7_kelly_scale": {
+    "macro_score": -0.044,
+    "multiplier": 0.884,
+    "alloc": 0.0442,
+    "blocked": false,
+    "label": "\u27a1\ufe0f  Neutral Band"
+  },
+  "p7_slippage": {
+    "ETH": {
+      "avg_slip_bps": -1116.535,
+      "max_slip_bps": 0.971,
+      "min_slip_bps": -2234.041,
+      "samples": 2,
+      "fill_rate_1h": null
+    },
+    "XRP": {
+      "avg_slip_bps": 162.849,
+      "max_slip_bps": 488.546,
+      "min_slip_bps": -0.0,
+      "samples": 3,
+      "fill_rate_1h": null
+    },
+    "BTC": {
+      "avg_slip_bps": -91.576,
+      "max_slip_bps": -19.514,
+      "min_slip_bps": -163.639,
+      "samples": 2,
+      "fill_rate_1h": null
+    }
+  },
+  "p7_spread": {
+    "BTC": {
+      "offset_bps": 0.5,
+      "fill_rate": 0.0,
+      "fill_rate_1h": null,
+      "samples": 0,
+      "tick_sz": 0.1
+    },
+    "XRP": {
+      "offset_bps": 0.5,
+      "fill_rate": 0.0,
+      "fill_rate_1h": null,
+      "samples": 0,
+      "tick_sz": 0.0001
+    },
+    "ETH": {
+      "offset_bps": 0.5,
+      "fill_rate": 0.0,
+      "fill_rate_1h": null,
+      "samples": 0,
+      "tick_sz": 0.01
+    },
+    "SOL": {
+      "offset_bps": 0.5,
+      "fill_rate": 0.0,
+      "fill_rate_1h": null,
+      "samples": 0,
+      "tick_sz": 0.0
+    },
+    "DOGE": {
+      "offset_bps": 0.5,
+      "fill_rate": 0.0,
+      "fill_rate_1h": null,
+      "samples": 0,
+      "tick_sz": 0.0
+    },
+    "BNB": {
+      "offset_bps": 0.5,
+      "fill_rate": 0.0,
+      "fill_rate_1h": null,
+      "samples": 0,
+      "tick_sz": 0.0
+    }
+  },
+  "p16_last_express_by_sym": {
+    "XRP": 95.5,
+    "ETH": 80.4,
+    "BTC": 78.2
+  },
+  "p18_adaptive_conviction": {
+    "dynamic_sizing_enabled": true,
+    "latest_multipliers": {}
+  },
+  "p19_state_save_interval_secs": 1800.0,
+  "p20_shadow_hmm_metrics": {},
+  "p21_execution": {
+    "p21_slippage_guard": {
+      "throttle_pct": 0.05,
+      "throttle_count": 0,
+      "pass_count": 0,
+      "latest_spreads": {},
+      "throttled_now": {}
+    },
+    "p21_microburst": {
+      "legs": 1,
+      "delay_secs": 0.8,
+      "liq_threshold": 0.4,
+      "leg_fractions": [
+        1.0
+      ],
+      "burst_count": 0,
+      "single_count": 0,
+      "leg_fills_total": 0
+    },
+    "p21_tif_watcher": {
+      "timeout_secs": 10.0,
+      "pending_count": 0,
+      "pending_orders": [],
+      "cancel_count": 0,
+      "fill_count": 0,
+      "timeout_count": 0
+    },
+    "p21_enabled": true,
+    "p21_spread_throttle_pct": 0.05,
+    "p21_liq_threshold": 0.4,
+    "p21_microburst_legs": 1,
+    "p21_microburst_delay_secs": 0.8,
+    "p21_tif_timeout_secs": 10.0
+  },
+  "p22": {
+    "openrouter_model": "stepfun/step-3.5-flash:free",
+    "openrouter_active": true,
+    "entropy_threshold": 3.5,
+    "entropy_confidence_boost": 0.2,
+    "bull_trail_widen": 0.005,
+    "chop_trail_tighten": 0.002,
+    "panic_lock": {
+      "locked": false,
+      "blocked_until": 0.0,
+      "remaining_secs": 0.0,
+      "trigger_count": 0,
+      "drop_threshold": 1.5,
+      "quorum_pct": 0.66,
+      "window_secs": 60.0,
+      "block_secs": 300.0,
+      "per_coin": {}
+    },
+    "entropy_per_coin": {
+      "BTC": {
+        "entropy": 1.661,
+        "n_returns": 0
+      },
+      "XRP": {
+        "entropy": 1.661,
+        "n_returns": 0
+      },
+      "ETH": {
+        "entropy": 1.661,
+        "n_returns": 0
+      },
+      "SOL": {
+        "entropy": 1.661,
+        "n_returns": 0
+      },
+      "DOGE": {
+        "entropy": 1.661,
+        "n_returns": 0
+      },
+      "BNB": {
+        "entropy": 1.661,
+        "n_returns": 0
+      }
+    }
+  },
+  "p22_latency_bar": {
+    "ai_latency_ms": null,
+    "exchange_latency_ms": null,
+    "newswire_latency_ms": 6844.0
+  },
+  "p22_whale_tape": [
+    {
+      "symbol": "XRP",
+      "size_usd": 4459.38,
+      "signal": "WHALE_SWEEP_BUY",
+      "multiplier": 6.34,
+      "valid": true,
+      "cancel_buys": false
+    },
+    {
+      "symbol": "BTC",
+      "size_usd": 0.05,
+      "signal": "WHALE_SWEEP_SELL",
+      "multiplier": 5.03,
+      "valid": true,
+      "cancel_buys": true
+    }
+  ]
+}
