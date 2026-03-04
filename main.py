@@ -1,105 +1,13 @@
 """
-main.py  —  Phase 40.1: Binary Truth Synchronization
+main.py  —  Phase 40.3 PowerTrader AI Core Orchestrator
 
-Refactor changelog (Phase 40.1 — Binary Truth Synchronization):
-  [P40.1-RG]    Ready-Gate Fix — executor._on_bridge_account_update() and
-                executor._on_bridge_ghost_healed() now call
-                self._p40_ready_gate.set() after accepting valid Binary Truth
-                equity from the Rust bridge.  Previously the bridge path
-                NEVER opened the ready-gate, so _cycle() blocked trading
-                permanently with bridge active.  Fix is applied in executor.py.
-
-  [P40.1-HEAL]  Ghost-Heal Listener — _on_bridge_ghost_healed_main now
-                immediately applies the Rust bridge's healed_eq to
-                executor._equity, brain.peak_equity, and writes an
-                atomic patch to trader_status.json so the Dashboard
-                reads the correct equity within milliseconds of the
-                heal event rather than waiting for the 2-second
-                _gui_bridge cycle.
-
-  [P40.1-HB]    Heartbeat Reset — _on_bridge_account_update_main,
-                _on_bridge_fill_main, and _on_bridge_ghost_healed_main
-                all call _touch_hub_timestamp() so every valid bridge
-                message refreshes the trader_status.json timestamp and
-                stops the Watchdog from declaring STALE data on a
-                healthy bot.
-
-  [P40.1-SHIELD] Zero-Value Shield (Anti-Zombie) — _gui_bridge carries
-                a strict guard: if the reported equity is ≤ 1.0 AND
-                the bridge has flagged it as a ghost read, peak_equity
-                and the drawdown calculation are FROZEN (not updated).
-                Additionally, if the bridge confirms a ghost-state is
-                currently being healed, executor._p20_zombie_mode is
-                explicitly forced to False so the "Zombie Mode" UI
-                indicator is never triggered by phantom equity.
-
-  [P40.1-CLI]   --no-bridge flag — explicitly added to argparse so
-                Safe Mode (legacy REST/WS, no Rust binary) can be
-                activated at the command line without relying on the
-                hasattr() guard.  BridgeClient(auto_start_bridge=False)
-                is the canonical Safe Mode path.
-
-  [P40.1-RETAIN] Consistency — retained_equity logged by the ghost-heal
-                handler exactly matches the value written to the
-                Dashboard, eliminating the UI/Logic discrepancy.
-
-  All Phase 24.1 and earlier changes preserved verbatim.
-
-Refactor changelog (Phase 24.1 — Hard-Reset):
-
-  [P24.1-PATH]  Explicit HUB_DIR Guarantee — os.makedirs(HUB_DIR, exist_ok=True)
-                is called immediately after BASE_DIR/HUB_DIR are defined, before
-                any path-derived constants are used.  This ensures the hub_data/
-                directory always exists even on a clean container first boot or
-                after an accidental directory deletion.  Complements the existing
-                _preseed_hub_state() atomic seeding.
-
-  All Phase 24 path unification and pre-seed logic preserved verbatim.
-
-Refactor changelog (Phase 24 — Systemic Defense):
-  [P24-PATH-1]  Path Unification — HUB_DIR is hard-coded as a sub-folder of
-                the script's directory.  os.environ overwrite of POWERTRADER_HUB_DIR
-                is removed.  A single source of truth block at the top of the
-                module defines ALL hub paths.  No more Shadow Directory bugs.
-
-  [P24-SEED-2]  Pre-Seed Startup — _preseed_hub_state() creates hub_data/ if
-                missing and writes Zero-State valid JSON objects to
-                trader_status.json and veto_audit.json at startup so the
-                Dashboard never sees a null state on first boot.
-
-  All Phase 22/23 changes preserved verbatim (see original changelog below).
-
-Refactor changelog (Production-Readiness Pass):
-  [SHUTDOWN-4] Hanging-Shutdown Guard — the entire component teardown block
-               is wrapped in asyncio.wait_for(_teardown(...),
-               timeout=SHUTDOWN_TIMEOUT_SECS).  If any component fails to
-               close within SHUTDOWN_TIMEOUT_SECS seconds, a TimeoutError is
-               caught, a CRITICAL log is emitted, and sys.exit(2) fires
-               immediately so the OS process watchdog can restart the bot
-               without a hanging zombie.
-
-  [LLMFB-3]   LLM Empty-Response Fallback — every call to _p17_veto.score()
-               and any other OpenRouter call-site is wrapped in try/except.
-               On empty body, whitespace, 'char 0' JSON error, or any other
-               exception the bot returns a neutral NarrativeResult
-               (score=0.5, verdict='PASS', conviction_multiplier=1.0) and
-               continues on pure TA-driven trading.  The bot will never crash
-               because the AI free-tier is lagging.
-
-  All other Phase 22 changes preserved verbatim (P22-1..P22-4).
-
-Changes vs Phase 21:
-  [P22-1] OpenRouter Unified AI Hub
-  [P22-2] Entropy Shield
-  [P22-3] Regime-Adaptive Take-Profit
-  [P22-4] Systemic Panic Lock
-
-All Phase 21, 20, 19, 18, 17 components fully preserved.
-
-Exit Codes:
+Exit codes:
   0  — Clean, intentional shutdown
   1  — Fatal startup error
   2  — Unrecoverable runtime error / forced shutdown after timeout
+
+[ATOMIC-MIRROR-SYNC]     Every total_equity write also writes retained_equity.
+[ANALYTICS-NULL-SHIELD]  analytics and symbols always (data or {}) — never None.
 """
 from __future__ import annotations
 
@@ -116,9 +24,9 @@ from collections import defaultdict, deque
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import aiohttp   # [STAGE-3] Binance public trade stream (already a dep via data_hub)
 import numpy as np
 from dotenv import load_dotenv
-
 
 load_dotenv(override=True)
 
@@ -149,6 +57,34 @@ from intelligence_layer import (
 )
 
 log = logging.getLogger("main_p22")
+
+# ── Safe env parsing (prevents startup crash on invalid env vars) ───────────
+def _env_float(key: str, default: float) -> float:
+    raw = os.environ.get(key, "")
+    if raw == "":
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        try:
+            log.warning("Invalid float env %s=%r; using default=%s", key, raw, default)
+        except Exception:
+            pass
+        return default
+
+def _env_int(key: str, default: int) -> int:
+    raw = os.environ.get(key, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        try:
+            log.warning("Invalid int env %s=%r; using default=%s", key, raw, default)
+        except Exception:
+            pass
+        return default
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -160,11 +96,6 @@ logging.basicConfig(
 for _lib in ("aiohttp", "websockets", "urllib3", "hpack", "ccxt"):
     logging.getLogger(_lib).setLevel(logging.WARNING)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# [P24-PATH-1] Single Source of Truth — ALL paths derived from BASE_DIR.
-# HUB_DIR is hard-coded as hub_data/ inside the script directory.
-# No os.environ override so Shadow Directory bugs are impossible.
-# ══════════════════════════════════════════════════════════════════════════════
 BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
 GUI_SETTINGS       = os.environ.get(
     "POWERTRADER_GUI_SETTINGS", os.path.join(BASE_DIR, "gui_settings.json")
@@ -189,11 +120,7 @@ TRADER_STATUS_PATH = os.path.join(HUB_DIR, "trader_status.json")
 TIF_PENDING_PATH   = os.path.join(HUB_DIR, "tif_pending.json")
 PANIC_LOCK_PATH    = os.path.join(HUB_DIR, "panic_lock.json")   # [P22-4]
 VETO_AUDIT_PATH    = os.path.join(HUB_DIR, "veto_audit.json")   # [P24-SEED-2]
-CONTROL_EVENT_PATH = os.path.join(HUB_DIR, "control_event.json")# [P24-DEFENSE]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P24-SEED-2]  Pre-Seed Hub State
-# ══════════════════════════════════════════════════════════════════════════════
+CONTROL_QUEUE_PATH = os.path.join(HUB_DIR, "control_queue.jsonl")# [P24-DEFENSE]
 
 def _preseed_hub_state() -> None:
     """
@@ -219,7 +146,12 @@ def _preseed_hub_state() -> None:
             "timestamp":    _NOW,
             "status":       "pre_seed",
             "demo_mode":    False,
-            "account":      {"total_equity": 0.0, "buying_power": 0.0},
+            "account":      {
+                "total_equity":    0.0,
+                # [ATOMIC-MIRROR-SYNC] retained_equity always mirrors total_equity.
+                "retained_equity": 0.0,
+                "buying_power":    0.0,
+            },
             "positions":    {},
             "p24_preseed":  True,
         },
@@ -255,55 +187,47 @@ def _preseed_hub_state() -> None:
                 except Exception:
                     pass
 
-
 # [P24-SEED-2] Run pre-seed at import time (before any component is initialised).
 _preseed_hub_state()
 
-
 TF_ALL = ["1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"]
 
-NEWS_BLOCK_THRESHOLD = float(os.environ.get("NEWS_BEARISH_BLOCK_THRESHOLD", "-0.5"))
-ARB_EXEC_PCT         = float(os.environ.get("ARB_SPREAD_EXEC_PCT",          "0.2"))
+NEWS_BLOCK_THRESHOLD = _env_float("NEWS_BEARISH_BLOCK_THRESHOLD", -0.5)
+ARB_EXEC_PCT         = _env_float("ARB_SPREAD_EXEC_PCT", 0.2)
 MAX_ATOMIC_RETRIES   = 5
 ATOMIC_RETRY_BASE    = 0.1
 
-P19_STATE_SAVE_INTERVAL_SECS = float(
-    os.environ.get("P19_STATE_SAVE_INTERVAL_SECS", str(60 * 30))
+P19_STATE_SAVE_INTERVAL_SECS = _env_float("P19_STATE_SAVE_INTERVAL_SECS", float(str(60 * 30))
 )
 
-P20_DRAWDOWN_ZOMBIE_PCT   = float(os.environ.get("P20_DRAWDOWN_ZOMBIE_PCT",   "10.0"))
-P20_COLD_START_GRACE_SECS = float(os.environ.get("P20_COLD_START_GRACE_SECS", "60.0"))
-P20_SHADOW_INTERVAL_SECS  = float(os.environ.get("P20_SHADOW_INTERVAL_SECS",  str(24 * 3600)))
+P20_DRAWDOWN_ZOMBIE_PCT   = _env_float("P20_DRAWDOWN_ZOMBIE_PCT", 10.0)
+P20_COLD_START_GRACE_SECS = _env_float("P20_COLD_START_GRACE_SECS", 60.0)
+P20_SHADOW_INTERVAL_SECS  = _env_float("P20_SHADOW_INTERVAL_SECS", float(str(24 * 3600)))
 P20_SHADOW_AUTO_SWAP      = os.environ.get("P20_SHADOW_AUTO_SWAP", "0").strip() == "1"
 
 # [SHUTDOWN-4] Maximum seconds to wait for all components to close gracefully
 # before forcing sys.exit(2) and letting the watchdog restart the bot.
-SHUTDOWN_TIMEOUT_SECS = float(os.environ.get("SHUTDOWN_TIMEOUT_SECS", "10.0"))
+SHUTDOWN_TIMEOUT_SECS = _env_float("SHUTDOWN_TIMEOUT_SECS", 10.0)
 
 # ── [P21] Institutional Execution parameters ──────────────────────────────────
-P21_SPREAD_THROTTLE_PCT     = float(os.environ.get("P21_SPREAD_THROTTLE_PCT",     "0.05"))
-P21_LOW_LIQUIDITY_THRESHOLD = float(os.environ.get("P21_LOW_LIQUIDITY_THRESHOLD", "0.4"))
-P21_MICROBURST_LEGS         = int  (os.environ.get("P21_MICROBURST_LEGS",         "3"))
-P21_MICROBURST_DELAY_SECS   = float(os.environ.get("P21_MICROBURST_DELAY_SECS",   "0.8"))
-P21_TIF_TIMEOUT_SECS        = float(os.environ.get("P21_TIF_TIMEOUT_SECS",        "10.0"))
-P21_TIF_POLL_SECS           = float(os.environ.get("P21_TIF_POLL_SECS",           "1.0"))
-P21_SPREAD_CACHE_TTL        = float(os.environ.get("P21_SPREAD_CACHE_TTL",        "2.0"))
+P21_SPREAD_THROTTLE_PCT     = _env_float("P21_SPREAD_THROTTLE_PCT", 0.05)
+P21_LOW_LIQUIDITY_THRESHOLD = _env_float("P21_LOW_LIQUIDITY_THRESHOLD", 0.4)
+P21_MICROBURST_LEGS         = _env_int("P21_MICROBURST_LEGS", 3)
+P21_MICROBURST_DELAY_SECS   = _env_float("P21_MICROBURST_DELAY_SECS", 0.8)
+P21_TIF_TIMEOUT_SECS        = _env_float("P21_TIF_TIMEOUT_SECS", 10.0)
+P21_TIF_POLL_SECS           = _env_float("P21_TIF_POLL_SECS", 1.0)
+P21_SPREAD_CACHE_TTL        = _env_float("P21_SPREAD_CACHE_TTL", 2.0)
 
 # ── [P22] Phase 22 parameters ─────────────────────────────────────────────────
-P22_ENTROPY_HIGH_THRESHOLD   = float(os.environ.get("P22_ENTROPY_HIGH_THRESHOLD",   "3.5"))
-P22_ENTROPY_CONFIDENCE_BOOST = float(os.environ.get("P22_ENTROPY_CONFIDENCE_BOOST", "0.20"))
-P22_BULL_TRAIL_WIDEN         = float(os.environ.get("P22_BULL_TRAIL_WIDEN",   "0.005"))
-P22_CHOP_TRAIL_TIGHTEN       = float(os.environ.get("P22_CHOP_TRAIL_TIGHTEN", "0.002"))
-P22_PANIC_DROP_PCT           = float(os.environ.get("P22_PANIC_DROP_PCT",   "1.5"))
-P22_PANIC_QUORUM_PCT         = float(os.environ.get("P22_PANIC_QUORUM_PCT", "0.66"))
-P22_PANIC_WINDOW_SECS        = float(os.environ.get("P22_PANIC_WINDOW_SECS","60.0"))
-P22_PANIC_BLOCK_SECS         = float(os.environ.get("P22_PANIC_BLOCK_SECS", "300.0"))
-P22_MIN_SIGNAL_CONFIDENCE    = float(os.environ.get("P22_MIN_SIGNAL_CONFIDENCE", "0.55"))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [LLMFB-3] Module-level neutral NarrativeResult factory
-# ══════════════════════════════════════════════════════════════════════════════
+P22_ENTROPY_HIGH_THRESHOLD   = _env_float("P22_ENTROPY_HIGH_THRESHOLD", 3.5)
+P22_ENTROPY_CONFIDENCE_BOOST = _env_float("P22_ENTROPY_CONFIDENCE_BOOST", 0.2)
+P22_BULL_TRAIL_WIDEN         = _env_float("P22_BULL_TRAIL_WIDEN", 0.005)
+P22_CHOP_TRAIL_TIGHTEN       = _env_float("P22_CHOP_TRAIL_TIGHTEN", 0.002)
+P22_PANIC_DROP_PCT           = _env_float("P22_PANIC_DROP_PCT", 1.5)
+P22_PANIC_QUORUM_PCT         = _env_float("P22_PANIC_QUORUM_PCT", 0.66)
+P22_PANIC_WINDOW_SECS        = _env_float("P22_PANIC_WINDOW_SECS", 60.0)
+P22_PANIC_BLOCK_SECS         = _env_float("P22_PANIC_BLOCK_SECS", 300.0)
+P22_MIN_SIGNAL_CONFIDENCE    = _env_float("P22_MIN_SIGNAL_CONFIDENCE", 0.55)
 
 def _make_neutral_narrative() -> NarrativeResult:
     """
@@ -341,11 +265,6 @@ def _make_neutral_narrative() -> NarrativeResult:
         pass
     ns = _types.SimpleNamespace(**_FIELDS)
     return ns  # type: ignore[return-value]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P20] Graced risk classes
-# ══════════════════════════════════════════════════════════════════════════════
 
 class GracedGlobalRiskManager(GlobalRiskManager):
     """
@@ -389,7 +308,6 @@ class GracedGlobalRiskManager(GlobalRiskManager):
         })
         return snap
 
-
 class GracedCircuitBreaker(CircuitBreaker):
     """
     [P7/P20] CircuitBreaker with a cold-start grace window.  During the
@@ -429,11 +347,6 @@ class GracedCircuitBreaker(CircuitBreaker):
         if self._in_grace():
             return False
         return super().is_tripped
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P22-4] PanicLock — Systemic Panic Detection
-# ══════════════════════════════════════════════════════════════════════════════
 
 class PanicLock:
     """
@@ -605,11 +518,6 @@ class PanicLock:
             "per_coin":       per_sym,
         }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P21] Institutional Execution classes
-# ══════════════════════════════════════════════════════════════════════════════
-
 class DynamicSlippageGuard:
     """
     [P21-1] Fetches real-time BBO spread and throttles order entry when
@@ -682,7 +590,6 @@ class DynamicSlippageGuard:
             "latest_spreads": {s: round(self._cache[s][3], 6) for s in self._cache},
             "throttled_now":  {s: self._cache[s][4] for s in self._cache},
         }
-
 
 class MicroBurstExecutor:
     """
@@ -796,7 +703,6 @@ class MicroBurstExecutor:
             "single_count":    self._single_count,
             "leg_fills_total": self._leg_fills,
         }
-
 
 class TIFWatcher:
     """
@@ -959,7 +865,6 @@ class TIFWatcher:
             "timeout_count":  self._timeout_count,
         }
 
-
 class P21ExecutionMonitor:
     """[P21] Aggregates status snapshots from all three P21 sub-systems."""
 
@@ -980,11 +885,6 @@ class P21ExecutionMonitor:
             "p21_microburst_delay_secs": P21_MICROBURST_DELAY_SECS,
             "p21_tif_timeout_secs":      P21_TIF_TIMEOUT_SECS,
         }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P22-2] Rolling return / Shannon entropy buffer
-# ══════════════════════════════════════════════════════════════════════════════
 
 class EntropyBuffer:
     """
@@ -1015,11 +915,6 @@ class EntropyBuffer:
         ]
         return returns
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
 def load_coins_from_settings() -> List[str]:
     try:
         with open(GUI_SETTINGS, "r", encoding="utf-8") as f:
@@ -1031,14 +926,13 @@ def load_coins_from_settings() -> List[str]:
         pass
     return ["BTC", "ETH", "XRP", "BNB", "DOGE"]
 
-
 async def _atomic_write(path: str, obj: dict) -> bool:
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=2)
     except Exception as exc:
-        log.error("[P8] Atomic write failed to serialise %s: %s", tmp, exc)
+        log.error("[P8] Atomic write failed to serialise %s: %s", tmp, exc, exc_info=True)
         return False
     for attempt in range(1, MAX_ATOMIC_RETRIES + 1):
         try:
@@ -1048,23 +942,17 @@ async def _atomic_write(path: str, obj: dict) -> bool:
             if attempt == MAX_ATOMIC_RETRIES:
                 log.error(
                     "[P8] All %d atomic write attempts failed: %s",
-                    MAX_ATOMIC_RETRIES, exc,
+                    MAX_ATOMIC_RETRIES, exc, exc_info=True,
                 )
                 return False
             await asyncio.sleep(ATOMIC_RETRY_BASE * attempt)
     return False
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P40.1-HB]  Hub heartbeat helpers — called on every valid bridge message
-# so the Watchdog never sees STALE data on a healthy bot.
-# ══════════════════════════════════════════════════════════════════════════════
-
 # [P40.1-HB] Throttled heartbeat state — avoids redundant I/O churn.
 # Writes at most once every 5 seconds unless forced (ghost-heal / fill).
 _P401_HB_LOCK: asyncio.Lock = asyncio.Lock()
 _P401_HB_LAST_WRITE_TS: float = 0.0
-_P401_HB_MIN_INTERVAL_SECS: float = float(os.environ.get("P401_HB_MIN_INTERVAL_SECS", "5.0"))
+_P401_HB_MIN_INTERVAL_SECS: float = _env_float("P401_HB_MIN_INTERVAL_SECS", 5.0)
 
 async def _touch_hub_timestamp(path: str = TRADER_STATUS_PATH, *, force: bool = False) -> None:
     """
@@ -1096,7 +984,6 @@ async def _touch_hub_timestamp(path: str = TRADER_STATUS_PATH, *, force: bool = 
     except Exception as _exc:
         log.debug("[P40.1-HB] _touch_hub_timestamp error (non-fatal): %s", _exc)
 
-
 async def _patch_trader_status_equity(
     path: str,
     retained_equity: float,
@@ -1104,23 +991,19 @@ async def _patch_trader_status_equity(
     ghost_count: int,
 ) -> None:
     """
-    [P40.1-HEAL] Atomically patch ``account.total_equity`` in the hub status
-    file with the Rust-bridge-healed equity value.
+    [ATOMIC-MIRROR-SYNC] Atomically patch account.total_equity AND
+    account.retained_equity (Binary Truth anchor) in trader_status.json.
 
-    This is called immediately on a ``ghost_healed`` bridge event so the
-    Dashboard shows the correct equity without waiting for the next
-    _gui_bridge write cycle (default 2 s).
+    Called immediately on ghost_healed so Dashboard shows Binary Truth without
+    waiting for the next _gui_bridge cycle (default 2s).
 
     Fields patched:
-      timestamp                   → time.time()
-      account.total_equity        → retained_equity
-      equity_is_ghost             → False
-      consecutive_ghost_reads     → 0
-      p40_ghost_heal_source       → bridge_source
-      p40_ghost_heal_count        → ghost_count
-      p40_last_heal_ts            → time.time()
-      zombie_mode (if present)    → False  (bridge confirmed heal = no zombie)
-      p20_zombie_mode (if present)→ False
+      account.total_equity     → retained_equity (Binary Truth)
+      account.retained_equity  → retained_equity (Binary Truth anchor)
+      equity_is_ghost          → False
+      consecutive_ghost_reads  → 0
+      zombie_mode              → False
+      p20_zombie_mode          → False
     """
     try:
         try:
@@ -1140,7 +1023,9 @@ async def _patch_trader_status_equity(
         # Patch nested account block if present
         if "account" not in _doc or not isinstance(_doc["account"], dict):
             _doc["account"] = {}
-        _doc["account"]["total_equity"] = retained_equity
+        # [ATOMIC-MIRROR-SYNC] Write both fields atomically — Binary Truth anchor.
+        _doc["account"]["total_equity"]    = retained_equity
+        _doc["account"]["retained_equity"] = retained_equity
 
         # Veto zombie flags — ghost heal proves the equity reading was bad
         _doc["zombie_mode"]     = False
@@ -1153,15 +1038,15 @@ async def _patch_trader_status_equity(
 
         await _atomic_write(path, _doc)
         log.info(
-            "[P40.1-HEAL] trader_status.json patched → "
+            "[ATOMIC-MIRROR-SYNC] trader_status.json patched → "
             "retained_equity=%.4f  ghost=False  zombie=False  source=%s",
             retained_equity, bridge_source,
         )
     except Exception as _exc:
         log.warning(
-            "[P40.1-HEAL] _patch_trader_status_equity error (non-fatal): %s", _exc
+            "[ATOMIC-MIRROR-SYNC] _patch_trader_status_equity error (non-fatal): %s",
+            _exc
         )
-
 
 async def _write_runner_ready(
     ready: bool, stage: str, ready_coins: List[str], total_coins: int
@@ -1173,7 +1058,6 @@ async def _write_runner_ready(
         "ready_coins": ready_coins,
         "total_coins": total_coins,
     })
-
 
 def _validate_credentials() -> None:
     missing = [
@@ -1188,11 +1072,6 @@ def _validate_credentials() -> None:
             "[P22-1] OPENROUTER_API_KEY not set — "
             "LLM scoring will fall back to keyword heuristics."
         )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P19-1] Periodic brain state saver
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def _brain_state_saver(
     brain, path: str, interval: float = P19_STATE_SAVE_INTERVAL_SECS
@@ -1210,11 +1089,6 @@ async def _brain_state_saver(
         except Exception as exc:
             log.warning("[P19-1] Periodic save raised: %s", exc)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P16] Whale callback factory
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _make_whale_callback(executor: Executor):
     async def _on_whale_signal(oracle_signal) -> None:
         sym  = oracle_signal.symbol
@@ -1230,33 +1104,6 @@ def _make_whale_callback(executor: Executor):
                 sym, exc, exc_info=True,
             )
     return _on_whale_signal
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [P40.1] OrchestratorGate — P21 + P22 extensions (Bridge-ready)
-#
-# Phase 40.1 refactor — Binary Truth Synchronization:
-#
-#   [P40.1-GATE]  Native installation: executor.gate = self
-#                 Executor._cycle() → _maybe_enter() → self.gate._gated_enter()
-#                 is the Phase 40.1 call chain.  The gate is replaced at the
-#                 OrchestratorGate slot level rather than by injecting instance
-#                 attributes at runtime.  This satisfies the no-monkeypatch
-#                 constraint and keeps the fix native to the class architecture.
-#
-#   [P40.1-CLOSE] _on_post_close() hook replaces the former _record_close
-#                 monkeypatch.  Executor._record_close() calls
-#                 self.gate._on_post_close(pos, fill_px, tag) when the gate
-#                 exposes that method (checked via hasattr).  Brain weight
-#                 updates and slippage auditing are performed here, after the
-#                 executor's own record-keeping is complete.
-#
-#   [P40.1-MB-FB] MicroBurst fallback: when dispatch fails, the gate returns
-#                 True so executor's native execution path (_execute_order or
-#                 TWAP) handles the fill.  _orig_enter is not referenced.
-#
-# All Phase 21 and Phase 22 gate logic is preserved verbatim.
-# ══════════════════════════════════════════════════════════════════════════════
 
 class OrchestratorGate:
     """
@@ -1318,7 +1165,7 @@ class OrchestratorGate:
         self.sentinel           = getattr(executor.gate, "sentinel", None)
 
         self._arb_cooldown: dict = {}
-        self._arb_cooldown_secs = float(os.environ.get("ARB_COOLDOWN_SECS", "30.0"))
+        self._arb_cooldown_secs = _env_float("ARB_COOLDOWN_SECS", 30.0)
 
     def install(self) -> None:
         """
@@ -1563,10 +1410,123 @@ class OrchestratorGate:
             side        = close_side,
         )
 
+# ── [STAGE-3] Binance TPS Ingestor ───────────────────────────────────────────
+# Binance public trade stream — no API keys required.
+# Uses the Combined Stream endpoint so all symbols share one WebSocket.
+#
+# Symbol mapping: OKX-style "BTC" → Binance lowercase "btcusdt"
+# TPS: delegated to DataHub.record_binance_trade() which maintains a rolling
+#      10-second deque.  DataHub.get_global_tape_status() reads it back.
+#
+# Resilience: reconnects on any error with exponential backoff (1 s → 60 s max).
+# Safety: malformed or non-trade messages are silently ignored; the task never
+#         raises an unhandled exception.
+#
+_BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
+_BINANCE_BACKOFF_BASE = 1.0
+_BINANCE_BACKOFF_MAX  = 60.0
 
-# ══════════════════════════════════════════════════════════════════════════════
-# GUI bridge — extended with P22 telemetry
-# ══════════════════════════════════════════════════════════════════════════════
+
+async def _binance_tape_ingestor(hub: "DataHub", symbols: List[str]) -> None:
+    """
+    [STAGE-3] Long-running background task that subscribes to the Binance
+    Combined Public Trade Stream for all configured symbols.
+
+    Trade event schema (Binance @trade stream):
+      {
+        "stream": "btcusdt@trade",
+        "data": {
+          "e": "trade",   -- event type
+          "s": "BTCUSDT", -- symbol
+          "p": "...",     -- price
+          "q": "...",     -- quantity
+          ...
+        }
+      }
+
+    On each valid trade message, calls hub.record_binance_trade() which bumps
+    the rolling TPS counter.  hub.get_global_tape_status() reads the counter
+    and publishes it as p15_global_tape.binance_tps in trader_status.json.
+
+    Parameters
+    ----------
+    hub     : DataHub — the live hub instance; mutated via record_binance_trade()
+    symbols : List[str] — base symbols, e.g. ["BTC", "ETH", "XRP"]
+    """
+    _log = logging.getLogger("main_p22.binance_tape")
+
+    # Build Binance stream names: BTC → btcusdt@trade
+    streams = "/".join(
+        f"{sym.lower().replace('-usdt', '').replace('-swap', '')}usdt@trade"
+        for sym in symbols
+    )
+    url = _BINANCE_WS_BASE + streams
+    _log.info("[STAGE-3] Binance tape ingestor starting: %d symbols url=%s", len(symbols), url)
+
+    backoff = _BINANCE_BACKOFF_BASE
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=15.0,
+                sock_read=30.0,   # heartbeat: Binance sends ping every 20 s
+            )
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.ws_connect(
+                    url,
+                    heartbeat=20.0,  # aiohttp auto-pong on Binance ping frames
+                    max_msg_size=0,  # no limit
+                ) as ws:
+                    _log.info("[STAGE-3] Binance WS connected.")
+                    backoff = _BINANCE_BACKOFF_BASE  # reset on successful connect
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                frame = json.loads(msg.data)
+                                data  = frame.get("data") or {}
+                                # Accept only "trade" event type; ignore snapshots etc.
+                                if data.get("e") != "trade":
+                                    continue
+                                # Validate price and quantity are positive reals
+                                px = float(data.get("p") or 0)
+                                qty = float(data.get("q") or 0)
+                                if px <= 0 or qty <= 0:
+                                    continue
+                                hub.record_binance_trade()
+                            except (json.JSONDecodeError, ValueError, TypeError):
+                                pass  # malformed message — skip silently
+                            except Exception as _exc:
+                                _log.debug(
+                                    "[STAGE-3] Unexpected parse error (non-fatal): %s", _exc
+                                )
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.ERROR,
+                            aiohttp.WSMsgType.CLOSED,
+                        ):
+                            _log.warning(
+                                "[STAGE-3] Binance WS closed (type=%s) — will reconnect in %.1f s.",
+                                msg.type, backoff,
+                            )
+                            break  # exit inner loop → reconnect
+        except asyncio.CancelledError:
+            _log.info("[STAGE-3] Binance tape ingestor cancelled — exiting.")
+            return
+        except Exception as exc:
+            _log.warning(
+                "[STAGE-3] Binance WS error: %s — reconnecting in %.1f s.",
+                exc, backoff,
+            )
+
+        # Exponential backoff before reconnect (bounded to _BINANCE_BACKOFF_MAX)
+        try:
+            await asyncio.sleep(backoff)
+        except asyncio.CancelledError:
+            _log.info("[STAGE-3] Binance tape ingestor cancelled during backoff — exiting.")
+            return
+        backoff = min(backoff * 2.0, _BINANCE_BACKOFF_MAX)
+
+# ── [/STAGE-3] ────────────────────────────────────────────────────────────────
 
 async def _gui_bridge(
     executor,
@@ -1589,6 +1549,13 @@ async def _gui_bridge(
     while True:
         try:
             status     = dict(executor._status)
+            # [ANALYTICS-NULL-SHIELD] (data or {}) — handles None AND non-dict values.
+            if not isinstance(status.get("analytics"), dict):
+                status["analytics"] = (status.get("analytics") or {})
+            if not isinstance(status.get("positions"), dict):
+                status["positions"] = (status.get("positions") or {})
+            if not isinstance(status.get("symbols"), dict):
+                status["symbols"] = {}
             brain_data = {}
 
             for sym in symbols:
@@ -1747,7 +1714,6 @@ async def _gui_bridge(
                 cur_equity = _retained
             # ── [/P40.1-OPEN-POS-SHIELD] ─────────────────────────────────────
 
-
             # If the reported equity is ≤ $1.00 AND the bridge has flagged it
             # as a ghost read (or a heal is in progress), we MUST NOT:
             #   • Update the Peak Equity high-water mark with the ghost value
@@ -1812,11 +1778,64 @@ async def _gui_bridge(
             status["p20_zombie_mode"]        = executor._p20_zombie_mode
             status["p20_shadow_hmm_metrics"] = shadow_hmm_metrics
 
-            if p21_monitor is not None:
+            # ── [S6-1] ALWAYS EXPORT p21_execution (dashboard contract) ───────────
+            # Export a stable schema on every cycle so the dashboard never sees a
+            # missing key. Uses LKG on transient snapshot failures (no blanking).
+            if "p21_lkg" not in locals():
+                p21_lkg: Optional[dict] = None
+            if "p21_last_err_ts" not in locals():
+                p21_last_err_ts: float = 0.0
+
+            def _p21_disabled_stub() -> dict:
+                return {
+                    "p21_enabled": False,
+                    "p21_disabled": True,
+                    "p21_slippage_guard": {},
+                    "p21_microburst": {},
+                    "p21_tif_watcher": {},
+                }
+
+            def _p21_enabled_stub() -> dict:
+                return {
+                    "p21_enabled": True,
+                    "_synthesised": True,
+                    "p21_slippage_guard": {},
+                    "p21_microburst": {},
+                    "p21_tif_watcher": {},
+                }
+
+            if p21_monitor is None:
+                status["p21_execution"] = _p21_disabled_stub()
+            else:
+                snap: Optional[dict] = None
                 try:
-                    status["p21_execution"] = p21_monitor.snapshot()
+                    _raw = p21_monitor.snapshot()
+                    snap = _raw if isinstance(_raw, dict) else None
                 except Exception as exc:
-                    log.debug("[P21] GUI snapshot error: %s", exc)
+                    now = time.time()
+                    if (now - p21_last_err_ts) >= 10.0:
+                        log.warning("[P21] snapshot() error — using LKG: %s", exc, exc_info=True)
+                        p21_last_err_ts = now
+                    snap = None
+
+                if isinstance(snap, dict):
+                    # Validate/patch required sub-dicts (never drop keys)
+                    if not isinstance(snap.get("p21_slippage_guard"), dict):
+                        snap["p21_slippage_guard"] = {}
+                    if not isinstance(snap.get("p21_microburst"), dict):
+                        snap["p21_microburst"] = {}
+                    if not isinstance(snap.get("p21_tif_watcher"), dict):
+                        snap["p21_tif_watcher"] = {}
+                    if "p21_enabled" not in snap:
+                        snap["p21_enabled"] = True
+                    p21_lkg = dict(snap)
+                    status["p21_execution"] = snap
+                else:
+                    # Invalid snapshot: use LKG if present, else enabled stub
+                    if isinstance(p21_lkg, dict) and p21_lkg:
+                        status["p21_execution"] = dict(p21_lkg)
+                    else:
+                        status["p21_execution"] = _p21_enabled_stub()
 
             p22_snap: dict = {
                 "openrouter_model":         OPENROUTER_MODEL,
@@ -1890,20 +1909,37 @@ async def _gui_bridge(
             _whale_tape.sort(key=lambda x: x["size_usd"], reverse=True)
             status["p22_whale_tape"] = _whale_tape[:15]   # cap at 15 rows
 
+            # [ATOMIC-MIRROR-SYNC] Guarantee retained_equity mirrors total_equity
+            # on every _gui_bridge write regardless of source path.
+            try:
+                _acct = status.get("account")
+                if isinstance(_acct, dict):
+                    if "total_equity" in _acct:
+                        _acct["retained_equity"] = _acct["total_equity"]
+                    else:
+                        _acct["retained_equity"] = round(
+                            getattr(executor, "_equity", None) or 0.0, 2
+                        )
+            except Exception:
+                pass
+            # [ANALYTICS-NULL-SHIELD] Final write-time null guard.
+            try:
+                if not isinstance(status.get("analytics"), dict):
+                    status["analytics"] = (status.get("analytics") or {})
+                if not isinstance(status.get("symbols"), dict):
+                    status["symbols"] = {}
+            except Exception:
+                pass
+
             try:
                 await _atomic_write(TRADER_STATUS_PATH, status)
             except Exception as exc:
-                log.error("[P8] GUI bridge write error: %s", exc)
+                log.error("[P8] GUI bridge write error: %s", exc, exc_info=True)
 
         except Exception as exc:
-            log.debug("[GUI] Bridge error: %s", exc)
+            log.debug("[GUI] Bridge error: %s", exc, exc_info=True)
 
         await asyncio.sleep(interval)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Settings watcher / candle callback
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def _settings_watcher(
     executor, brain, symbols_ref: List[str], interval: float = 10.0
@@ -1926,7 +1962,6 @@ async def _settings_watcher(
         except Exception:
             pass
         await asyncio.sleep(interval)
-
 
 async def _on_new_candle(
     candle,
@@ -1956,7 +1991,6 @@ async def _on_new_candle(
     except Exception as exc:
         log.debug("_on_new_candle error %s %s: %s", candle.symbol, candle.tf, exc)
 
-
 async def run_training(coins: List[str], brain) -> None:
     from trainer import train
     log.info("=== TRAINING PHASE ===")
@@ -1965,22 +1999,11 @@ async def run_training(coins: List[str], brain) -> None:
     await _write_runner_ready(False, "training_complete", coins, len(coins))
     log.info("=== TRAINING COMPLETE ===")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Shutdown event + signal handler
-# ══════════════════════════════════════════════════════════════════════════════
-
 _shutdown_event = asyncio.Event()
-
 
 def _handle_signal(*_) -> None:
     log.info("Shutdown signal received — setting shutdown event.")
     _shutdown_event.set()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# [SHUTDOWN-4] Timed component teardown coroutine
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def _teardown(
     tif_watcher,
@@ -2174,11 +2197,6 @@ async def _teardown(
 
     log.info("PowerTrader Phase 40 stopped cleanly.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def main() -> None:
     parser = argparse.ArgumentParser(
         description="PowerTrader Phase 22 — Unified Intelligence & Market Correlation Defense"
@@ -2283,19 +2301,21 @@ async def main() -> None:
         is_ghost = bool(msg.get("is_ghost", False))
         if is_ghost or eq <= 0.0:
             return  # Ghost — let _on_bridge_ghost_healed_main handle resolution
-        # ── [P40.1-OPEN-POS-SHIELD] REST / Bridge Account-Update Guard ───────
-        # If open positions are confirmed by the executor but the incoming
-        # equity is ≤ $1.00 it is structurally impossible — reject as Ghost.
-        if executor.has_open_positions() and eq <= 1.0:
-            _retained = executor._last_valid_equity or eq
-            log.warning(
-                "[SHIELD-REJECT] _on_bridge_account_update_main: "
-                "open positions present but bridge eq=%.6f ≤ 1.0 — "
-                "Ghost Read rejected.  _last_valid_equity=%.6f retained.",
-                eq, _retained,
-            )
-            return  # Do NOT update peak_equity or touch hub timestamp
-        # ── [/P40.1-OPEN-POS-SHIELD] ─────────────────────────────────────────
+        _exec = executor
+        if _exec is not None:
+            # ── [P40.1-OPEN-POS-SHIELD] REST / Bridge Account-Update Guard ───────
+            # If open positions are confirmed by the executor but the incoming
+            # equity is ≤ $1.00 it is structurally impossible — reject as Ghost.
+            if _exec.has_open_positions() and eq <= 1.0:
+                _retained = getattr(_exec, '_last_valid_equity', None) or eq
+                log.warning(
+                    "[SHIELD-REJECT] _on_bridge_account_update_main: "
+                    "open positions present but bridge eq=%.6f ≤ 1.0 — "
+                    "Ghost Read rejected.  _last_valid_equity=%.6f retained.",
+                    eq, _retained,
+                )
+                return  # Do NOT update peak_equity or touch hub timestamp
+            # ── [/P40.1-OPEN-POS-SHIELD] ─────────────────────────────────────────
 
         if brain.peak_equity <= 0 or eq > brain.peak_equity:
             brain.peak_equity = eq
@@ -2360,7 +2380,7 @@ async def main() -> None:
         if healed_eq > 0.0:
             executor._equity = healed_eq
             log.info(
-                "[P40.1-HEAL] executor._equity updated: %.4f → %.4f (retained_equity)",
+                "[ATOMIC-MIRROR-SYNC] executor._equity updated: %.4f → %.4f (retained_equity)",
                 raw_ws_eq, healed_eq,
             )
 
@@ -2396,7 +2416,7 @@ async def main() -> None:
         )
 
         log.info(
-            "[P40.1-HEAL] retained_equity=%.4f written to Dashboard "
+            "[ATOMIC-MIRROR-SYNC] retained_equity=%.4f written to Dashboard "
             "(consistent with executor._equity=%.4f)",
             retained_equity, executor._equity,
         )
@@ -2716,6 +2736,17 @@ async def main() -> None:
             asyncio.create_task(news_wire.refresh_loop(), name="news_wire_refresh")
         )
 
+    # [STAGE-3] Binance public trade stream ingestor — no keys, always started.
+    # Populates hub._binance_trade_ts so get_global_tape_status() returns a
+    # real binance_tps value rather than 0.0.
+    tasks.append(
+        asyncio.create_task(
+            _binance_tape_ingestor(hub, list(symbols_ref)),
+            name="p15_binance_tape_ingestor",
+        )
+    )
+    log.info("[STAGE-3] Binance tape ingestor task registered for %s", symbols_ref)
+
     log.info(
         "🚀 PowerTrader Phase 40 LIVE.  "
         "demo=%s  coins=%s  "
@@ -2783,11 +2814,6 @@ async def main() -> None:
 
     return 0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     # [P40.1-HEAL][P40.1-SHIELD] Custom asyncio runner.
     #
@@ -2819,7 +2845,7 @@ if __name__ == "__main__":
             for t in pending:
                 t.cancel()
             if pending:
-                timeout = float(os.environ.get("SHUTDOWN_TIMEOUT_SECS", "20"))
+                timeout = _env_float("SHUTDOWN_TIMEOUT_SECS", 20.0)
                 loop.run_until_complete(
                     asyncio.wait_for(
                         asyncio.shield(asyncio.gather(*pending, return_exceptions=True)),

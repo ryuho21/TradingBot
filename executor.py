@@ -1,206 +1,13 @@
 """
-executor.py  —  OKX Execution Gateway
-                Phase 40.1: Binary Truth Synchronization (Bridge-Ready)
-                Phase 37: Predictive Microstructure (VPIN / Flow Toxicity)
-                Phase 36.2: Adversarial Resilience — Dynamic Clamping,
-                Multi-Level Mimicry, and Golden Build Monitor
+executor.py  —  Phase 40.3 OKX Execution Gateway
 
-Phase 40.1 additions (Binary Truth Synchronization):
-  [P40.1-RG]    Ready-Gate Fix — _on_bridge_account_update() and
-                _on_bridge_ghost_healed() now unconditionally call
-                self._p40_ready_gate.set() after accepting a valid equity
-                value.  Previously the bridge path NEVER opened the gate,
-                causing _cycle() to block trading permanently whenever the
-                Rust bridge was connected.  The fix ensures the first
-                non-ghost, non-zero Binary Truth equity from the bridge
-                unblocks the cycle loop regardless of whether the legacy
-                WS account handler (_on_account_update) fires concurrently.
-
-  [P40.1-SHIELD] Zombie Veto in ghost_healed — executor-level ghost_healed
-                handler now explicitly sets _p20_zombie_mode = False when
-                it applies the healed equity.  This mirrors the main.py
-                handler and ensures Zombie Mode can never remain active
-                after the bridge confirms the $0.00 reading was phantom.
-
-  [P40.1-SAFE]  Safe Mode Hold — _cycle() ready-gate log now includes the
-                current bridge.connected status so operators can distinguish
-                "waiting for bridge to connect" vs "bridge connected but no
-                equity received yet" in the log stream.
-
-Phase 37 additions (this release):
-  [P37-VPIN]   Emergency Toxicity Exit — _tape_monitor_loop now polls
-               DataHub.get_flow_toxicity(symbol) every tick.  If ToxicityScore
-               spikes above P37_EMERGENCY_EXIT_TOXICITY (default 0.95) and an
-               open position exists, an immediate IOC _close_position() task is
-               launched via _p37_emergency_toxicity_exit().
-
-  [P37-VPIN]   VetoArbitrator Integration — ToxicityScore is injected into
-               VetoArbitrator.set_flow_toxicity() every tape-monitor tick AND
-               at the start of each _cycle() as a belt-and-suspenders feed.
-
-  [P37-GOLDEN] Golden Build Preservation — the emergency toxicity exit does NOT
-               call _p362_reset_golden_counter(). A Toxic Flush protection exit
-               is a feature, not a failure; the golden counter continues its run.
-
-Phase 36.2 additions (this release):
-  [P36.2-DYNCLAMP]  Dynamic Price Clamping — PriceVelocity is sampled over a
-                    configurable 10-second rolling window (P362_VELOCITY_WINDOW_SECS)
-                    per symbol using the tape-monitor velocity feed.  When
-                    PriceVelocity > P362_VELOCITY_THRESHOLD_PCT (default 0.5%) the
-                    DynamicBuffer is doubled from PRICE_LIMIT_BUFFER (5 bps) to
-                    P362_DYNAMIC_BUFFER_HIGH (10 bps).  The live buffer is exposed
-                    via _p362_get_dynamic_buffer(symbol) and used in every
-                    _execute_order price guard and in the PortfolioGovernor hedge leg.
-
-  [P36.2-GOLDEN]    Golden Build Monitor — _p362_cycle_count tracks consecutive
-                    successful cycles with zero sCode 51006 rejections and zero
-                    IndexError crashes.  Any failure resets the counter.  On reaching
-                    P362_GOLDEN_BUILD_CYCLES (default 1000) the monitor writes
-                    GOLDEN_BUILD_REPORT.txt with full performance stats and logs a
-                    prominent SUCCESS banner.
-
-  [P36.2-MIMIC2]    Multi-Level Mimicry — _p36_run_mimic_test() now places TWO
-                    micro POST_ONLY orders simultaneously: one at Level 1 (best
-                    wall) and one at Level 3 of the book.  A Spoof is only confirmed
-                    when BOTH probe levels evaporate (≥ P36_SPOOF_EVAPORATION) within
-                    P36_SPOOF_REACTION_MS.  A single-level evaporation is logged as
-                    AMBIGUOUS and pushes a 0.5 raw probability into the EMA.
-
-  [P36.2-SELFHEAL]  Self-Healing on 51006 — When _execute_order encounters a
-                    sCode 51006 rejection, it immediately fires a non-blocking
-                    asyncio task that calls hub.force_immediate_refresh(symbol) to
-                    bypass the 1800-second timer and fetch fresh buyLmt / sellLmt
-                    bands for that symbol from the OKX REST API.
-
-Phase 36.1 additions (all preserved):
-  [P36-MIMIC]    Passive Spoof Test — before each TWAPSlicer major slice, the
-                 Executor places a tiny minimum-size POST_ONLY "mimic" order at
-                 the same price level as a detected Whale Wall.  If the wall
-                 evaporates within P36_SPOOF_REACTION_MS (default 400ms), the
-                 wall is flagged as a Spoof order.  Implemented in the new
-                 _p36_run_mimic_test() method.
-
-Phase 36.1 additions (this release):
-  [P36-MIMIC]    Passive Spoof Test — before each TWAPSlicer major slice, the
-                 Executor places a tiny minimum-size POST_ONLY "mimic" order at
-                 the same price level as a detected Whale Wall.  If the wall
-                 evaporates within P36_SPOOF_REACTION_MS (default 400ms), the
-                 wall is flagged as a Spoof order.  Implemented in the new
-                 _p36_run_mimic_test() method.
-
-  [P36-SIGNAL]   Toxicity Injection — when a Spoof is detected, the Executor
-                 updates DataHub.update_spoof_toxicity() with a raw probability
-                 of 1.0 (or 0.0 on a clean cycle).  When the resulting EMA
-                 spoof_probability > P36_SPOOF_THRESHOLD (default 0.65), the
-                 TWAPSlicer immediately forces _use_ioc=True for all remaining
-                 slices, switching to Aggressive Taker (IOC) to capture real
-                 liquidity behind the fake wall.
-
-  [P36-VETO]     Manipulation Veto — VetoArbitrator.set_spoof_probability() is
-                 called after each mimic test so intelligence_layer can veto
-                 new entries when spoof_prob > 0.8 (configured in
-                 intelligence_layer.py via P36_SPOOF_VETO_THRESHOLD).
-
-Phase 33.2 additions (all preserved):
-  [P33.2-REBATE]  Maker-Priority Logic
-  [P33.2-CHASE]   Adaptive Price Chasing
-  [P33.2-LAYERING] Stealth Layering Engine
-
-Phase 33.1 additions (all preserved):
-  [P33-SNIFFER]  Toxic Flow Detection — _p32_stealth_twap() (TWAPSlicer) now
-                 monitors rolling HFT cancellation and partial-fill rates via
-                 _p33_toxicity_score().  When the DataHub-derived toxicity
-                 exceeds P33_TOXICITY_THRESHOLD (0.75), the TWAPSlicer
-                 automatically switches from POST_ONLY to IOC (Immediate-or-
-                 Cancel) order type to jump the queue and avoid adversarial
-                 quote-stuffing.  All cancellation and partial-fill events from
-                 the executor's own order lifecycle are recorded via
-                 _p33_record_order_event() into a rolling deque so the toxicity
-                 score reflects real market microstructure rather than simulated
-                 data.  The active order type is logged with the [P33-SNIFFER]
-                 prefix on every TWAP slice.
-
-  [P33-SHADOW]   Iceberg Shadowing — _execute_order() now queries the DataHub
-                 OrderBook for massive passive buy walls after computing the
-                 limit price.  If the best bid wall depth exceeds
-                 P33_ICEBERG_WALL_RATIO × median book depth AND the wall USD
-                 value exceeds P33_ICEBERG_WALL_MIN_USD, the bot price-improves
-                 by exactly 1 tickSz ("shadow" the block) to jump ahead of
-                 resting limit orders and improve fill probability.  The
-                 adjustment is clamped via _clamp_price() before submission.
-                 Shadowing is logged with the [P33-SHADOW] prefix.
-
-  [P33-REVERSION] Exhaustion Gap Filter — _maybe_enter() now reports Whale
-                 Sweep events to the VetoArbitrator via record_sweep_event()
-                 and feeds current price velocity via record_price_velocity()
-                 in the tape monitor loop.  VetoArbitrator.compute_p_success()
-                 returns 0.0 as a hard block when velocity collapses by > 50%
-                 within 500ms of a sweep (implemented in intelligence_layer.py).
-
-Phase 33.1 additions (original docstring — preserved):
-  [P33-SNIFFER]  Toxic Flow Detection — _p32_stealth_twap() (TWAPSlicer) now
-                 monitors rolling HFT cancellation and partial-fill rates via
-                 _p33_toxicity_score().  When the DataHub-derived toxicity
-                 exceeds P33_TOXICITY_THRESHOLD (0.75), the TWAPSlicer
-                 automatically switches from POST_ONLY to IOC (Immediate-or-
-                 Cancel) order type to jump the queue and avoid adversarial
-                 quote-stuffing.  All cancellation and partial-fill events from
-                 the executor's own order lifecycle are recorded via
-                 _p33_record_order_event() into a rolling deque so the toxicity
-                 score reflects real market microstructure rather than simulated
-                 data.  The active order type is logged with the [P33-SNIFFER]
-                 prefix on every TWAP slice.
-
-  [P33-SHADOW]   Iceberg Shadowing — _execute_order() now queries the DataHub
-                 OrderBook for massive passive buy walls after computing the
-                 limit price.  If the best bid wall depth exceeds
-                 P33_ICEBERG_WALL_RATIO × median book depth AND the wall USD
-                 value exceeds P33_ICEBERG_WALL_MIN_USD, the bot price-improves
-                 by exactly 1 tickSz ("shadow" the block) to jump ahead of
-                 resting limit orders and improve fill probability.  The
-                 adjustment is clamped via _clamp_price() before submission.
-                 Shadowing is logged with the [P33-SHADOW] prefix.
-
-  [P33-REVERSION] Exhaustion Gap Filter — _maybe_enter() now reports Whale
-                 Sweep events to the VetoArbitrator via record_sweep_event()
-                 and feeds current price velocity via record_price_velocity()
-                 in the tape monitor loop.  VetoArbitrator.compute_p_success()
-                 returns 0.0 as a hard block when velocity collapses by > 50%
-                 within 500ms of a sweep (implemented in intelligence_layer.py).
-
-Phase 32 additions (all preserved):
-  [P32-OBI-PATIENCE]   Whale-Aware OBI Patience Timer                      [v32.1]
-  [P32-STEALTH-TWAP]   Stealth TWAP Engine
-  [P32-VETO-ARB]       Unified Veto Arbitrator hook
-  [P32-SLIP-ADAPT]     Slippage-Adaptive Execution
-  [P32-LIQ-MAGNET]     Liquidation Magnet Logic
-
-Phase 31 Institutional Tactical Suite (all preserved):
-  [P31-WHALE-TRAIL]  Dynamic Whale-Trail
-  [P31-SMART-RETRY]  Smart-Retry Order Engine
-
-Phase 30.5 additions (all preserved):
-  [P30.5-WARM]    InstrumentCache Pre-Flight Barrier
-  [P30.5-PUBLISH] _publish_status() first-call guarantee
-
-Phase 25 additions (Adaptive Performance Scaling — preserved):
-  [P25-PFVT]  Pre-Flight Truth Verification
-  [v27.1-BOOT] Immediate Boot Status Write
-
-Phase 24.1 additions (Systemic Defense Refactor — all preserved):
-  [P24.1-EXEC-1..4] Truth Verification, force_truth, _hard_reset_sync, Entropy Seeding
-
-Phase 24 additions (all preserved):
-  [P24-DEFENSE-1..ENT] Heartbeat, Ghost Recovery, Entropy Seeding, Command Listener,
-                       Whale Tape, Intelligence Bridge, Entropy Trend
-
-Phase 23 additions (all preserved):
-  [P23-HOTFIX-1..4] Ghost-state hardening  [P23-OPT-1..6] Production optimisations
-
-Phase 20 additions (all preserved):
-  [P20-1] GlobalRiskManager  [P20-2] Council of Judges  [P20-3] Shadow HMM
-
-All earlier phases (1-19) fully preserved.
+[STRICT-ENV-LATCH]       _on_account_update() permanently discards legacy WS equity
+                         when OKX_BRIDGE_ENABLED=1. Env-var only — no connection
+                         status check — eliminates $0.00 zigzag permanently.
+[ATOMIC-MIRROR-SYNC]     Every status write includes both total_equity and
+                         retained_equity (Binary Truth anchor).
+[ANALYTICS-NULL-SHIELD]  analytics and symbols always (data or {}) at construction.
+[READY-GATE-TIMEOUT]     _cycle() wraps _p40_ready_gate.wait() in 30s timeout.
 """
 import asyncio
 import csv
@@ -209,13 +16,13 @@ import json
 import logging
 import math
 import os
-from decimal import Decimal, getcontext
-
 import time
 import types
 import uuid
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -254,10 +61,7 @@ if not os.path.exists(hub_path):
     os.makedirs(hub_path)
     print(f"Created missing directory: {hub_path}")
 
-getcontext().prec = 8
-
 log = logging.getLogger("executor")
-
 
 def _env_float(key: str, default: float) -> float:
     """Parse float env var safely (falls back to default on missing/bad values)."""
@@ -287,51 +91,13 @@ def _env_int(key: str, default: int) -> int:
             pass
         return int(default)
 
+# Attach file handler to executor logger
+_log_file_handler = logging.FileHandler("executor.log", mode="a", encoding="utf-8")
+_log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+log.addHandler(_log_file_handler)
 
-
-def _D(val) -> Decimal:
-    """Coerce val into Decimal safely for financial math (prec=8)."""
-    try:
-        if isinstance(val, Decimal):
-            return val
-        if val is None:
-            return Decimal("0")
-        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-            return Decimal("0")
-        return Decimal(str(val))
-    except Exception:
-        return Decimal("0")
-
-
-def _is_valid_equity(eq) -> bool:
-    """Fail-closed validity check for equity values coming from external JSON."""
-    try:
-        d = _D(eq)
-        return d > 0
-    except Exception:
-        return False
-
-# ── [P32-LOG-FIX] Self-Initializing File Logger ─────────────────────────────
-import logging
-from pathlib import Path
-
-# Ensure the log file exists in the correct directory
-log_file = Path("executor.log")
-file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-file_handler.setFormatter(logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s'))
-
-# Attach to the main executor logger
-
-log = logging.getLogger("executor")
-log.addHandler(file_handler)
-log.setLevel(logging.INFO)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # [SANITIZER] Institutional Environment Sanitizer
 # Must be defined BEFORE any env-var constants so every loader below can use it.
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _clean_env(raw: str) -> str:
     """
@@ -343,7 +109,6 @@ def _clean_env(raw: str) -> str:
     characters are removed.
     """
     return raw.strip().strip("'\"").strip()
-
 
 def _safe_float_env(key: str, default: float) -> float:
     """
@@ -366,7 +131,6 @@ def _safe_float_env(key: str, default: float) -> float:
             key, _raw, default,
         )
         return default
-
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 MAX_DRAWDOWN_PCT     = _env_float("MAX_DRAWDOWN_PCT", 15.0)
@@ -556,6 +320,12 @@ ICEBERG_FILL_TIMEOUT = _env_float("P9_ICEBERG_FILL_TIMEOUT", 45.0)
 # ICEBERG_DISPLAY_PCT is a module-level constant; NameError on line 3712 is fixed.
 ICEBERG_DISPLAY_PCT  = _safe_float_env("P9_ICEBERG_DISPLAY_PCT",  0.10)
 
+# ── [STRICT-ENV-LATCH] ────────────────────────────────────────────────────────
+# OKX_BRIDGE_ENABLED=1 permanently latches the legacy WS equity path OFF.
+# _on_account_update() checks the env var only — no runtime connection check —
+# so the $0.00 zigzag cannot occur during any reconnect window.
+OKX_BRIDGE_ENABLED = os.environ.get("OKX_BRIDGE_ENABLED", "1").strip().strip("'\"") == "1"
+
 SHADOW_REGIMES       = set(os.environ.get("P9_SHADOW_REGIMES", "chop").split(","))
 SHADOW_POLL_SECS     = _env_float("P9_SHADOW_POLL_SECS", 0.5)
 SHADOW_EXPIRY_SECS   = _env_float("P9_SHADOW_EXPIRY_SECS", 120.0)
@@ -641,11 +411,11 @@ P23_FORCE_SYNC_FLAG = os.environ.get(
 
 # ── [P24] Systemic Defense — Control Event path ────────────────────────────────
 # Dashboard writes JSON {"event": "reset_gateway"} here to trigger a hard sync.
-P24_CONTROL_EVENT_PATH = os.environ.get(
-    "P24_CONTROL_EVENT_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_data", "control_event.json"),
+# NEW
+P24_CONTROL_QUEUE_PATH = os.environ.get(
+    "P24_CONTROL_QUEUE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_data", "control_queue.jsonl"),
 )
-
 # ── [FIX-HWM-RACE] Minimum valid equity floor ─────────────────────────────────
 _EXECUTOR_MIN_VALID_EQUITY = _env_float("P7_CB_MIN_VALID_EQUITY", 10.0)
 
@@ -670,10 +440,7 @@ _P25_TACTICAL_DEFAULTS: dict = {"risk_off": False, "sniper_only": False, "hedge_
 # Module-level lock for veto_audit writes from executor context
 _p25_veto_audit_lock = _threading.Lock()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # [LLMFB-3] LLM Empty-Response Fallback Helper
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _make_neutral_narrative() -> NarrativeResult:
     """
@@ -718,10 +485,7 @@ def _make_neutral_narrative() -> NarrativeResult:
     ns = types.SimpleNamespace(**_FIELDS)
     return ns  # type: ignore[return-value]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # [P25] Executor-side Veto Audit Append
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _append_veto_audit_executor(symbol: str, reason: str, details: str = "") -> None:
     """
@@ -769,10 +533,7 @@ def _append_veto_audit_executor(symbol: str, reason: str, details: str = "") -> 
             except Exception:
                 pass
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # [QUANT-1] Size Quantization Layer
-# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class QuantizedSize:
@@ -793,7 +554,6 @@ class QuantizedSize:
     min_sz:   float
     valid:    bool
 
-
 def _lot_decimal_places(lot_sz: float) -> int:
     """
     [QUANT-1] Derive the exact number of decimal places required by a lotSz.
@@ -813,7 +573,6 @@ def _lot_decimal_places(lot_sz: float) -> int:
         return 0
     return len(s.split(".")[1])
 
-
 def _fmt_sz(qty: float, decimals: int) -> str:
     """
     [QUANT-1] Format a quantized quantity as a string with exact precision.
@@ -823,19 +582,14 @@ def _fmt_sz(qty: float, decimals: int) -> str:
         return str(int(qty))
     return f"{qty:.{decimals}f}"
 
-
 def inst_id(symbol: str, swap: bool = False) -> str:
     base = f"{symbol.upper()}-USDT"
     return f"{base}-SWAP" if swap else base
 
-
 # Keep the module-level alias used elsewhere in the file
 _inst_id = inst_id
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Supporting dataclasses (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class WallResult:
@@ -845,7 +599,6 @@ class WallResult:
     bid_vol:       float
     ask_ratio:     float
     bid_ratio:     float
-
 
 @dataclass
 class ShadowWatch:
@@ -874,12 +627,10 @@ class ShadowWatch:
         tol = self.target_px * (SHADOW_HIT_BPS / 10_000.0)
         return abs(current_price - self.target_px) <= tol
 
-
 @dataclass
 class CoinConfig:
     min_usd_value: float = DEFAULT_MIN_USD
     max_alloc_pct: float = MAX_ALLOC_PCT
-
 
 def _load_coin_configs(path: str) -> Dict[str, CoinConfig]:
     try:
@@ -903,13 +654,11 @@ def _load_coin_configs(path: str) -> Dict[str, CoinConfig]:
         log.warning("Could not load coin_config: %s", e)
         return {}
 
-
 @dataclass
 class CoinPerf:
     results:        Deque[bool]     = field(default_factory=lambda: deque(maxlen=AUTO_TUNE_WINDOW))
     alloc_override: Optional[float] = None
     conf_override:  Optional[float] = None
-
 
 class CoinPerformanceTracker:
     def __init__(self):
@@ -965,7 +714,6 @@ class CoinPerformanceTracker:
         p = self._perfs.get(symbol)
         return bool(p and (p.alloc_override is not None or p.conf_override is not None))
 
-
 @dataclass
 class Position:
     symbol:           str
@@ -989,7 +737,6 @@ class Position:
     squeeze_delay_until: float     = 0.0
     entry_limit_px:   float        = 0.0
     p16_express:      bool         = False
-
 
 class DrawdownTracker:
     def __init__(self, pct_limit: float = MAX_DRAWDOWN_PCT,
@@ -1020,10 +767,7 @@ class DrawdownTracker:
         self._killed = False
         self._hist.clear()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # [P20-1] Global Risk Manager (unchanged logic, preserved verbatim)
-# ══════════════════════════════════════════════════════════════════════════════
 
 class GlobalRiskManager:
     """
@@ -1181,10 +925,7 @@ class GlobalRiskManager:
                                if self._zombie_active else 0.0,
         }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Quantity Resolver (updated to use Quantization Layer)
-# ══════════════════════════════════════════════════════════════════════════════
 
 class QuantityResolver:
     def __init__(self, icache: InstrumentCache):
@@ -1199,12 +940,27 @@ class QuantityResolver:
         meta = await self._ic.get_instrument_info(symbol, swap=swap)
         if meta is None:
             raise ValueError(f"[{tag}] No instrument metadata for {symbol} swap={swap}")
-        raw_base = usd_amount / price
+
+        # [FIX-003-PARTIAL] Use Decimal for all sizing arithmetic to eliminate
+        # floating-point accumulation errors in lot-size quantization.
+        try:
+            d_usd   = Decimal(str(usd_amount))
+            d_price = Decimal(str(price))
+        except InvalidOperation:
+            d_usd   = Decimal(usd_amount)
+            d_price = Decimal(price)
+
+        d_raw_base = d_usd / d_price
+
         if swap:
-            ct_val = meta.ct_val if meta.ct_val > 0 else OKX_CT_VAL
-            raw_sz = raw_base / ct_val
+            ct_val   = meta.ct_val if meta.ct_val > 0 else OKX_CT_VAL
+            d_ct_val = Decimal(str(ct_val))
+            d_raw_sz = d_raw_base / d_ct_val
         else:
-            raw_sz = raw_base
+            d_raw_sz = d_raw_base
+
+        raw_sz = float(d_raw_sz)
+
         if usd_amount < coin_cfg.min_usd_value:
             if swap:
                 ct_val   = meta.ct_val if meta.ct_val > 0 else OKX_CT_VAL
@@ -1228,10 +984,7 @@ class QuantityResolver:
             sz_str = f"{final_sz:.{dec}f}"
         return sz_str, final_price
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Smart Order Router (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
 
 class SmartOrderRouter:
     def __init__(self, rest):
@@ -1288,7 +1041,6 @@ class SmartOrderRouter:
             b["posSide"] = pos_side
         return b
 
-
 class OrchestratorGate:
     def __init__(self, hub, sentinel=None):
         self.hub      = hub
@@ -1302,10 +1054,40 @@ class OrchestratorGate:
             return False
         return True
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Executor
-# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _drain_control_queue(path: str) -> list[dict]:
+    """Read all pending control events and clear the queue file."""
+    queue_path = Path(path)
+    if not queue_path.exists():
+        return []
+    events: list[dict] = []
+    try:
+        # Swap-and-read: rename first so dashboard can keep appending to a fresh file
+        tmp_path = queue_path.with_suffix(".jsonl.processing")
+        queue_path.rename(tmp_path)
+        for line in tmp_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    events.append(obj)
+                else:
+                    log.warning("control queue: non-dict JSON skipped: %r", str(line)[:80])
+            except json.JSONDecodeError:
+                log.warning("control queue: bad JSON line skipped: %r", line[:80])
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except TypeError:
+            # Python <3.8 compatibility: missing_ok not available
+            if tmp_path.exists():
+                tmp_path.unlink()
+    except Exception:
+        log.error("_drain_control_queue: failed", exc_info=True)
+    return events
 
 class Executor:
 
@@ -1389,6 +1171,17 @@ class Executor:
         # AND the full account-update branch so back-to-back WS pushes cannot
         # interleave ghost-state detection with a legitimate update in-flight.
         self._equity_lock: asyncio.Lock = asyncio.Lock()
+
+        # [P40.1-LOCK] Status file concurrency lock — serialises all writes to
+        # trader_status.json from bridge handlers so high-frequency account_update
+        # events cannot interleave with ghost_healed atomic patches.
+        self._status_lock: asyncio.Lock = asyncio.Lock()
+
+        # [P40.1-HB] Heartbeat throttle state — mirrors main.py's _P401_HB_*
+        # pattern so the executor-level bridge handlers can touch the status
+        # file without creating a churn storm.
+        self._hb_last_write_ts: float = 0.0
+        self._hb_min_interval: float  = float(os.environ.get("P401_HB_MIN_INTERVAL_SECS", "5.0"))
 
         # [GHOST-3] Flag ensuring only one REST back-fill task runs at a time.
         # Set AFTER task is successfully scheduled so a scheduling error can
@@ -1546,6 +1339,21 @@ class Executor:
         self._p37_exit_in_flight: Dict[str, bool] = {}
         # ── [/P37-VPIN] ──────────────────────────────────────────────────────
 
+        # ── [STAGE2-DEFECT1] OKX Position Reconciliation state ───────────────
+        # Stores the latest OKX REST position snapshot keyed by base symbol.
+        # Populated by _reconcile_positions_from_okx() and merged into
+        # positions_snap in _cycle() to surface exchange-truth positions
+        # not tracked in self.positions (bot state).
+        self._okx_positions_cache: dict = {}
+        # Wall-clock timestamp of the last successful REST positions fetch.
+        # Used to rate-limit reconciliation calls.
+        self._position_reconcile_ts: float = 0.0
+        # Reconciliation interval in seconds — one REST call per 30 s maximum.
+        self._position_reconcile_interval: float = 30.0
+        # Concurrency guard: only one reconciliation task in-flight at a time.
+        self._position_reconcile_in_flight: bool = False
+        # ── [/STAGE2-DEFECT1] ────────────────────────────────────────────────
+
         hub.subscribe("account", self._on_account_update)
         hub.subscribe("fill",    self._on_fill_event)
 
@@ -1581,6 +1389,7 @@ class Executor:
             self.bridge.on("account_update",  self._on_bridge_account_update)
             self.bridge.on("ghost_healed",    self._on_bridge_ghost_healed)
             self.bridge.on("equity_breach",   self._on_bridge_equity_breach)
+            self.bridge.on("order_fill",      self._on_bridge_fill)
             log.info(
                 "[P40] Bridge event handlers registered on executor "
                 "(bridge instance verified non-None; transport connects async)."
@@ -1946,6 +1755,23 @@ class Executor:
 
     # ── Account handlers ───────────────────────────────────────────────────────
 
+    def _is_bridge_active(self) -> bool:
+        """
+        [STRICT-ENV-LATCH] Return True when OKX_BRIDGE_ENABLED=1 is set in the
+        environment.  Permanent, unconditional latch — does NOT check runtime
+        bridge socket connection status.  Env-var intent check only.
+
+        _on_account_update() returns immediately when latched, permanently
+        discarding ALL legacy WS equity updates regardless of bridge connectivity.
+        This is the only way to eliminate the $0.00 zigzag permanently.
+        """
+        val = os.environ.get("OKX_BRIDGE_ENABLED", "")
+        val = val.strip().strip('"').strip("\'").strip()
+        if not val:
+            return False
+        val_l = val.lower()
+        return val_l in {"1", "true", "yes", "on"}
+
     async def _on_account_update(self, snap: AccountSnapshot):
         """
         [LOCK-2] + [GHOST-3] + [EQBOOT-2] State-Aware equity validator.
@@ -1968,6 +1794,13 @@ class Executor:
         raw_equity = snap.total_equity
         raw_avail  = snap.buying_power
 
+        # ── [STRICT-ENV-LATCH] ───────────────────────────────────────────────
+        # OKX_BRIDGE_ENABLED=1: permanently discard ALL legacy WS equity updates.
+        # Env-var only — no connection status — no reconnect-window zigzag gap.
+        if self._is_bridge_active():
+            return
+        # ── [/STRICT-ENV-LATCH] ──────────────────────────────────────────────
+
         try:
             equity = float(raw_equity) if raw_equity is not None else 0.0
         except (TypeError, ValueError):
@@ -1980,6 +1813,17 @@ class Executor:
 
         # [LOCK-2] Acquire lock for the full update branch.
         async with self._equity_lock:
+            # [P40.1] If Rust bridge is active, treat WS account ghost reads as secondary noise.
+            # This prevents WS equity=0 bursts from triggering ghost counters/reconnects while bridge truth is available.
+            bridge_active = False
+            try:
+                bridge_active = bool(getattr(self, 'p16_bridge_active', False)) or bool(getattr(self.bridge, 'connected', False))
+            except Exception:
+                bridge_active = bool(getattr(self, 'p16_bridge_active', False))
+            if bridge_active and equity <= _EXECUTOR_MIN_VALID_EQUITY:
+                # Keep retained equity/avail; do not increment ghost counters.
+                return
+
             if equity <= _EXECUTOR_MIN_VALID_EQUITY:
                 has_positions = self.has_open_positions()
 
@@ -2097,7 +1941,8 @@ class Executor:
 
             # [P40.1-SHIELD] Ready-Gate opens on first verified equity.
             try:
-                self._p40_ready_gate.set()
+                if not self._p40_ready_gate.is_set():
+                    self._p40_ready_gate.set()
             except Exception:
                 pass
 
@@ -2131,6 +1976,16 @@ class Executor:
         acknowledges a deliberate manual reset to zero.
         """
         try:
+            # [P40.1] If the Rust bridge is active and this is not an explicit force-truth request,
+            # skip the REST poll entirely to avoid noisy backfills once bridge truth is available.
+            _bridge_active = False
+            try:
+                _bridge_active = bool(getattr(self, 'p16_bridge_active', False)) or bool(getattr(self.bridge, 'connected', False))
+            except Exception:
+                _bridge_active = bool(getattr(self, 'p16_bridge_active', False))
+            if _bridge_active and not bool(self._force_truth_pending):
+                return
+
             log.info(
                 "[GHOST-STATE] Background REST poll: verifying equity truth "
                 "(WS ghost reading with open positions).  force_truth=%s",
@@ -2156,6 +2011,20 @@ class Executor:
             # so subsequent polls behave normally.
             _is_force_truth = self._force_truth_pending
             self._force_truth_pending = False
+
+            # [P40.1] If the Rust bridge is active and this is not an explicit force-truth request,
+            # skip REST truth verification entirely. Bridge equity is the source of truth and WS ghost reads
+            # must not trigger noisy REST backfills once bridge is feeding account updates.
+            _bridge_active = False
+            try:
+                _bridge_active = bool(getattr(self, 'p16_bridge_active', False)) or bool(getattr(self.bridge, 'connected', False))
+            except Exception:
+                _bridge_active = bool(getattr(self, 'p16_bridge_active', False))
+            if _bridge_active and not _is_force_truth:
+                # Clear ghost counters so we do not keep scheduling verification loops.
+                self._consecutive_ghost_reads = 0
+                self._equity_is_ghost = False
+                return
 
             # [LOCK-2] Use equity lock for the REST-sourced update too.
             async with self._equity_lock:
@@ -2188,45 +2057,60 @@ class Executor:
                     return
                 # ── [/P40.1-OPEN-POS-SHIELD] ─────────────────────────────────
 
-                if rest_equity <= _EXECUTOR_MIN_VALID_EQUITY and not _is_force_truth:
-                    # [P24.1-EXEC] REST confirmed the account is genuinely at/near
-                    # zero.  Accept this as truth so the ghost counter resets and
-                    # the bot stops spamming REST polls.  Do NOT update
-                    # _last_valid_equity — Kelly sizing will keep using the
-                    # last confirmed non-zero reading so position math doesn't
-                    # collapse while the account is being refunded.
-                    log.warning(
-                        "[P24.1-EXEC] REST poll: equity=%.6f at/below floor=%.2f — "
-                        "ACCEPTED as New Truth (genuine empty account confirmed). "
-                        "Ghost counters reset; _last_valid_equity=%.6f preserved for Kelly.",
-                        rest_equity, _EXECUTOR_MIN_VALID_EQUITY, self._last_valid_equity,
-                    )
-                    self._equity           = rest_equity
-                    self._avail            = rest_avail
-                    # Hard-reset ghost counters so we stop hammering the exchange.
-                    self._consecutive_ghost_reads = 0
-                    self._equity_is_ghost         = False
-                else:
-                    # REST confirmed valid equity (above floor) — OR force_truth
-                    # override is active (dashboard-initiated manual reset).
-                    log.info(
-                        "[GHOST-STATE] REST poll SUCCESS: "
-                        "accepting equity=%.6f avail=%.6f "
-                        "(was retained=%.6f, delta=%.6f, force_truth=%s).",
-                        rest_equity, rest_avail,
-                        self._equity, abs(rest_equity - self._equity),
-                        _is_force_truth,
-                    )
-                    self._equity            = rest_equity
-                    self._avail             = rest_avail
-                    # [LKG-3] REST-confirmed value is authoritative.
-                    self._last_valid_equity = rest_equity
-                    # [P24-DEFENSE-2] Hard-reset ghost counters so the Dashboard
-                    # ghost meter returns to green without requiring a bot restart.
-                    self._consecutive_ghost_reads = 0
-                    self._equity_is_ghost         = False
+                                # [P25/P40] Always compute retained avail inside the lock for consistent gating.
+                retained_avail = float(self._avail or 0.0)
+                _accepted_equity = rest_equity
+                _accepted_avail  = rest_avail
 
-            self.drawdown.record(rest_equity)
+                # If REST reports equity at/below floor while any avail source indicates funds,
+                # treat equity=0 as a ghost read (even under force_truth) and bootstrap equity from avail.
+                if rest_equity <= _EXECUTOR_MIN_VALID_EQUITY and (rest_avail > 1.0 or retained_avail > 1.0):
+                    baseline_avail = rest_avail if rest_avail > 1.0 else retained_avail
+                    log.warning(
+                        "[P24.1-EXEC] REST poll: equity=%.6f at/below floor=%.2f but (rest_avail=%.6f, retained_avail=%.6f) indicates funds — "
+                        "REJECTING equity=0 truth; using avail as bootstrap equity baseline. "
+                        "Ghost counters reset; _last_valid_equity=%.6f preserved for Kelly.",
+                        rest_equity, _EXECUTOR_MIN_VALID_EQUITY, rest_avail, retained_avail, float(self._last_valid_equity or 0.0),
+                    )
+                    _accepted_equity = baseline_avail
+                    _accepted_avail  = baseline_avail
+                    self._equity = _accepted_equity
+                    self._avail  = _accepted_avail
+                    self._consecutive_ghost_reads = 0
+                    self._equity_is_ghost = False
+                    _dd_equity = _accepted_equity
+                else:
+                    if rest_equity <= _EXECUTOR_MIN_VALID_EQUITY and not _is_force_truth:
+                        # REST confirmed the account is genuinely at/near zero. Accept as truth,
+                        # but do NOT update _last_valid_equity so sizing doesn't collapse.
+                        log.warning(
+                            "[P24.1-EXEC] REST poll: equity=%.6f at/below floor=%.2f — "
+                            "ACCEPTED as New Truth (genuine empty account confirmed). "
+                            "Ghost counters reset; _last_valid_equity=%.6f preserved for Kelly.",
+                            rest_equity, _EXECUTOR_MIN_VALID_EQUITY, float(self._last_valid_equity or 0.0),
+                        )
+                        self._equity = rest_equity
+                        self._avail  = rest_avail
+                        self._consecutive_ghost_reads = 0
+                        self._equity_is_ghost = False
+                        _dd_equity = rest_equity
+                    else:
+                        # REST confirmed valid equity (above floor) — OR force_truth override is active.
+                        log.info(
+                            "[GHOST-STATE] REST poll SUCCESS: "
+                            "accepting equity=%.6f avail=%.6f "
+                            "(was retained=%.6f, delta=%.6f, force_truth=%s).",
+                            rest_equity, rest_avail,
+                            float(self._equity or 0.0), abs(rest_equity - float(self._equity or 0.0)),
+                            _is_force_truth,
+                        )
+                        self._equity = rest_equity
+                        self._avail  = rest_avail
+                        self._last_valid_equity = rest_equity
+                        self._consecutive_ghost_reads = 0
+                        self._equity_is_ghost = False
+                        _dd_equity = rest_equity
+                        self.drawdown.record(rest_equity)
         except Exception as exc:
             log.error("[GHOST-STATE] REST poll failed: %s", exc)
         finally:
@@ -2240,7 +2124,8 @@ class Executor:
         control event from the dashboard.
 
         [P24.1-EXEC] force_truth parameter — when True (set by dashboard
-        via control_event.json {"event":"reset_gateway","force_truth":true}),
+        via the append-only control queue: control_queue.jsonl
+        with {"event":"reset_gateway","force_truth":true}),
         ALL safety counters are hard-reset regardless of the current equity
         value.  This is the escape hatch for the Ghost-Rest Paradox: even if
         the REST poll returns $0.00, the bot accepts it as the New Truth and
@@ -2307,10 +2192,87 @@ class Executor:
     async def _on_fill_event(self, fill: dict):
         base_sym = fill.get("instId", "").split("-")[0]
         pos      = self.positions.get(base_sym)
+
+        log.info(
+            "Fill: %s %s sz=%s px=%s",
+            base_sym, fill.get("side"), fill.get("fillSz"), fill.get("fillPx"),
+        )
+
+        # [STAGE2-DEFECT2] Persist every fill to DB — deduplication is handled
+        # by the UNIQUE constraint on order_id in the trades table (INSERT OR IGNORE).
+        # On failure, log error with context; do NOT crash the event loop.
+        try:
+            ord_id = str(fill.get("ordId") or fill.get("clOrdId") or "")
+            fill_px_raw = fill.get("fillPx") or fill.get("px") or 0
+            fill_sz_raw = fill.get("fillSz") or fill.get("sz") or 0
+            try:
+                fill_px = float(fill_px_raw)
+            except (TypeError, ValueError):
+                fill_px = 0.0
+            try:
+                fill_sz = float(fill_sz_raw)
+            except (TypeError, ValueError):
+                fill_sz = 0.0
+            if ord_id and fill_px > 0.0 and fill_sz > 0.0:
+                cost_basis = pos.cost_basis if pos is not None else fill_px
+                inst_type  = str(fill.get("instType") or (pos.inst_type if pos is not None else "SPOT"))
+                tag        = "okx_fill_tracked" if pos is not None else "okx_fill_untracked"
+                await self.db.insert_trade({
+                    "ts":           int(time.time()),
+                    "symbol":       base_sym,
+                    "side":         str(fill.get("side") or ""),
+                    "qty":          fill_sz,
+                    "price":        fill_px,
+                    "cost_basis":   cost_basis,
+                    "pnl_pct":      0.0,
+                    "realized_usd": 0.0,
+                    "tag":          tag,
+                    "order_id":     ord_id,
+                    "inst_type":    inst_type,
+                })
+        except Exception as _fill_db_exc:
+            log.error(
+                "[STAGE2-DEFECT2] _on_fill_event: DB insert failed — "
+                "ordId=%s instId=%s base=%s: %s",
+                fill.get("ordId"), fill.get("instId"), base_sym, _fill_db_exc,
+            )
+
         if not pos:
             return
-        log.info("Fill: %s %s sz=%s px=%s",
-                 base_sym, fill.get("side"), fill.get("fillSz"), fill.get("fillPx"))
+
+    # ── [P40.1-HB] Executor-level hub heartbeat ───────────────────────────────
+
+    async def _touch_hub_timestamp(self, *, force: bool = False) -> None:
+        """
+        [P40.1-HB] Atomically update ONLY the ``timestamp`` field in the hub
+        status file so the Watchdog never declares STALE on a healthy bot
+        whose 2-second _gui_bridge write cycle hasn't fired yet.
+
+        Throttled: writes at most once per _hb_min_interval seconds unless
+        ``force=True`` (used for ghost-heal and fill events where freshness
+        matters).
+
+        Silently swallows all exceptions — must never crash a bridge handler.
+        """
+        try:
+            now = time.time()
+            if (not force) and (self._hb_last_write_ts > 0) and \
+                    (now - self._hb_last_write_ts) < self._hb_min_interval:
+                return
+            async with self._status_lock:
+                self._hb_last_write_ts = now
+                try:
+                    with open(TRADER_STATUS_PATH, "r", encoding="utf-8") as _f:
+                        _doc = json.load(_f)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    _doc = {}
+                _doc["timestamp"] = now
+                tmp = TRADER_STATUS_PATH + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as _f:
+                    json.dump(_doc, _f)
+                os.replace(tmp, TRADER_STATUS_PATH)
+        except Exception as _exc:
+            log.debug("[P40.1-HB] _touch_hub_timestamp error (non-fatal): %s", _exc)
 
     # ── [P40] Bridge event handlers ────────────────────────────────────────────
 
@@ -2328,20 +2290,39 @@ class Executor:
         the transition: if both fire, the bridge value is preferred because the
         bridge sets _consecutive_ghost_reads=0 first, causing the legacy handler
         to see a clean slate.
+
+        [P40.1-HB]  Calls _touch_hub_timestamp() on every valid (non-ghost)
+                    update to prevent false-positive watchdog STALE triggers.
+        [P40.1-RG]  Unconditionally sets _p40_ready_gate after any accepted
+                    bridge message (including ghost events) so the gate always
+                    opens even if the first push arrives is_ghost=True.
         """
+        # [P40.1-HB] Heartbeat: bridge is alive — update watchdog sentinel.
+        asyncio.create_task(self._touch_hub_timestamp())
+
         # Robust parse (bridge may send strings)
         try:
             eq = float(msg.get("eq", 0.0) or 0.0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _exc:
+            log.warning("[P40] account_update: eq parse error — %s (raw=%r)", _exc, msg.get("eq"), exc_info=True)
             eq = 0.0
         try:
             avail = float(msg.get("avail_eq") or msg.get("cash_bal") or eq or 0.0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as _exc:
+            log.warning("[P40] account_update: avail parse error — %s", _exc, exc_info=True)
             avail = eq
-
 
         is_ghost    = bool(msg.get("is_ghost", False))
         ghost_count = int(msg.get("ghost_count", 0))
+
+        # [P40.1-RG] UNCONDITIONAL Ready-Gate set — the bridge connected and
+        # delivered a message; open the gate regardless of ghost/zero status so
+        # _cycle() is never permanently blocked by a bridge that sends only
+        # ghost reads at startup.
+        try:
+            self._p40_ready_gate.set()
+        except Exception as _rg_exc:
+            log.debug("[P40.1-RG] Ready-Gate set error (non-fatal): %s", _rg_exc)
 
         # ── [P40.1-SHIELD] Binary Truth Shield (Position-Aware) ────────────────
         # If positions are open, any equity <= 1.0 is treated as a Ghost Read,
@@ -2358,9 +2339,9 @@ class Executor:
                 self._equity_is_ghost = True
                 self._consecutive_ghost_reads = int(getattr(self, "_consecutive_ghost_reads", 0) or 0) + 1
                 return
-        except Exception:
+        except Exception as _shield_exc:
             # Never allow shield logic to crash the bridge handler.
-            pass
+            log.debug("[P40.1-SHIELD] shield check error (non-fatal): %s", _shield_exc)
         # ── [/P40.1-SHIELD] ───────────────────────────────────────────────────
 
         if is_ghost:
@@ -2388,27 +2369,26 @@ class Executor:
             self._consecutive_ghost_reads = 0
             self._equity_is_ghost         = False
 
-            # [P40.1-SHIELD] Ready-Gate: open on first verified Binary Truth equity
-            # from the Rust bridge.  Without this set the _cycle() ready-gate check
-            # (line 7203) blocks trading permanently when bridge is connected,
-            # because _on_account_update (the legacy WS path) may never fire.
-            try:
-                _was_set = self._p40_ready_gate.is_set()
-                self._p40_ready_gate.set()
-                if not _was_set:
-                    log.info(
-                        "[P40.1-SHIELD] Ready-Gate OPENED by bridge account_update: "
-                        "eq=%.6f — trading cycle will proceed normally.", eq,
-                    )
-            except Exception as _rg_exc:
-                log.debug("[P40.1-SHIELD] Ready-Gate set error (non-fatal): %s", _rg_exc)
-
             log.debug(
                 "[P40] Bridge account_update accepted: eq=%.6f avail=%.6f",
                 eq, avail,
             )
 
         self.drawdown.record(eq)
+
+        # [STAGE2-DEFECT1] Trigger a non-blocking position reconciliation from
+        # the bridge account_update path to ensure the dashboard OPEN POS count
+        # stays synchronised with OKX exchange truth.  The reconciliation is
+        # rate-limited to once per _position_reconcile_interval seconds.
+        _now_bridge = time.time()
+        if (
+            _now_bridge - self._position_reconcile_ts >= self._position_reconcile_interval
+            and not self._position_reconcile_in_flight
+        ):
+            asyncio.create_task(
+                self._reconcile_positions_from_okx(),
+                name="okx_position_reconcile_bridge",
+            )
 
     async def _on_bridge_ghost_healed(self, msg: dict) -> None:
         """
@@ -2425,11 +2405,27 @@ class Executor:
           • DO NOT trip the CircuitBreaker
           • DO update self._equity with the healed value (reliable truth)
           • DO reset ghost counters (bridge already healed this)
+
+        [STRICT-ENV-LATCH]   Unconditionally sets _p40_ready_gate (bridge alive).
+        [ATOMIC-MIRROR-SYNC] Immediately writes healed equity to trader_status.json
+                             with both total_equity and retained_equity fields.
+        Zombie mode cleared unconditionally. Heartbeat touched with force=True.
         """
-        raw_ws_eq  = float(msg.get("raw_ws_eq",  0.0))
-        healed_eq  = float(msg.get("healed_eq",  0.0))
-        ghost_count = int(msg.get("ghost_count", 0))
-        source     = msg.get("source", "unknown")
+        try:
+            raw_ws_eq = float(msg.get("raw_ws_eq", 0.0))
+        except (TypeError, ValueError) as _exc:
+            log.warning("[P40] ghost_healed: raw_ws_eq parse error — %s", _exc, exc_info=True)
+            raw_ws_eq = 0.0
+        try:
+            healed_eq = float(msg.get("healed_eq", 0.0))
+        except (TypeError, ValueError) as _exc:
+            log.warning("[P40] ghost_healed: healed_eq parse error — %s", _exc, exc_info=True)
+            healed_eq = 0.0
+        try:
+            ghost_count = int(msg.get("ghost_count", 0))
+        except (TypeError, ValueError):
+            ghost_count = 0
+        source = str(msg.get("source", "unknown"))
 
         log.warning(
             "[P40][GHOST-HEALED] Rust bridge resolved ghost state — "
@@ -2438,35 +2434,151 @@ class Executor:
             raw_ws_eq, healed_eq, ghost_count, source,
         )
 
+        # [STRICT-ENV-LATCH] UNCONDITIONAL Ready-Gate set — ghost_healed proves
+        # bridge is operational regardless of healed_eq validity.
+        try:
+            self._p40_ready_gate.set()
+            log.info(
+                "[P40.1-RG] Ready-Gate OPENED (unconditional) by ghost_healed: "
+                "healed_eq=%.6f  source=%s", healed_eq, source,
+            )
+        except Exception as _rg_exc:
+            log.debug("[P40.1-RG] ghost_healed Ready-Gate set error (non-fatal): %s", _rg_exc)
+
+        # [ATOMIC-MIRROR-SYNC] UNCONDITIONAL Zombie Veto — ghost_healed proves
+        # the equity reading was phantom.  Zombie Mode must NEVER remain active.
+        prior_zombie = self._p20_zombie_mode
+        self._p20_zombie_mode = False
+        if prior_zombie:
+            log.warning(
+                "[P40.1-SHIELD] Zombie Mode UNCONDITIONALLY CLEARED by "
+                "_on_bridge_ghost_healed — bridge confirmed ghost equity. "
+                "healed_eq=%.6f  raw_ws_eq=%.4f  bot resuming normal trading.",
+                healed_eq, raw_ws_eq,
+            )
+
+        # Equity sync (guarded by value > 0 so we never overwrite with zero)
         if healed_eq > 0.0:
             async with self._equity_lock:
-                self._equity               = healed_eq
-                self._last_valid_equity    = healed_eq
+                self._equity                  = healed_eq
+                self._last_valid_equity       = healed_eq
                 self._consecutive_ghost_reads = 0
                 self._equity_is_ghost         = False
                 self._ghost_poll_in_flight    = False
 
-            # [P40.1-SHIELD] Ready-Gate: healed_eq is validated Binary Truth.
-            # Open the gate outside the equity lock (lock not needed for asyncio.Event).
-            try:
-                _was_set = self._p40_ready_gate.is_set()
-                self._p40_ready_gate.set()
-                if not _was_set:
-                    log.info(
-                        "[P40.1-SHIELD] Ready-Gate OPENED by ghost_healed: "
-                        "healed_eq=%.6f — trading cycle will proceed normally.", healed_eq,
-                    )
-            except Exception as _rg_exc:
-                log.debug("[P40.1-SHIELD] ghost_healed Ready-Gate set error: %s", _rg_exc)
+        # [ATOMIC-MIRROR-SYNC] Immediate atomic status patch — bypass 2-second
+        # GUI cycle so Dashboard shows Binary Truth immediately.
+        _retained = healed_eq if healed_eq > 0.0 else (self._equity or 0.0)
+        try:
+            async with self._status_lock:
+                try:
+                    with open(TRADER_STATUS_PATH, "r", encoding="utf-8") as _f:
+                        _doc = json.load(_f)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    _doc = {}
+                _now = time.time()
+                _doc["timestamp"]               = _now
+                _doc["equity_is_ghost"]         = False
+                _doc["consecutive_ghost_reads"] = 0
+                _doc["p40_ghost_heal_source"]   = source
+                _doc["p40_ghost_heal_count"]    = ghost_count
+                _doc["p40_last_heal_ts"]        = _now
+                _doc["zombie_mode"]             = False
+                _doc["p20_zombie_mode"]         = False
+                if "account" not in _doc or not isinstance(_doc["account"], dict):
+                    _doc["account"] = {}
+                _doc["account"]["total_equity"]    = _retained
+                _doc["account"]["retained_equity"] = _retained
+                if isinstance(_doc.get("p20_global_risk"), dict):
+                    _doc["p20_global_risk"]["zombie_mode_status"] = False
+                    _doc["p20_global_risk"]["current_equity"]     = round(_retained, 2)
+                _tmp = TRADER_STATUS_PATH + ".tmp"
+                with open(_tmp, "w", encoding="utf-8") as _f:
+                    json.dump(_doc, _f, default=str)
+                os.replace(_tmp, TRADER_STATUS_PATH)
+            log.info(
+                "[ATOMIC-MIRROR-SYNC] trader_status.json patched → "
+                "retained_equity=%.4f  ghost=False  zombie=False  source=%s",
+                _retained, source,
+            )
+        except Exception as _sync_exc:
+            log.error(
+                "[ATOMIC-MIRROR-SYNC] ghost_healed patch failed: %s",
+                _sync_exc, exc_info=True,
+            )
 
-            # [P40.1-SHIELD] Veto any zombie mode triggered by the ghost reading.
-            if self._p20_zombie_mode:
-                self._p20_zombie_mode = False
-                log.warning(
-                    "[P40.1-SHIELD] Zombie Mode VETOED by executor ghost_healed handler "
-                    "— bridge confirmed healed_eq=%.6f is Binary Truth, not a breach.",
-                    healed_eq,
+        # Heartbeat — force=True because ghost-heal is high-priority.
+        asyncio.create_task(self._touch_hub_timestamp(force=True))
+
+    async def _on_bridge_fill(self, msg: dict) -> None:
+        """
+        [P40][P40.1-HB] Bridge order_fill event handler.
+
+        A confirmed fill means the bridge is alive and connected.  Touch the
+        hub timestamp (force=True) so the Watchdog does not declare STALE
+        during high-activity periods where equity has not changed but fills
+        are arriving.
+
+        [STAGE2-DEFECT2] Also persists the bridge fill to the trades table so
+        the Recent Fills dashboard panel reflects bridge-placed executions.
+        Deduplication is handled by the UNIQUE constraint on order_id.
+        """
+        import math as _math
+        try:
+            ord_id  = str(msg.get("ordId")   or msg.get("ord_id")  or "")
+            fill_px = msg.get("fillPx") or msg.get("fill_px") or ""
+            fill_sz = msg.get("fillSz") or msg.get("fill_sz") or ""
+            log.debug(
+                "[P40][P40.1-HB] Bridge order_fill: ordId=%s  fillPx=%s  fillSz=%s",
+                ord_id, fill_px, fill_sz,
+            )
+        except Exception as _exc:
+            log.warning("[P40] _on_bridge_fill: msg parse error — %s", _exc, exc_info=True)
+
+        # [STAGE2-DEFECT2] Persist bridge fill to DB — non-blocking, explicit
+        # error logging, no event-loop crash on failure.
+        try:
+            _ord_id    = str(msg.get("ordId") or msg.get("ord_id") or msg.get("clOrdId") or "")
+            _inst_id   = str(msg.get("instId") or msg.get("inst_id") or "")
+            _base_sym  = _inst_id.split("-")[0] if _inst_id else ""
+            _side      = str(msg.get("side") or "")
+            _inst_type = str(msg.get("instType") or msg.get("inst_type") or "SWAP")
+            try:
+                _fill_px = float(msg.get("fillPx") or msg.get("fill_px") or 0)
+            except (TypeError, ValueError):
+                _fill_px = 0.0
+            try:
+                _fill_sz = float(msg.get("fillSz") or msg.get("fill_sz") or 0)
+            except (TypeError, ValueError):
+                _fill_sz = 0.0
+            _px_valid = _fill_px > 0.0 and _math.isfinite(_fill_px)
+            _sz_valid = _fill_sz > 0.0 and _math.isfinite(_fill_sz)
+            if _ord_id and _base_sym and _px_valid and _sz_valid:
+                await self.db.insert_trade({
+                    "ts":           int(time.time()),
+                    "symbol":       _base_sym,
+                    "side":         _side,
+                    "qty":          _fill_sz,
+                    "price":        _fill_px,
+                    "cost_basis":   _fill_px,
+                    "pnl_pct":      0.0,
+                    "realized_usd": 0.0,
+                    "tag":          "bridge_fill",
+                    "order_id":     _ord_id,
+                    "inst_type":    _inst_type,
+                })
+                log.info(
+                    "[STAGE2-DEFECT2] Bridge fill persisted to DB: "                    "ordId=%s %s %s sz=%.6f px=%.6f",
+                    _ord_id, _base_sym, _side, _fill_sz, _fill_px,
                 )
+        except Exception as _bf_db_exc:
+            log.error(
+                "[STAGE2-DEFECT2] _on_bridge_fill: DB insert failed — "                "ordId=%s instId=%s: %s",
+                msg.get("ordId", msg.get("ord_id", "")), msg.get("instId", ""), _bf_db_exc,
+            )
+
+        # [P40.1-HB] Heartbeat — bridge is alive, fill confirmed.
+        asyncio.create_task(self._touch_hub_timestamp(force=True))
 
     async def _on_bridge_equity_breach(self, msg: dict) -> None:
         """
@@ -2489,6 +2601,114 @@ class Executor:
         # Allow existing risk management (CircuitBreaker, GlobalRiskManager) to
         # respond organically — do NOT add hard-coded emergency shutdown here.
         # The CB will trip on the next cycle when it reads the new equity.
+
+    # ── [STAGE2-DEFECT1] OKX Position Reconciliation ─────────────────────────
+
+    async def _reconcile_positions_from_okx(self) -> None:
+        """
+        [STAGE2-DEFECT1] Fetch open positions from the OKX REST API and store
+        them in self._okx_positions_cache keyed by base symbol.
+
+        Called as a fire-and-forget asyncio.Task from _cycle() and from
+        _on_bridge_account_update() (when bridge is active) to ensure the
+        dashboard OPEN POS count always reflects exchange truth.
+
+        Design
+        ------
+        * Uses self.hub.rest (the shared OKXRestClient instance) — no new
+          dependencies or credentials required.
+        * Must not overwrite valid last-known-good cache with an empty/None
+          response: only replaces the cache when the REST response is a
+          non-empty list.
+        * Normalises position records into the minimal schema required by
+          positions_snap in _cycle().
+        * All exceptions are caught and logged; failure is non-fatal.
+        * A concurrency guard (_position_reconcile_in_flight) prevents
+          overlapping REST calls.
+        """
+        if self._position_reconcile_in_flight:
+            return
+        self._position_reconcile_in_flight = True
+        try:
+            d = await self.hub.rest.get("/api/v5/account/positions")
+            rows = (d or {}).get("data") or []
+            if not isinstance(rows, list):
+                log.warning(
+                    "[STAGE2-DEFECT1] _reconcile_positions_from_okx: "                    "unexpected response type=%s — cache unchanged.",
+                    type(rows).__name__,
+                )
+                return
+            # Only replace cache when OKX returned a non-None list.
+            # An empty list is valid (all positions closed).
+            new_cache: dict = {}
+            for row in rows:
+                try:
+                    if not isinstance(row, dict):
+                        continue
+                    inst_id = str(row.get("instId") or "")
+                    if not inst_id:
+                        continue
+                    # Parse position size.
+                    try:
+                        pos_sz = float(row.get("pos") or 0)
+                    except (TypeError, ValueError):
+                        pos_sz = 0.0
+                    if pos_sz == 0.0:
+                        continue  # position fully closed
+                    # Derive base symbol: "BTC-USDT-SWAP" -> "BTC"
+                    parts    = inst_id.split("-")
+                    base_sym = parts[0] if parts else inst_id
+                    # Normalise direction from posSide + sign of pos.
+                    pos_side = str(row.get("posSide") or "net")
+                    if pos_side == "long":
+                        direction = "long"
+                    elif pos_side == "short":
+                        direction = "short"
+                    else:
+                        direction = "long" if pos_sz > 0 else "short"
+                    # Average entry price.
+                    try:
+                        avg_px = float(row.get("avgPx") or 0)
+                    except (TypeError, ValueError):
+                        avg_px = 0.0
+                    inst_type = str(row.get("instType") or "SWAP")
+                    qty = abs(pos_sz)
+                    new_cache[base_sym] = {
+                        "inst_id":   inst_id,
+                        "direction": direction,
+                        "inst_type": inst_type,
+                        "qty":        qty,
+                        "cost_basis": avg_px,
+                        "usd_cost":   qty * avg_px,
+                        "pos_side":   pos_side,
+                        "ts":         time.time(),
+                    }
+                except Exception as _row_exc:
+                    log.debug(
+                        "[STAGE2-DEFECT1] Position row parse error: %s", _row_exc
+                    )
+            # Commit the new cache (empty list = all closed is valid).
+            self._okx_positions_cache = new_cache
+            self._position_reconcile_ts = time.time()
+            log.debug(
+                "[STAGE2-DEFECT1] OKX positions reconciled: "                "%d exchange positions cached.",
+                len(new_cache),
+            )
+            if new_cache:
+                log.info(
+                    "[STAGE2-DEFECT1] OKX open positions: %s",
+                    {k: v["direction"] + "x" + str(round(v["qty"], 6))
+                     for k, v in new_cache.items()},
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "[STAGE2-DEFECT1] _reconcile_positions_from_okx failed: %s",
+                exc,
+            )
+        finally:
+            self._position_reconcile_in_flight = False
 
     # ── REST helpers ───────────────────────────────────────────────────────────
     async def _place_order(self, body: dict, priority: Optional[str] = None) -> dict:
@@ -3892,39 +4112,39 @@ class Executor:
         self._p362_cycle_count    = 0
         self._p362_run_start_ts   = time.time()
 
-def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
-    """
-    [P36.2-GOLDEN] Classify IndexError sources.
-
-    HIGH-severity fix: do NOT reset the Golden Build counter for IndexError
-    that originate from *expected data gaps* (temporarily empty tape buffers,
-    cache warm-up, or transient REST/WS refresh windows).
-
-    Only IndexError that appear to originate from executor logic corruption
-    should reset the counter.
-    """
-    try:
-        import traceback as _tb
-        tb = exc.__traceback__
-        frames = _tb.extract_tb(tb) if tb else []
-        for fr in frames:
-            fn = (fr.filename or "").replace("\\", "/")
-            name = fr.name or ""
-            # Expected: data_hub buffers, tape snapshots, candle buffers.
-            if fn.endswith("/data_hub.py") or fn.endswith("/phase7_execution.py"):
+    def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
+        """
+        [P36.2-GOLDEN] Classify IndexError sources.
+    
+        HIGH-severity fix: do NOT reset the Golden Build counter for IndexError
+        that originate from *expected data gaps* (temporarily empty tape buffers,
+        cache warm-up, or transient REST/WS refresh windows).
+    
+        Only IndexError that appear to originate from executor logic corruption
+        should reset the counter.
+        """
+        try:
+            import traceback as _tb
+            tb = exc.__traceback__
+            frames = _tb.extract_tb(tb) if tb else []
+            for fr in frames:
+                fn = (fr.filename or "").replace("\\", "/")
+                name = fr.name or ""
+                # Expected: data_hub buffers, tape snapshots, candle buffers.
+                if fn.endswith("/data_hub.py") or fn.endswith("/phase7_execution.py"):
+                    return True
+                if name in ("snapshot", "snapshot_stats", "_recent", "_tape_buf", "_get_buf"):
+                    return True
+                # Instrument cache warm-up paths
+                if "instrument" in name.lower() and "cache" in name.lower():
+                    return True
+            # Heuristic: "list index out of range" with any buffer-related frame
+            msg = str(exc)
+            if "out of range" in msg and any("buffer" in (f.name or "").lower() for f in frames):
                 return True
-            if name in ("snapshot", "snapshot_stats", "_recent", "_tape_buf", "_get_buf"):
-                return True
-            # Instrument cache warm-up paths
-            if "instrument" in name.lower() and "cache" in name.lower():
-                return True
-        # Heuristic: "list index out of range" with any buffer-related frame
-        msg = str(exc)
-        if "out of range" in msg and any("buffer" in (f.name or "").lower() for f in frames):
-            return True
-    except Exception:
+        except Exception:
+            return False
         return False
-    return False
 
     def _p362_write_golden_report(self) -> None:
         """
@@ -3980,7 +4200,6 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             log.warning("[P36.2-GOLDEN] Failed to write golden report: %s", _gr_exc)
 
     # ── [/P36.2] ──────────────────────────────────────────────────────────────
-
 
     async def _p36_run_mimic_test(
         self,
@@ -4293,7 +4512,6 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             return spoof_prob
 
     # ── [/P36.1+P36.2] ────────────────────────────────────────────────────────
-
 
     # ═════════════════════════════════════════════════════════════════════════
     # [P33.2] Phase 33.2 — Maker-Rebate Optimization & Stealth Layering
@@ -5999,10 +6217,10 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             if meta and tick.ask > 0:
                 min_lot_usd = float(meta.lot_sz if hasattr(meta, 'lot_sz') else 0.01) * tick.ask
 
-            usd_amount = float(min(
-                max(_D(self._avail) * _D(P16_EXPRESS_ALLOC_PCT), _D(cfg.min_usd_value), _D(min_lot_usd)),
-                _D(P16_EXPRESS_MAX_USD),
-            ))
+            usd_amount = min(
+                max(self._avail * P16_EXPRESS_ALLOC_PCT, cfg.min_usd_value, min_lot_usd),
+                P16_EXPRESS_MAX_USD,
+            )
 
             if usd_amount > self._avail * 0.95:
                 return False
@@ -6490,24 +6708,12 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
         return True
 
     async def _record_close(self, pos: Position, fill_px: float, tag: str):
-        pnl_pct: float = 0.0
-        realized: float = 0.0
-
-        try:
-            if pos.cost_basis > 0:
-                cb = _D(pos.cost_basis)
-                fp = _D(fill_px)
-                if pos.direction == "long":
-                    pnl_pct_d = (fp - cb) / cb * Decimal("100")
-                else:
-                    pnl_pct_d = (cb - fp) / cb * Decimal("100")
-                pnl_pct = float(pnl_pct_d)
-                realized = float(_D(pnl_pct) / Decimal("100") * _D(pos.usd_cost))
-        except Exception as _pnl_exc:
-            log.debug("[P7] _record_close Decimal pnl calc error: %s", _pnl_exc)
-            pnl_pct = 0.0
-            realized = 0.0
-
+        pnl_pct = (
+            (fill_px - pos.cost_basis) / pos.cost_basis * 100
+            if pos.direction == "long"
+            else (pos.cost_basis - fill_px) / pos.cost_basis * 100
+        ) if pos.cost_basis > 0 else 0.0
+        realized = pnl_pct / 100 * pos.usd_cost
         await self.db.insert_trade({
             "ts": int(time.time()), "symbol": pos.symbol,
             "side": "sell" if pos.direction == "long" else "buy",
@@ -7325,20 +7531,39 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
                 "skipping trade execution this cycle (cache populating)."
             )
             return
-        # [P40.1-SHIELD] Ready-Gate: do not enter trading cycle until the Rust
-        # bridge has delivered a non-ghost, non-zero equity snapshot. This
-        # prevents baselining equity at $0.00 during the bridge connect phase.
+        # [P40.1-SHIELD] / [FIX-002] Ready-Gate: do not enter trading cycle until
+        # the Rust bridge has delivered a non-ghost, non-zero equity snapshot.
         # Gate is opened by _on_bridge_account_update or _on_bridge_ghost_healed
         # once Binary Truth equity is confirmed.  In Safe Mode (bridge=None) the
         # gate is opened immediately at construction time.
+        #
+        # [FIX-002] READY-GATE TIMEOUT: Wrapped in asyncio.wait_for with a 30-second
+        # timeout.  If the bridge does not deliver equity within 30 s (e.g. IPC
+        # startup delay, misconfigured binary path), the bot logs a CRITICAL alert
+        # and proceeds with last_valid_equity to prevent a permanent startup hang.
         if self.bridge is not None and not self._p40_ready_gate.is_set():
             log.debug(
-                "[P40.1-SHIELD] Ready-Gate active — awaiting Binary Truth equity "
-                "from Rust bridge.  Bridge connected=%s.  "
-                "Skipping trade execution this cycle (Safe Mode hold).",
+                "[FIX-002] Ready-Gate active — awaiting Binary Truth equity "
+                "from Rust bridge (timeout=30s).  Bridge connected=%s.",
                 getattr(self.bridge, "connected", False),
             )
-            return
+            try:
+                await asyncio.wait_for(self._p40_ready_gate.wait(), timeout=30.0)
+                log.info(
+                    "[FIX-002] Ready-Gate UNBLOCKED — bridge delivered Binary Truth "
+                    "equity.  Trading cycle proceeding normally."
+                )
+            except asyncio.TimeoutError:
+                log.critical(
+                    "[FIX-002] ⚠ Ready-Gate TIMEOUT (30s) — Rust bridge has not "
+                    "delivered a Binary Truth equity snapshot.  "
+                    "Proceeding with last_valid_equity=%.6f to prevent permanent "
+                    "startup hang.  Check bridge binary path and IPC port config.",
+                    self._last_valid_equity,
+                )
+                # Force-open the gate so subsequent cycles are not blocked.
+                # The bot continues on last_valid_equity or falls back to 1.0 safely.
+                self._p40_ready_gate.set()
 
         if self._p20_zombie_mode:
             log.debug(
@@ -7353,11 +7578,13 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
         #   {"event": "reset_gateway", "force_truth": true}
         # When force_truth is set, _hard_reset_sync() bypasses the equity floor
         # check so even a genuine $0.00 balance is accepted as the New Truth.
+        collected = gc.collect()
+        if collected:
+            log.debug("[P19-4] GC collected %d objects.", collected)
+
         try:
-            if os.path.exists(P24_CONTROL_EVENT_PATH):
-                with open(P24_CONTROL_EVENT_PATH, "r", encoding="utf-8") as _cef:
-                    _ce = json.load(_cef)
-                os.remove(P24_CONTROL_EVENT_PATH)
+            events = _drain_control_queue(P24_CONTROL_QUEUE_PATH)
+            for _ce in events:
                 _event       = str(_ce.get("event", "")).strip().lower()
                 _force_truth = bool(_ce.get("force_truth", False))
                 log.info(
@@ -7371,10 +7598,6 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
                     )
         except Exception as _ce_exc:
             log.warning("[P24-DEFENSE] Control event read error: %s", _ce_exc)
-
-        collected = gc.collect()
-        if collected:
-            log.debug("[P19-4] GC collected %d objects.", collected)
 
         self._reload_coin_cfgs_if_stale()
 
@@ -7787,6 +8010,50 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             except Exception as e:
                 log.error("Cycle error %s: %s", symbol, e, exc_info=True)
 
+        # [STAGE2-DEFECT1] Trigger periodic OKX position reconciliation from _cycle()
+        # as a non-blocking task, then merge reconciled positions into positions_snap.
+        _now_cyc = time.time()
+        if (
+            _now_cyc - self._position_reconcile_ts >= self._position_reconcile_interval
+            and not self._position_reconcile_in_flight
+        ):
+            asyncio.create_task(
+                self._reconcile_positions_from_okx(),
+                name="okx_position_reconcile_cycle",
+            )
+        # Merge OKX REST positions into positions_snap for any position not tracked
+        # by the bot.  This surfaces exchange-truth open positions so the dashboard
+        # OPEN POS count never reads 0 when OKX has live open positions.
+        for _rec_sym, _rec_pos in self._okx_positions_cache.items():
+            if _rec_sym not in positions_snap:
+                # OKX has a position this bot instance did not open — mark external.
+                positions_snap[_rec_sym] = {
+                    "direction":          _rec_pos["direction"],
+                    "inst_type":          _rec_pos["inst_type"],
+                    "qty":                _rec_pos["qty"],
+                    "cost_basis":         _rec_pos.get("cost_basis", 0.0),
+                    "usd_cost":           _rec_pos.get("usd_cost",   0.0),
+                    "current_bid":        0.0,
+                    "current_ask":        0.0,
+                    "regime":             "unknown",
+                    "signal_conf":        0.0,
+                    "external_position":  True,
+                    "p7_cb_tripped":      (self._p7_cb.is_tripped if self._p7_cb is not None else False),
+                    "p20_zombie_mode":    self._p20_zombie_mode,
+                }
+            elif (
+                positions_snap[_rec_sym].get("direction", "none") == "none"
+                and _rec_pos.get("qty", 0.0) > 0.0
+            ):
+                # Bot shows no position for this symbol but OKX confirms one —
+                # reconcile direction and size from exchange truth.
+                positions_snap[_rec_sym]["direction"]         = _rec_pos["direction"]
+                positions_snap[_rec_sym]["qty"]              = _rec_pos["qty"]
+                positions_snap[_rec_sym]["cost_basis"]       = _rec_pos.get("cost_basis", 0.0)
+                positions_snap[_rec_sym]["usd_cost"]         = _rec_pos.get("usd_cost",   0.0)
+                positions_snap[_rec_sym]["inst_type"]        = _rec_pos["inst_type"]
+                positions_snap[_rec_sym]["reconciled_from_okx"] = True
+
         gov_snap = {}
         if gov is not None:
             try:
@@ -7877,6 +8144,9 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             "account": {
                 "total_equity": round(equity, 2),
                 "buying_power": round(avail,  2),
+                # [ATOMIC-MIRROR-SYNC] retained_equity is the Binary Truth anchor.
+                # Always written atomically with total_equity — never a separate write.
+                "retained_equity": round(equity, 2),
                 # [ATOMIC-2] Single coherent block so math always balances.
                 "deployed_capital": round(max(equity - avail, 0.0), 2),
                 "avail_balance":    round(avail, 2),
@@ -7966,6 +8236,10 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
                     "min_change_usd": 0.0, "symbol": P35_HEDGE_SYMBOL,
                 }
             ),
+            # [ANALYTICS-NULL-SHIELD] (data or {}) — never None at construction.
+            "analytics": (getattr(self, "_analytics_data", None) or {}),
+            # [ANALYTICS-NULL-SHIELD] symbols always present as {} — never None.
+            "symbols":   {},
         }
 
         # [P24-DEFENSE] Entropy Trend — sample the current cycle's Shannon Entropy
@@ -8109,24 +8383,29 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
     # ── [ATOMIC-1] Atomic JSON status writer ──────────────────────────────────
     def _write_status_json(self) -> None:
         """
-        [ATOMIC-1] Write self._status to trader_status.json using the
-        write-to-.tmp-then-os.replace() pattern.
+        [ATOMIC-1] Write self._status to trader_status.json atomically using
+        write-to-.tmp then os.replace().  Readers always see a complete file.
 
-        This guarantees the dashboard process never reads a partially-written
-        or empty file, eliminating the JSON race condition that caused
-        flickering 'DATA UNAVAILABLE' overlays and mathematical hallucinations
-        (e.g. 2000% Heat) on the dashboard.
-
-        Steps
-        -----
-        1. Ensure hub_data/ directory exists.
-        2. Serialise self._status to JSON bytes.
-        3. Write to TRADER_STATUS_PATH + '.tmp'.
-        4. Atomically rename .tmp → TRADER_STATUS_PATH using os.replace().
-           On POSIX this is a single kernel syscall (rename(2)) — readers see
-           either the old complete file or the new complete file, never a
-           partial write.
+        [ATOMIC-MIRROR-SYNC] Before serialisation, patches account.retained_equity
+        with self._equity so every write carries Binary Truth equity.
+        [ANALYTICS-NULL-SHIELD] Guarantees analytics and symbols are never null.
         """
+        # [ATOMIC-MIRROR-SYNC] Mirror self._equity → account.retained_equity on
+        # every write so no write path can omit the Binary Truth field.
+        try:
+            acct = self._status.get("account")
+            if isinstance(acct, dict):
+                acct["retained_equity"] = round(self._equity, 2)
+        except Exception:
+            pass
+        # [ANALYTICS-NULL-SHIELD] Guarantee analytics and symbols are never null.
+        try:
+            if not isinstance(self._status.get("analytics"), dict):
+                self._status["analytics"] = (self._status.get("analytics") or {})
+            if not isinstance(self._status.get("symbols"), dict):
+                self._status["symbols"] = {}
+        except Exception:
+            pass
         tmp_path = TRADER_STATUS_PATH + ".tmp"
         try:
             os.makedirs(os.path.dirname(TRADER_STATUS_PATH), exist_ok=True)
@@ -8173,22 +8452,14 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             self._shadow_audit_path, P20_DRAWDOWN_ZOMBIE_PCT,
         )
 
-        # ── [v27.1-BOOT] Immediate Boot Status Write ──────────────────────────────
-        # Requirement: the dashboard must see "0 s stale" the moment the process
-        # starts.  _publish_status() is a deliberate no-op when self._status is
-        # empty (its guard: `if not self._status: return`), so we seed a minimal
-        # boot-state dict and call _write_status_json() directly.
-        #
-        # This write happens BEFORE entropy seeding and BEFORE PFVT so the
-        # dashboard has a valid, timestamped file even if OKX is slow to respond.
-        # The full, rich status dict is overwritten by the first _cycle() call
-        # moments later, so no dashboard widget ever displays a boot-state value
-        # for more than one refresh interval.
+        # ── [Phase 40.3] Immediate Boot Status Write ──────────────────────────────
+        # Seeds a minimal boot-state dict so the dashboard sees "0 s stale" from
+        # process start.  The full status dict is overwritten by the first _cycle().
         self._status = {
             "timestamp":            time.time(),
             "heartbeat_ts":         time.time(),
             "demo_mode":            self.demo,
-            "boot":                 True,           # sentinel — dashboard can grey minor KPIs
+            "boot":                 True,
             "circuit_breaker":      False,
             "strategy_mode":        "⏳ BOOTING",
             "emergency_pause":      False,
@@ -8211,11 +8482,17 @@ def _p362_is_expected_data_gap_index_error(self, exc: IndexError) -> bool:
             "tactical_active": self._tactical_active,
             "tactical_config": self._tactical_config,
             "market_data":   {"liquidations": [], "whale_tape": {}},
+            # [ANALYTICS-NULL-SHIELD] (data or {}) — never None.
+            "analytics":     (getattr(self, "_analytics_data", None) or {}),
+            # [ANALYTICS-NULL-SHIELD] symbols always {} — never None.
+            "symbols":       {},
         }
+        # [ATOMIC-MIRROR-SYNC] retained_equity always mirrors total_equity in boot seed.
+        if isinstance(self._status.get("account"), dict):
+            self._status["account"]["retained_equity"] = round(self._equity, 2)
         self._status["intelligence"]["entropy_history"] = list(self._entropy_history)
         self._write_status_json()
-        log.info("[v27.1-BOOT] Boot status written → dashboard sees 0 s stale immediately.")
-        # ── [/v27.1-BOOT] ────────────────────────────────────────────────────────
+        log.info("[Phase 40.3] Boot status written — dashboard 0 s stale.")
 
         self.brain.start_background_tasks()
 

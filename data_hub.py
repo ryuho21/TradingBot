@@ -63,6 +63,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import sqlite3
 import time
 from collections import defaultdict, deque
@@ -401,36 +402,18 @@ class TapeBuffer:
         # a new bucket is sealed.  0.0 when < 2 buckets have been sealed.
         self._vpin_toxicity: float = 0.0
         # ── [/P37-VPIN] ──────────────────────────────────────────────────────
+
     async def add(self, side: str, qty: float, price: float) -> None:
         async with self._lock:
-            # [P37-VPIN] Source validation: reject malformed tape events so VPIN
-            # cannot be polluted by non-finite values or unknown sides.
-            try:
-                _side = str(side).strip().lower()
-                if _side.startswith("b"):
-                    _side = "buy"
-                elif _side.startswith("s"):
-                    _side = "sell"
-                else:
-                    return
-                _qty = float(qty)
-                _px  = float(price)
-                if _qty <= 0.0 or _px <= 0.0:
-                    return
-                import math as _math
-                if not (_math.isfinite(_qty) and _math.isfinite(_px)):
-                    return
-            except Exception:
-                return
-
             self._events.append(
-                TapeEvent(ts=time.time(), side=_side, qty=_qty,
-                          price=_px, usd=_qty * _px)
+                TapeEvent(ts=time.time(), side=side, qty=qty,
+                          price=price, usd=qty * price)
             )
             # ── [P37-VPIN] Volume-Clock accumulation ─────────────────────────
             # Classify trade direction into the active bucket.
             try:
-                if _side == "buy":
+                _qty = max(0.0, float(qty))
+                if side == "buy":
                     self._vpin_buy_vol  += _qty
                 else:
                     self._vpin_sell_vol += _qty
@@ -459,7 +442,6 @@ class TapeBuffer:
             except Exception:
                 pass  # VPIN accumulation is always non-fatal
             # ── [/P37-VPIN] ──────────────────────────────────────────────────
-
 
     def _compute_toxicity_score(self, latest_vpin: float) -> float:
         """
@@ -961,20 +943,177 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 
 
 class Database:
-    def __init__(self, path: str = "powertrader.db"):
-        self._path = path
+    def __init__(self, path: Optional[str] = None):
+        # Default DB must match the dashboard (datahub.db in this directory).
+        module_dir = Path(__file__).resolve().parent
+
+        if path and str(path).strip():
+            p = Path(str(path).strip()).expanduser()
+            if not p.is_absolute():
+                p = (module_dir / p).resolve()
+            else:
+                p = p.resolve()
+            self._path = str(p)
+        else:
+            self._path = str((module_dir / "datahub.db").resolve())
+
+        # Legacy DB path (older builds used powertrader.db). We migrate once on first open.
+        self._legacy_path = str((module_dir / "powertrader.db").resolve())
+
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = asyncio.Lock()
 
     def _conn_obj(self) -> sqlite3.Connection:
+        """
+        Return the shared SQLite connection, creating it on first call.
+        Applies schema, WAL pragmas, and performs a one-time legacy migration
+        (powertrader.db → datahub.db) only if the destination DB is empty.
+
+        This prevents the dashboard from appearing "stuck" on old fills when the
+        bot is writing to a different database file.
+        """
         if self._conn is None:
-            self._conn = sqlite3.connect(self._path, check_same_thread=False, timeout=30)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL;")
-            self._conn.execute("PRAGMA synchronous=NORMAL;")
-            self._conn.executescript(_SCHEMA)
-            self._conn.commit()
+            try:
+                self._conn = sqlite3.connect(
+                    self._path, check_same_thread=False, timeout=30
+                )
+                self._conn.row_factory = sqlite3.Row
+                self._conn.execute("PRAGMA journal_mode=WAL;")
+                self._conn.execute("PRAGMA synchronous=NORMAL;")
+                self._conn.executescript(_SCHEMA)
+                self._conn.commit()
+
+                try:
+                    self._maybe_migrate_legacy(self._conn)
+                except Exception as exc:
+                    log.warning("Database: legacy migration skipped/failed: %s", exc, exc_info=True)
+
+                log.info("Database: opened and schema applied for %s", self._path)
+            except Exception:
+                log.error(
+                    "Database._conn_obj: failed to open/init %s",
+                    self._path, exc_info=True,
+                )
+                raise
         return self._conn
+
+    def _maybe_migrate_legacy(self, conn: sqlite3.Connection) -> None:
+        """One-time migration from legacy powertrader.db → datahub.db.
+
+        Only runs if:
+          - legacy DB exists
+          - destination DB is empty (no candles/trades/snapshots)
+          - legacy DB has the relevant tables
+
+        Uses INSERT OR IGNORE / OR REPLACE to avoid duplicates and to remain safe
+        under retransmits and restarts.
+        """
+        try:
+            if not self._legacy_path:
+                return
+            if os.path.abspath(self._legacy_path) == os.path.abspath(self._path):
+                return
+            if not os.path.exists(self._legacy_path):
+                return
+        except Exception:
+            return
+
+        # Do not migrate if destination already contains data.
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(1) FROM trades")
+            dst_trades = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(1) FROM account_snapshots")
+            dst_snaps = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(1) FROM candles")
+            dst_candles = int(cur.fetchone()[0] or 0)
+            if (dst_trades + dst_snaps + dst_candles) > 0:
+                return
+        except Exception:
+            return
+
+        log.warning("Database: migrating legacy DB %s → %s (destination empty)", self._legacy_path, self._path)
+
+        legacy = sqlite3.connect(self._legacy_path, check_same_thread=False, timeout=10)
+        legacy.row_factory = sqlite3.Row
+        try:
+            lcur = legacy.cursor()
+            lcur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {r[0] for r in lcur.fetchall() if r and r[0]}
+
+            if "trades" in tables:
+                rows = lcur.execute(
+                    "SELECT ts,symbol,side,qty,price,cost_basis,pnl_pct,realized_usd,tag,order_id,inst_type FROM trades"
+                ).fetchall()
+                if rows:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO trades(ts,symbol,side,qty,price,cost_basis,pnl_pct,realized_usd,tag,order_id,inst_type) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        [
+                            (
+                                int(r[0] or 0),
+                                str(r[1] or ""),
+                                str(r[2] or ""),
+                                float(r[3] or 0.0),
+                                float(r[4] or 0.0),
+                                float(r[5] or 0.0),
+                                float(r[6] or 0.0),
+                                float(r[7] or 0.0),
+                                str(r[8] or ""),
+                                str(r[9] or ""),
+                                str(r[10] or ""),
+                            )
+                            for r in rows
+                        ],
+                    )
+
+            if "account_snapshots" in tables:
+                rows = lcur.execute(
+                    "SELECT ts,total_equity,buying_power,margin_ratio FROM account_snapshots"
+                ).fetchall()
+                if rows:
+                    conn.executemany(
+                        "INSERT INTO account_snapshots(ts,total_equity,buying_power,margin_ratio) VALUES(?,?,?,?)",
+                        [
+                            (
+                                int(r[0] or 0),
+                                float(r[1] or 0.0),
+                                float(r[2] or 0.0),
+                                float(r[3] or 0.0),
+                            )
+                            for r in rows
+                        ],
+                    )
+
+            if "candles" in tables:
+                rows = lcur.execute(
+                    "SELECT symbol,tf,ts,open,high,low,close,volume FROM candles"
+                ).fetchall()
+                if rows:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO candles(symbol,tf,ts,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?)",
+                        [
+                            (
+                                str(r[0] or ""),
+                                str(r[1] or ""),
+                                int(r[2] or 0),
+                                float(r[3] or 0.0),
+                                float(r[4] or 0.0),
+                                float(r[5] or 0.0),
+                                float(r[6] or 0.0),
+                                float(r[7] or 0.0),
+                            )
+                            for r in rows
+                        ],
+                    )
+
+            conn.commit()
+            log.warning("Database: legacy migration complete")
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
 
     async def _run(self, fn: Callable) -> Any:
         loop = asyncio.get_event_loop()
@@ -993,29 +1132,62 @@ class Database:
         await self._run(_fn)
 
     async def insert_trade(self, t: dict) -> None:
+        """
+        Insert a trade record into the `trades` table.
+
+        Uses INSERT OR IGNORE to handle the UNIQUE constraint on order_id without
+        crashing on duplicate fills (e.g. WS retransmit).
+        """
         def _fn():
-            conn = self._conn_obj()
-            conn.execute(
-                "INSERT OR IGNORE INTO trades"
-                "(ts,symbol,side,qty,price,cost_basis,pnl_pct,"
-                "realized_usd,tag,order_id,inst_type) VALUES"
-                "(:ts,:symbol,:side,:qty,:price,:cost_basis,:pnl_pct,"
-                ":realized_usd,:tag,:order_id,:inst_type)",
-                t,
-            )
-            conn.commit()
+            try:
+                conn = self._conn_obj()
+                conn.execute(
+                    "INSERT OR IGNORE INTO trades"
+                    "(ts,symbol,side,qty,price,cost_basis,pnl_pct,"
+                    "realized_usd,tag,order_id,inst_type) VALUES"
+                    "(:ts,:symbol,:side,:qty,:price,:cost_basis,:pnl_pct,"
+                    ":realized_usd,:tag,:order_id,:inst_type)",
+                    t,
+                )
+                conn.commit()
+            except sqlite3.Error as _exc:
+                log.error(
+                    "Database.insert_trade: sqlite error for order_id=%s: %s",
+                    t.get("order_id", "?"), _exc,
+                )
+                raise
+            except Exception as _exc:
+                log.error(
+                    "Database.insert_trade: unexpected error for order_id=%s: %s",
+                    t.get("order_id", "?"), _exc,
+                )
+                raise
         await self._run(_fn)
 
     async def insert_snapshot(self, s: dict) -> None:
+        """Insert an account snapshot into `account_snapshots`."""
         def _fn():
-            conn = self._conn_obj()
-            conn.execute(
-                "INSERT INTO account_snapshots"
-                "(ts,total_equity,buying_power,margin_ratio)"
-                " VALUES(:ts,:total_equity,:buying_power,:margin_ratio)",
-                s,
-            )
-            conn.commit()
+            try:
+                conn = self._conn_obj()
+                conn.execute(
+                    "INSERT INTO account_snapshots"
+                    "(ts,total_equity,buying_power,margin_ratio)"
+                    " VALUES(:ts,:total_equity,:buying_power,:margin_ratio)",
+                    s,
+                )
+                conn.commit()
+            except sqlite3.Error as _exc:
+                log.error(
+                    "Database.insert_snapshot: sqlite error ts=%s equity=%.4f: %s",
+                    s.get("ts", "?"), s.get("total_equity", 0.0), _exc,
+                )
+                raise
+            except Exception as _exc:
+                log.error(
+                    "Database.insert_snapshot: unexpected error ts=%s: %s",
+                    s.get("ts", "?"), _exc,
+                )
+                raise
         await self._run(_fn)
 
 
@@ -1374,6 +1546,66 @@ class DataHub:
         self._p36_spoof_probs: Dict[str, float] = {}
         self._p36_spoof_lock: asyncio.Lock = asyncio.Lock()
         # ── [/P36.1-DETECT] ──────────────────────────────────────────────────
+
+        # ── [STAGE-3] Binance TPS ingestion state ────────────────────────────
+        # Rolling deque of epoch timestamps for Binance trades received within
+        # the last _binance_tps_window seconds.  TPS is recomputed on every
+        # record_binance_trade() call (lock-free; deque pops are O(1)).
+        # Populated by the _binance_tape_ingestor background task in main.py.
+        self._binance_trade_ts: deque = deque()
+        # Rolling window for TPS computation (seconds).
+        self._binance_tps_window: float = float(
+            os.environ.get("BINANCE_TPS_WINDOW_SECS", "10.0")
+        )
+        # ── [/STAGE-3] ───────────────────────────────────────────────────────
+
+    # ── [STAGE-3] Binance TPS API ─────────────────────────────────────────────
+
+    def record_binance_trade(self) -> None:
+        """
+        [STAGE-3] Record a single Binance trade tick and recompute the rolling
+        TPS counter.
+
+        Called by the _binance_tape_ingestor background task in main.py on
+        every validated trade message.  This method is deliberately synchronous
+        (no asyncio.Lock) because the deque is only ever mutated from a single
+        asyncio task and popleft/append are individually GIL-atomic in CPython.
+        Exceptions are swallowed so a malformed message can never crash the
+        event loop.
+
+        TPS formula: count of trade timestamps within the last
+        _binance_tps_window seconds, divided by the window length.
+        """
+        try:
+            now = time.time()
+            self._binance_trade_ts.append(now)
+            cutoff = now - self._binance_tps_window
+            while self._binance_trade_ts and self._binance_trade_ts[0] < cutoff:
+                self._binance_trade_ts.popleft()
+        except Exception as exc:
+            log.debug("[STAGE-3] record_binance_trade error (non-fatal): %s", exc)
+
+    def get_binance_tps(self) -> float:
+        """
+        [STAGE-3] Return the current Binance trades-per-second value, computed
+        over the rolling _binance_tps_window.
+
+        Recomputes by pruning stale timestamps before dividing so the caller
+        always gets an up-to-date value even if no new trades have arrived
+        recently.  Returns 0.0 on any error or when the window is empty.
+        """
+        try:
+            now = time.time()
+            cutoff = now - self._binance_tps_window
+            while self._binance_trade_ts and self._binance_trade_ts[0] < cutoff:
+                self._binance_trade_ts.popleft()
+            if self._binance_tps_window > 0:
+                return len(self._binance_trade_ts) / self._binance_tps_window
+            return 0.0
+        except Exception:
+            return 0.0
+
+    # ── [/STAGE-3] ────────────────────────────────────────────────────────────
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -1766,11 +1998,19 @@ class DataHub:
             return 0.0
 
     def get_global_tape_status(self) -> dict:
-        """[P15-4] Full GlobalTapeAggregator status dict for status cache."""
+        """[P15-4] Full GlobalTapeAggregator status dict for status cache.
+
+        [STAGE-3] Injects live binance_tps from the DataHub Binance tape
+        ingestion counter (_binance_trade_ts) and recomputes combined_tps as
+        coinbase_tps + binance_tps so the dashboard reflects real data.
+        """
+        # [STAGE-3] Compute Binance TPS once; injected into both paths below.
+        _binance_tps = self.get_binance_tps()
+
         base: dict = {
             "coinbase_tps":         0.0,
-            "binance_tps":          0.0,
-            "combined_tps":         0.0,
+            "binance_tps":          _binance_tps,
+            "combined_tps":         _binance_tps,   # coinbase=0 + binance
             "high_volatility_mode": False,
             "hv_stop_extra_pct":    0.0,
             "cb_credentials":       self.cb_creds.status_snapshot(),
@@ -1780,6 +2020,11 @@ class DataHub:
         try:
             snap = self.global_tape.status_snapshot()
             snap["cb_credentials"] = self.cb_creds.status_snapshot()
+            # [STAGE-3] Override binance_tps with live DataHub counter and
+            # recompute combined_tps.  The GlobalTapeAggregator's own
+            # binance_tps is always 0.0 (it has no Binance feed of its own).
+            snap["binance_tps"]  = _binance_tps
+            snap["combined_tps"] = snap.get("coinbase_tps", 0.0) + _binance_tps
             return snap
         except Exception as exc:
             log.debug("[P15-4] get_global_tape_status error: %s", exc)
