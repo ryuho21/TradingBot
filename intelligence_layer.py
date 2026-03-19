@@ -1,10 +1,38 @@
 """
-intelligence_layer.py  —  Phase 37: Predictive Microstructure (VPIN/Flow Toxicity)
+intelligence_layer.py  —  Phase 42: Shadow Correlation Matrix (Global Market Veto)
+            (Phase 40.1: Binary Truth Synchronization)
+            (Phase 37: Predictive Microstructure / VPIN / Flow Toxicity)
             (Dynamic Clamping · Multi-Level Mimicry · Golden Build Monitor ·
              VADER SNR · Accuracy Enrichment · JSON Sanitization re.DOTALL ·
              Dynamic Correlation Haircut · Cross-Exchange Price Velocity Lead/Lag ·
              Unified Veto Arbitrator · Exhaustion Gap Filter ·
-             Volume-Clock VPIN Flow Toxicity Veto)
+             Volume-Clock VPIN Flow Toxicity Veto ·
+             Shadow Correlation Matrix / GlobalMarketVeto)
+
+Phase 42 additions (this release):
+  [P42-SHADOW] Global Market Correlation Veto — VetoArbitrator gains a new
+               PRE-ZEROTH gate that runs before ALL existing veto checks (P37,
+               P38, P36, P35, P34, P33).  The Executor injects live SPY and DXY
+               5-minute delta values each cycle via set_global_market_data().
+               When SPY drops > P42_SPY_DROP_BLOCK_PCT (default 1.0%) in 5 min,
+               ALL Long entries are blocked unconditionally — crypto lags equity
+               markets by 60–120 seconds during macro shocks; this gate closes
+               that window.  When DXY spikes > P42_DXY_SPIKE_BLOCK_PCT (default
+               0.5%) in 5 min, Long entries are similarly blocked (rising dollar
+               = macro risk-off, broadly bearish for crypto).
+               P42_BLOCK_SHORTS_ON_CRASH (default False): when enabled, also
+               blocks Shorts during a macro crash to prevent adding conviction
+               into a potentially violent snap-back rally.
+               Data feed: GlobalMarketSentinel in data_hub.py polls the Yahoo
+               Finance free REST endpoint every 30 seconds (no API key required).
+               Fail-open: if the feed is stale or unreachable, the gate passes
+               (no veto) to avoid blocking trades on infrastructure failures.
+
+Phase 40.1 (this release):
+  [P40.1-IL] Full preservation of all Phase 37 Veto logic.  No functional
+             changes to VetoArbitrator, LLMContextVeto, or any sub-agent.
+             Fixed IntelligenceScraper.cache_age_secs indentation (was
+             accidentally at module scope; now correctly a method of the class).
 
 Phase 37 additions (this release):
   [P37-VPIN]  Flow Toxicity Veto — VetoArbitrator gains a new ZEROTH gate that
@@ -111,18 +139,15 @@ import threading
 import aiohttp
 
 log = logging.getLogger("p17_intelligence")
+logging.getLogger("p17_intelligence").addHandler(logging.NullHandler())
+
+
+# [P0-FIX-11] env helpers → pt_utils
+from pt_utils import _env_float, _env_int, atomic_write_json  # [P0-UTIL]
 
 # ── [SANITIZER] Institutional Environment Sanitizer ───────────────────────────
 # Consistent with executor.py / data_hub.py / portfolio_manager.py.
 # Must be defined before all _safe_il_* helpers and env-var constants.
-def _clean_env(raw: str) -> str:
-    """
-    Strip surrounding whitespace and literal quote characters from .env values.
-    Preserves the value content (including $ in passwords); only quote wrappers
-    such as OKX_PASSPHRASE="$Khalil21z" or P35_HEDGE_SYMBOL="BTC-USDT-SWAP"
-    are removed, yielding $Khalil21z and BTC-USDT-SWAP respectively.
-    """
-    return raw.strip().strip("'\"").strip()
 
 
 # ── [P25] Veto Audit config ────────────────────────────────────────────────────
@@ -135,48 +160,19 @@ _veto_audit_lock = threading.Lock()
 
 # ── Defensive env loader — prevents startup crash on missing/malformed keys ────
 def _safe_il_float(key: str, default: float) -> float:
+    """[P0-UTIL] Delegates to pt_utils._env_float — one canonical env-parse path.
+    Kept for backward-compat with 20+ call sites in this module.
     """
-    Defensive float loader for intelligence_layer constants.
+    return _env_float(key, default)
 
-    Uses _clean_env to strip whitespace and literal quote characters (from .env
-    files where values are wrapped in quotes, e.g. P36_SPOOF_VETO_THRESHOLD="0.8").
-    Logs a WARNING and returns *default* when:
-      • The variable is absent from the environment.
-      • The value cannot be parsed as a float.
-    Never raises — the bot must always be able to import this module.
-    """
-    raw = _clean_env(os.environ.get(key, ""))
-    if not raw:
-        log.warning(
-            "[IL-ENV-WARN] %s not set — using safe default %.4f", key, default
-        )
-        return default
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
-        log.warning(
-            "[IL-ENV-WARN] %s='%s' is not a valid float — "
-            "using safe default %.4f", key, raw, default,
-        )
-        return default
 
 
 def _safe_il_str(key: str, default: str) -> str:
-    """Defensive string loader — uses _clean_env to strip whitespace and literal quotes."""
+    """[P0-UTIL] Defensive string loader — strips surrounding quotes/whitespace from .env values."""
     raw = os.environ.get(key, default)
-    return _clean_env(raw) or default
+    return raw.strip().strip("'\" ").strip() or default
 
 
-# ── Phase 17–21 config ────────────────────────────────────────────────────────
-P17_VETO_THRESHOLD        = _safe_il_float("P17_NARRATIVE_VETO_THRESHOLD",  0.3)
-P17_BOOST_THRESHOLD       = _safe_il_float("P17_NARRATIVE_BOOST_THRESHOLD", 0.8)
-P17_BOOST_FACTOR          = _safe_il_float("P17_NARRATIVE_BOOST_FACTOR",    0.25)
-P17_CATASTROPHE_THRESHOLD = _safe_il_float("P17_CATASTROPHE_THRESHOLD",     0.1)
-P17_SCRAPER_MODE          = _safe_il_str("P17_SCRAPER_MODE",  "mock").lower()
-P17_SCRAPER_FEED_URL      = _safe_il_str("P17_SCRAPER_FEED_URL", "")
-P17_SCRAPER_TIMEOUT_MS    = _safe_il_float("P17_SCRAPER_TIMEOUT_MS",        10000.0)
-P17_CACHE_TTL_SECS        = _safe_il_float("P17_CACHE_TTL_SECS",            30.0)
-P17_MAX_PORTFOLIO_HEAT    = _safe_il_float("P17_MAX_PORTFOLIO_HEAT",        0.0)
 
 P20_COUNCIL_OBI_VETO_THRESHOLD     = _safe_il_float("P20_COUNCIL_OBI_VETO_THRESHOLD",     -0.5)
 P20_COUNCIL_WALL_RATIO             = _safe_il_float("P20_COUNCIL_WALL_RATIO",              4.0)
@@ -218,13 +214,34 @@ P33_EXHAUSTION_VELOCITY_DROP_PCT = _safe_il_float("P33_EXHAUSTION_VELOCITY_DROP_
 P33_EXHAUSTION_SWEEP_TTL_MS      = _safe_il_float("P33_EXHAUSTION_SWEEP_TTL_MS",      2000.0)
 
 # ── [P34.1-SKEW] Price Skew Veto config ──────────────────────────────────────
-# Source: P34_MAX_SKEW_BPS in .env (default 50 bps).
-P34_MAX_SKEW_BPS = _safe_il_float("P34_MAX_SKEW_BPS", 50.0)
+# Source: P34_MAX_SKEW_BPS in .env (default 80 bps).
+#
+# [FIX-P34-CALIBRATION] Raised default from 50 bps to 80 bps.
+# 50 bps was calibrated for BTC/ETH on major venues; for altcoins like XRP the
+# bid/ask spread difference between OKX and Coinbase can legitimately reach
+# 60-80 bps due to: different instrument conventions (XRP-USDT vs XRPUSD),
+# varying order-book depth, and sub-2s oracle refresh latency.  At 50 bps the
+# soft-veto fired on normal live spread conditions, collapsing p_success from
+# 0.75 to 0.1875 (×0.25 penalty) and systematically blocking express entries.
+# The hard veto threshold is still 2× P34_MAX_SKEW_BPS (160 bps by default)
+# and still returns 0.0 unconditionally — genuine dislocation is unaffected.
+# Operators may lower P34_MAX_SKEW_BPS in .env for BTC/ETH-only deployments.
+P34_MAX_SKEW_BPS = _safe_il_float("P34_MAX_SKEW_BPS", 80.0)
+
+# [P34-SOFT-PENALTY] Multiplicative factor applied to p_success when skew is
+# in the soft zone (P34_MAX_SKEW_BPS < skew < 2×P34_MAX_SKEW_BPS).
+# Default 0.65 (15% reduction) — signals a genuine concern without behaving as
+# a de facto hard block.  The prior hardcoded value of 0.25 produced a 75%
+# reduction which, when applied to an express-path baseline of ~0.75, pushed
+# p_success to 0.1875 — far below the 0.65 admission threshold and functionally
+# equivalent to a hard veto despite being labelled "soft".
+# The hard veto (skew > 2× threshold) still returns 0.0 unconditionally.
+P34_SOFT_SKEW_PENALTY = _safe_il_float("P34_SOFT_SKEW_PENALTY", 0.65)
 
 # ── [P35.1] Hedge symbol — read and sanitize so VetoArbitrator can reference it ─
 # _clean_env strips literal quotes that .env parsers may leave (e.g. P35_HEDGE_SYMBOL="BTC-USDT-SWAP").
 _p35_il_hedge_raw = os.environ.get("P35_HEDGE_SYMBOL", "BTC")
-P35_HEDGE_SYMBOL  = _clean_env(_p35_il_hedge_raw) or "BTC"
+P35_HEDGE_SYMBOL  = _p35_il_hedge_raw.strip().strip("'\" ").strip() or "BTC"
 
 # ── [P36.1-DETECT] Manipulation Veto config ───────────────────────────────────
 # Spoof probability EMA above which VetoArbitrator forces p_success=0.0.
@@ -247,6 +264,77 @@ P37_TOXICITY_THRESHOLD = _safe_il_float("P37_TOXICITY_THRESHOLD", 0.80)
 # deliberate, non-random institutional move rather than noise-driven imbalance.
 # Default 0.35: entropy_norm ≤ 0.35 → orderly, directional market (not chaotic).
 P37_LOW_ENTROPY_THRESHOLD = _safe_il_float("P37_LOW_ENTROPY_THRESHOLD", 0.35)
+
+# ── [P38-OFI] Predictive Order Flow Imbalance Veto ────────────────────────────
+# P38_OFI_VETO_THRESHOLD: OFI magnitude at which a directionally-adverse book
+#   imbalance triggers a hard veto.  |OFI| must exceed this AND be opposed to
+#   the trade direction to block.  Default 0.6 (strong but not extreme signal).
+# P38_WALL_PULL_ESCALATE: if True (default), the veto reason is escalated to
+#   "ESCALATED VETO: OFI + Wall Pull Detected" when a large wall disappeared
+#   in the same tick — indicating deliberate manipulation, not passive flow.
+P38_OFI_VETO_THRESHOLD = _safe_il_float("P38_OFI_VETO_THRESHOLD", 0.60)
+P38_WALL_PULL_ESCALATE = (
+    os.environ.get("P38_WALL_PULL_ESCALATE", "1").strip().strip("'\"") == "1"
+)
+
+# ── [P42-SHADOW] Global Market Correlation Veto config ───────────────────────
+# SPY drop % in 5 minutes that triggers a hard block on ALL Long entries.
+# Default 1.0 → if SPY falls 1 % within the last 5 minutes, no new Longs.
+# Crypto lags equities by 60–120 s during macro shock events; this gate
+# closes that window before OKX order books reflect the move.
+P42_SPY_DROP_BLOCK_PCT = _safe_il_float("P42_SPY_DROP_BLOCK_PCT", 1.0)
+# DXY spike % in 5 minutes that triggers a hard block on ALL Long entries.
+# A rising dollar is broadly bearish for risk assets including crypto.
+# Default 0.5 → 0.5 % DXY surge in 5 min blocks new Longs.
+P42_DXY_SPIKE_BLOCK_PCT = _safe_il_float("P42_DXY_SPIKE_BLOCK_PCT", 0.5)
+# When True, a confirmed macro crash also blocks Short entries — prevents
+# adding short conviction into a market that may see a violent snap-back.
+# Default False — only Long entries are blocked by default.
+P42_BLOCK_SHORTS_ON_CRASH = (
+    os.environ.get("P42_BLOCK_SHORTS_ON_CRASH", "0").strip().strip("'\"") == "1"
+)
+# ── [P42-CORR] Adaptive Correlation Decoupling Threshold ─────────────────────
+# When the rolling Pearson r between SPY returns and BTC returns falls BELOW
+# this value, the SPY-drop-blocker AUTOMATICALLY STANDS DOWN.
+#
+# Rationale: the SPY gate is calibrated for correlated macro regimes where
+# equity shocks propagate to crypto within 60–120 s.  When r < 0.3 crypto is
+# trading on idiosyncratic flow (e.g. ETF demand, halving, on-chain catalyst)
+# and blocking Longs on SPY weakness causes false negatives on crypto-native
+# rallies.  The DXY gate remains active regardless (currency risk is global).
+#
+# Default 0.3 — literature consensus for "negligible linear relationship".
+# Set to 0.0 in .env to disable decoupling detection entirely.
+P42_CORR_DECOUPLE_THRESHOLD = _safe_il_float("P42_CORR_DECOUPLE_THRESHOLD", 0.3)
+# ── [/P42-SHADOW] ─────────────────────────────────────────────────────────────
+
+
+# ── [P17] Intelligence Scraper / Narrative Veto config ───────────────────────
+# P17_VETO_THRESHOLD       : narrative score below which the trade is VETOED.
+#                            Env key: P17_NARRATIVE_VETO_THRESHOLD (default 0.3)
+# P17_BOOST_THRESHOLD      : narrative score above which a confidence BOOST is
+#                            applied.  Env: P17_NARRATIVE_BOOST_THRESHOLD (0.8)
+# P17_BOOST_FACTOR         : fractional size boost when narrative is bullish.
+#                            Env: P17_NARRATIVE_BOOST_FACTOR (default 0.25)
+# P17_CATASTROPHE_THRESHOLD: score below which a CATASTROPHE override fires
+#                            (blocks regardless of other signals).
+#                            Env: P17_CATASTROPHE_THRESHOLD (default 0.1)
+# P17_SCRAPER_MODE         : 'rss' (default) or 'api'.
+# P17_SCRAPER_FEED_URL     : override RSS feed URL (empty = built-in feeds).
+# P17_SCRAPER_TIMEOUT_MS   : HTTP fetch timeout in milliseconds (default 10000).
+# P17_CACHE_TTL_SECS       : how long to reuse cached headlines (default 30 s).
+# P17_MAX_PORTFOLIO_HEAT   : max fraction of equity exposed via narrative boost
+#                            (0.25 = 25%; 0 = disabled).
+P17_VETO_THRESHOLD         = _safe_il_float("P17_NARRATIVE_VETO_THRESHOLD",  0.3)
+P17_BOOST_THRESHOLD        = _safe_il_float("P17_NARRATIVE_BOOST_THRESHOLD", 0.8)
+P17_BOOST_FACTOR           = _safe_il_float("P17_NARRATIVE_BOOST_FACTOR",    0.25)
+P17_CATASTROPHE_THRESHOLD  = _safe_il_float("P17_CATASTROPHE_THRESHOLD",     0.1)
+P17_SCRAPER_TIMEOUT_MS     = _safe_il_float("P17_SCRAPER_TIMEOUT_MS",    10000.0)
+P17_CACHE_TTL_SECS         = _safe_il_float("P17_CACHE_TTL_SECS",           30.0)
+P17_MAX_PORTFOLIO_HEAT     = _safe_il_float("P17_MAX_PORTFOLIO_HEAT",        0.25)
+P17_SCRAPER_MODE           = _safe_il_str("P17_SCRAPER_MODE",   "rss")
+P17_SCRAPER_FEED_URL       = _safe_il_str("P17_SCRAPER_FEED_URL", "")
+# ── [/P17] ────────────────────────────────────────────────────────────────────
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -645,12 +733,24 @@ class OpenRouterClient:
 
                 data = await resp.json(content_type=None)
 
-            raw_content = (
-                data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-            )
+            # [P22-1-FIX] Guard against three API failure modes that all
+            # previously raised 'NoneType has no attribute strip':
+            #   (a) "content": null  → .get("content","") returns None
+            #   (b) "choices": []    → [{}][0] raises IndexError
+            #   (c) "message" absent → .get("message",{}) returns {} OK but
+            #       content still None if key exists with null value
+            _choices    = data.get("choices") or []
+            _msg        = (_choices[0].get("message") or {}) if _choices else {}
+            raw_content = (_msg.get("content") or "").strip()
+
+            # [FIX-OR-EMPTY-IL] Guard: empty content (API returned null/empty body).
+            # json.loads("") raises JSONDecodeError after 2 retries — noisy warning.
+            # Return None cleanly so keyword engine takes over immediately.
+            if not raw_content:
+                log.debug(
+                    "[P22-1] OpenRouter %s: empty content — keyword engine fallback.", symbol
+                )
+                return None, latency_ms, "empty_content"
 
             # [P30.5-JSON] Robust JSON Sanitization — re.DOTALL brace-hunt.
             # Two-retry loop: first strip markdown fences, then use a regex
@@ -809,6 +909,13 @@ def _append_veto_audit_file(
     executor (running in a single thread via asyncio) and any background
     threads cannot corrupt the file.
 
+    [WIN-FALLBACK] Delegates to pt_utils.atomic_write_json which uses
+    NamedTemporaryFile + os.replace with 3 retries, then a safe
+    direct-write fallback on PermissionError / WinError 5.  The previous
+    implementation used a fixed temp filename (VETO_AUDIT_PATH + ".tmp")
+    with a bare os.replace and no retry or fallback — causing WinError 5
+    failures under dashboard read pressure on Windows.
+
     File format: JSON array of audit records.
     """
     row = {
@@ -817,7 +924,6 @@ def _append_veto_audit_file(
         "reason":    reason,
         "details":   details,
     }
-    tmp_path = VETO_AUDIT_PATH + ".tmp"
     with _veto_audit_lock:
         try:
             os.makedirs(os.path.dirname(VETO_AUDIT_PATH), exist_ok=True)
@@ -836,17 +942,11 @@ def _append_veto_audit_file(
             # Keep last 10 000 rows to prevent unbounded growth
             if len(existing) > 10_000:
                 existing = existing[-10_000:]
-            payload = json.dumps(existing, indent=None, separators=(",", ":"))
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(payload)
-            os.replace(tmp_path, VETO_AUDIT_PATH)
+            # [WIN-FALLBACK] Use canonical hardened writer — retries + direct-write
+            # fallback on PermissionError eliminates WinError 5 under read pressure.
+            atomic_write_json(VETO_AUDIT_PATH, existing)
         except Exception as exc:
             log.warning("[P25] _append_veto_audit_file failed: %s", exc)
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
 
 
 def _keyword_score(headlines: List[str], direction: str) -> float:
@@ -884,24 +984,25 @@ class IntelligenceScraper:
         headlines = await self._fetch(symbol)
         self._cache[symbol] = (now, headlines)
         return headlines
-def cache_age_secs(self, symbol: str, now: Optional[float] = None) -> Optional[float]:
-    """
-    [P30.5-SNR] Return the age (seconds) of the cached headlines for `symbol`.
 
-    This is used by VADER/keyword fallback scoring to apply a confidence
-    penalty when LLM enrichment fails: stale headlines imply lower SNR.
-    Returns None when no cache entry exists.
-    """
-    try:
-        now_ts = float(now if now is not None else time.time())
-        cached = self._cache.get(symbol)
-        if not cached:
+    def cache_age_secs(self, symbol: str, now: Optional[float] = None) -> Optional[float]:
+        """
+        [P30.5-SNR] Return the age (seconds) of the cached headlines for `symbol`.
+
+        This is used by VADER/keyword fallback scoring to apply a confidence
+        penalty when LLM enrichment fails: stale headlines imply lower SNR.
+        Returns None when no cache entry exists.
+        """
+        try:
+            now_ts = float(now if now is not None else time.time())
+            cached = self._cache.get(symbol)
+            if not cached:
+                return None
+            ts = float(cached[0])
+            age = max(0.0, now_ts - ts)
+            return age
+        except Exception:
             return None
-        ts = float(cached[0])
-        age = max(0.0, now_ts - ts)
-        return age
-    except Exception:
-        return None
 
     def invalidate(self, symbol: str):
         self._cache.pop(symbol, None)
@@ -1292,6 +1393,14 @@ class VetoArbitrator:
     Any order with ``p_success < 0.65`` is blocked by the Executor before it
     reaches the exchange.
 
+    [P42-SHADOW] Global Market Correlation Veto (Phase 42 addition):
+    When set_global_market_data() records a SPY 5-min drop > P42_SPY_DROP_BLOCK_PCT
+    (default 1.0%), compute_p_success() immediately returns 0.0 for any Long entry.
+    This is the PRE-ZEROTH gate — runs before ALL other veto checks (P37, P38,
+    P36, P35, P34, P33) because a macro equity crash is the highest-priority
+    systemic risk signal.  DXY spike > P42_DXY_SPIKE_BLOCK_PCT (0.5%) also blocks
+    Longs.  Gate is fail-open: if data is stale (>300 s) the gate is skipped.
+
     [P37-VPIN] Flow Toxicity Veto (Phase 37 addition):
     When set_flow_toxicity() records a ToxicityScore > P37_TOXICITY_THRESHOLD
     (default 0.80), compute_p_success() immediately returns 0.0 with the reason:
@@ -1339,15 +1448,15 @@ class VetoArbitrator:
        velocity_boost > 1.0  → favourable (velocity_score > 0.5)
        velocity_score = min(1.0, (velocity_boost − 1.0) * 5.0 + 0.5)
 
+    [P42-SHADOW] Global Market Veto runs PRE-ZEROTH (before all other checks).
     [P37-VPIN] Flow Toxicity Veto runs ZEROTH (before all other checks).
-    [P36.1] Manipulation Veto runs FIRST.
-    [P33-REVERSION] Exhaustion pre-check runs SECOND and short-circuits to 0.0.
+    [P38-OFI]  OFI Veto runs FIRST.
+    [P36.1] Manipulation Veto runs SECOND.
+    [P33-REVERSION] Exhaustion pre-check runs THIRD and short-circuits to 0.0.
     """
 
     # Class-level guard threshold — adjustable via env var at module load time.
-    P_SUCCESS_THRESHOLD: float = float(
-        os.environ.get("P32_VETO_ARB_THRESHOLD", "0.65")
-    )
+    P_SUCCESS_THRESHOLD: float = _env_float("P32_VETO_ARB_THRESHOLD", 0.65)
 
     def __init__(self) -> None:
         # [P33-REVERSION] Sweep event ring-buffer.
@@ -1379,6 +1488,29 @@ class VetoArbitrator:
         self._p36_spoof_symbol: str = ""   # symbol for which the current prob applies
         # ── [/P36.1-DETECT] ──────────────────────────────────────────────────
 
+        # ── [P42-SHADOW] Global Market Correlation Veto state ────────────────
+        # Injected each cycle by the Executor via set_global_market_data().
+        # _p42_spy_drop_pct  : SPY 5-min % change (negative = falling).
+        #                      When < -P42_SPY_DROP_BLOCK_PCT, all Longs blocked.
+        # _p42_dxy_spike_pct : DXY 5-min % change (positive = rising dollar).
+        #                      When > P42_DXY_SPIKE_BLOCK_PCT, all Longs blocked.
+        # _p42_data_age_secs : seconds since last successful feed update.
+        #                      Gate is SKIPPED (fail-open) when age > 300 s to
+        #                      prevent infrastructure failures from halting trades.
+        # _p42_veto_active   : True while the macro veto is in force.
+        #                      Cached for dashboard reporting.
+        # _p42_veto_reason   : Human-readable reason string for last veto.
+        # _p42_spy_btc_corr  : Rolling Pearson r between SPY and BTC return series.
+        #                      When < P42_CORR_DECOUPLE_THRESHOLD, the SPY-drop-
+        #                      blocker stands down (crypto is trading independently).
+        self._p42_spy_drop_pct:  float = 0.0
+        self._p42_dxy_spike_pct: float = 0.0
+        self._p42_data_age_secs: float = 9999.0  # start stale → gate disabled
+        self._p42_veto_active:   bool  = False
+        self._p42_veto_reason:   str   = ""
+        self._p42_spy_btc_corr:  float = 1.0     # assume correlated on cold-start
+        # ── [/P42-SHADOW] ─────────────────────────────────────────────────────
+
         # ── [P37-VPIN] Flow Toxicity Veto state ──────────────────────────────
         # Volume-Clock ToxicityScore injected by the Executor each cycle via
         # set_flow_toxicity().  When this score exceeds P37_TOXICITY_THRESHOLD
@@ -1392,14 +1524,25 @@ class VetoArbitrator:
         self._p37_last_entropy_norm: float = 0.5
         # ── [/P37-VPIN] ──────────────────────────────────────────────────────
 
+        # ── [P38-OFI] Order Flow Imbalance Veto state ─────────────────────────
+        # OFI score ∈ [-1, +1] injected per symbol by the Executor each cycle
+        # via set_ofi_score().  The gate fires when OFI is directionally adverse
+        # and its magnitude exceeds P38_OFI_VETO_THRESHOLD.  Runs FIRST — after
+        # P37 VPIN (ZEROTH), before P36 Spoof (was previously FIRST, now SECOND).
+        self._p38_ofi_score:      float = 0.0
+        self._p38_ofi_symbol:     str   = ""
+        self._p38_bid_wall_pulled: bool = False
+        self._p38_ask_wall_pulled: bool = False
+        # ── [/P38-OFI] ───────────────────────────────────────────────────────
+
         log.debug("[P33-REVERSION] VetoArbitrator.__init__: exhaustion filter armed "
                   "(window=%.0fms drop=%.0f%%) | [P34-SKEW] max_skew=%.1f bps | "
                   "[P35.1-HEDGE] hedge veto armed | [P36.1-DETECT] spoof veto armed "
                   "(threshold=%.2f) | [P37-VPIN] flow toxicity veto armed "
-                  "(threshold=%.2f)",
+                  "(threshold=%.2f) | [P38-OFI] OFI veto armed (threshold=%.2f)",
                   P33_EXHAUSTION_WINDOW_MS, P33_EXHAUSTION_VELOCITY_DROP_PCT * 100.0,
                   P34_MAX_SKEW_BPS, P36_SPOOF_VETO_THRESHOLD,
-                  P37_TOXICITY_THRESHOLD)
+                  P37_TOXICITY_THRESHOLD, P38_OFI_VETO_THRESHOLD)
 
     # ── [P34.1-SKEW] DataHub injection ───────────────────────────────────────
 
@@ -1413,6 +1556,78 @@ class VetoArbitrator:
         self._p34_hub = hub
         log.debug("[P34-SKEW] VetoArbitrator.set_hub: hub injected (type=%s)",
                   type(hub).__name__)
+
+    # ── [P42-SHADOW] Global Market data injection ─────────────────────────────
+
+    def set_global_market_data(
+        self,
+        spy_drop_pct:  float,
+        dxy_spike_pct: float,
+        data_age_secs: float,
+        spy_btc_corr:  float = 1.0,
+    ) -> None:
+        """
+        [P42-SHADOW] Inject the latest macro market deltas from GlobalMarketSentinel.
+
+        Called by the Executor each _cycle() immediately before any entry evaluation
+        so compute_p_success() always has a fresh macro snapshot.
+
+        Parameters
+        ----------
+        spy_drop_pct  : float — SPY 5-min price change as a percentage.
+                        Negative means SPY is falling (e.g. -1.3 → fell 1.3 %).
+                        Gate fires when spy_drop_pct < -P42_SPY_DROP_BLOCK_PCT.
+        dxy_spike_pct : float — DXY 5-min price change as a percentage.
+                        Positive means the dollar is rising (risk-off).
+                        Gate fires when dxy_spike_pct > P42_DXY_SPIKE_BLOCK_PCT.
+        data_age_secs : float — seconds since the last successful Yahoo Finance
+                        poll.  Gate is SKIPPED (fail-open) when age > 300 s to
+                        prevent network outages from halting all trading.
+        spy_btc_corr  : float — rolling Pearson r between SPY and BTC return series
+                        (from GlobalMarketSentinel._spy_btc_corr).
+                        When < P42_CORR_DECOUPLE_THRESHOLD (default 0.3), the
+                        SPY-drop-blocker stands down — crypto is decoupled.
+                        Defaults to 1.0 (fully correlated) on cold-start so the
+                        gate is conservatively active until enough BTC samples exist.
+        """
+        try:
+            self._p42_spy_drop_pct  = float(spy_drop_pct)
+            self._p42_dxy_spike_pct = float(dxy_spike_pct)
+            self._p42_data_age_secs = float(data_age_secs)
+            self._p42_spy_btc_corr  = float(spy_btc_corr)
+            log.debug(
+                "[P42-SHADOW] set_global_market_data: spy_5m=%.3f%% dxy_5m=%.3f%% "
+                "age=%.0fs spy_btc_r=%.3f (gate_active=%s decouple=%s)",
+                self._p42_spy_drop_pct, self._p42_dxy_spike_pct,
+                self._p42_data_age_secs, self._p42_spy_btc_corr,
+                self._p42_data_age_secs <= 300.0,
+                self._p42_spy_btc_corr < P42_CORR_DECOUPLE_THRESHOLD,
+            )
+        except Exception as exc:
+            log.debug("[P42-SHADOW] set_global_market_data error: %s", exc)
+
+    def get_p42_status(self) -> dict:
+        """
+        [P42-SHADOW] Return a serialisable snapshot of Phase 42 state.
+        Called by the Executor to embed macro status in dashboard telemetry.
+        """
+        return {
+            "spy_5m_pct":      round(self._p42_spy_drop_pct,  4),
+            "dxy_5m_pct":      round(self._p42_dxy_spike_pct, 4),
+            "data_age_secs":   round(self._p42_data_age_secs, 1),
+            "veto_active":     self._p42_veto_active,
+            "veto_reason":     self._p42_veto_reason,
+            "spy_threshold":   P42_SPY_DROP_BLOCK_PCT,
+            "dxy_threshold":   P42_DXY_SPIKE_BLOCK_PCT,
+            "block_shorts":    P42_BLOCK_SHORTS_ON_CRASH,
+            "feed_stale":      self._p42_data_age_secs > 300.0,
+            # ── [P42-CORR] ───────────────────────────────────────────────────
+            "spy_btc_corr":       round(self._p42_spy_btc_corr, 4),
+            "spy_gate_decoupled": self._p42_spy_btc_corr < P42_CORR_DECOUPLE_THRESHOLD,
+            "corr_threshold":     P42_CORR_DECOUPLE_THRESHOLD,
+        }
+
+    # ── [/P42-SHADOW] ─────────────────────────────────────────────────────────
 
     # ── [P35.1-HEDGE] State injection ────────────────────────────────────────
 
@@ -1481,6 +1696,53 @@ class VetoArbitrator:
             )
         except Exception as exc:
             log.debug("[P37-VPIN] set_flow_toxicity error: %s", exc)
+
+    # ── [P38-OFI] Order Flow Imbalance injection ──────────────────────────────
+
+    def set_ofi_score(
+        self,
+        symbol:          str,
+        ofi_score:       float,
+        bid_wall_pulled: bool = False,
+        ask_wall_pulled: bool = False,
+    ) -> None:
+        """
+        [P38-OFI] Inject the current Order Flow Imbalance snapshot for a symbol.
+
+        Called by the Executor each cycle after reading DataHub.get_ofi_score().
+        The stored values are consumed on the very next compute_p_success() call
+        that passes a matching direction.
+
+        When ofi_score is directionally adverse AND its magnitude exceeds
+        P38_OFI_VETO_THRESHOLD, compute_p_success() returns 0.0 immediately:
+          • Going long  + ofi_score < -threshold → VETO (selling pressure)
+          • Going short + ofi_score >  threshold → VETO (buying pressure)
+
+        If the wall-pull flag is also set for the same side, the veto reason is
+        escalated to "ESCALATED VETO: OFI + Wall Pull Detected", indicating
+        deliberate manipulation (fake wall removed to bait the entry).
+
+        Parameters
+        ----------
+        symbol          : str   — base symbol, e.g. "BTC"
+        ofi_score       : float — normalised OFI ∈ [-1.0, +1.0]
+        bid_wall_pulled : bool  — large bid wall disappeared in last book tick
+        ask_wall_pulled : bool  — large ask wall disappeared in last book tick
+        """
+        try:
+            self._p38_ofi_score      = max(-1.0, min(1.0, float(ofi_score)))
+            self._p38_ofi_symbol     = str(symbol).upper()
+            self._p38_bid_wall_pulled = bool(bid_wall_pulled)
+            self._p38_ask_wall_pulled = bool(ask_wall_pulled)
+            log.debug(
+                "[P38-OFI] set_ofi_score %s: ofi=%.4f bid_pull=%s ask_pull=%s "
+                "(threshold=%.2f)",
+                self._p38_ofi_symbol, self._p38_ofi_score,
+                self._p38_bid_wall_pulled, self._p38_ask_wall_pulled,
+                P38_OFI_VETO_THRESHOLD,
+            )
+        except Exception as exc:
+            log.debug("[P38-OFI] set_ofi_score error: %s", exc)
 
     # ── [P36.1-DETECT] Spoof Probability injection ────────────────────────────
 
@@ -1630,24 +1892,17 @@ class VetoArbitrator:
         velocity_boost:    float = 1.0,
         local_price:       float = 0.0,
         global_mid_price:  Optional[float] = None,
+        direction:         str   = "",
     ) -> float:
         """
         Compute the composite ``p_success`` score.
 
-        [P36.1-DETECT] Manipulation Veto runs FIRST (before all other checks).
-        If the current spoof_probability (set via set_spoof_probability()) exceeds
-        P36_SPOOF_VETO_THRESHOLD (default 0.8), returns 0.0 immediately with
-        reason "VETO: Market Manipulation Detected (Spoofing)".
-
-        [P34.1-SKEW] Price Skew Veto runs SECOND.
-        If the OKX local price deviates from global_mid_price by more than
-        P34_MAX_SKEW_BPS basis points, returns 0.0 immediately.
-
-        [P33-REVERSION] Exhaustion Gap Filter runs THIRD as a hard pre-check.
-        If an exhaustion gap is detected (whale sweep followed by >50% velocity
-        collapse within 500ms), this method immediately returns 0.0, bypassing
-        the trimmed-mean calculation so no individual component can override
-        the mean-reversion veto.
+        [P37-VPIN] Flow Toxicity Veto runs ZEROTH (before all other checks).
+        [P38-OFI]  OFI Veto runs FIRST.
+        [P36.1-DETECT] Manipulation Veto runs SECOND.
+        [P35.1-HEDGE]  Hedge-Aware Veto runs THIRD.
+        [P34.1-SKEW]   Price Skew Veto runs FOURTH.
+        [P33-REVERSION] Exhaustion Gap Filter runs FIFTH.
 
         Parameters
         ----------
@@ -1657,26 +1912,114 @@ class VetoArbitrator:
                             (1.0 = neutral, > 1.0 = Coinbase leads OKX)
         local_price       : float — current OKX execution price (for skew check)
         global_mid_price  : float | None — synthetic mid from DataHub (P34.1-SYNTH)
+        direction         : str — "long" or "short"; used by P38 OFI gate to
+                            determine directionality of the imbalance signal.
+                            Empty string disables the directional OFI check.
 
         Returns
         -------
-        float ∈ [0, 1] — 0.0 on toxicity/manipulation/skew/exhaustion veto; trimmed mean otherwise.
+        float ∈ [0, 1] — 0.0 on any veto; trimmed mean otherwise.
         """
-        # ── [P37-VPIN] Flow Toxicity Veto — MUST run before ALL other checks ──
+        # ── [P42-SHADOW] Global Market Correlation Veto — PRE-ZEROTH gate ───────
+        # Runs before ALL other veto checks (P37, P38, P36, P35, P34, P33).
+        # Gate is DIRECTIONAL: blocks Long entries when SPY or DXY signals a
+        # macro risk-off event.  Fail-open when data is stale (>300 s).
+        #
+        # [P42-CORR] Adaptive stand-down: if the rolling SPY/BTC Pearson r is
+        # below P42_CORR_DECOUPLE_THRESHOLD (default 0.3) the SPY-drop-blocker
+        # is automatically disabled.  Crypto is trading on idiosyncratic flow
+        # (ETF demand, halving, on-chain catalyst) and blocking Longs on equity
+        # weakness causes false negatives on crypto-native rallies.
+        # The DXY gate remains active regardless — currency risk is global.
+        try:
+            _p42_stale = self._p42_data_age_secs > 300.0
+            if not _p42_stale and direction in ("long", "short"):
+                _spy_crash = self._p42_spy_drop_pct < -P42_SPY_DROP_BLOCK_PCT
+                _dxy_spike = self._p42_dxy_spike_pct > P42_DXY_SPIKE_BLOCK_PCT
+
+                # ── [P42-CORR] Decoupling stand-down for SPY-drop gate only ──
+                _decoupled = self._p42_spy_btc_corr < P42_CORR_DECOUPLE_THRESHOLD
+                if _spy_crash and _decoupled:
+                    log.info(
+                        "[P42-CORR] SPY-drop-blocker STANDING DOWN — "
+                        "spy_btc_r=%.3f < threshold=%.2f (crypto decoupled). "
+                        "SPY_5m=%+.2f%% DXY gate still active=%s.",
+                        self._p42_spy_btc_corr, P42_CORR_DECOUPLE_THRESHOLD,
+                        self._p42_spy_drop_pct, _dxy_spike,
+                    )
+                    _spy_crash = False   # stand down SPY gate; DXY gate unchanged
+                # ── [/P42-CORR] ──────────────────────────────────────────────
+
+                _macro_event = _spy_crash or _dxy_spike
+
+                _blocks_this_direction = (
+                    (direction == "long" and _macro_event)
+                    or (direction == "short" and _macro_event and P42_BLOCK_SHORTS_ON_CRASH)
+                )
+
+                if _blocks_this_direction:
+                    _p42_trigger = []
+                    if _spy_crash:
+                        _p42_trigger.append(
+                            f"SPY_5m={self._p42_spy_drop_pct:+.2f}% "
+                            f"(threshold=-{P42_SPY_DROP_BLOCK_PCT:.1f}%)"
+                        )
+                    if _dxy_spike:
+                        _p42_trigger.append(
+                            f"DXY_5m={self._p42_dxy_spike_pct:+.2f}% "
+                            f"(threshold=+{P42_DXY_SPIKE_BLOCK_PCT:.1f}%)"
+                        )
+                    _p42_reason = (
+                        f"VETO: Macro Crash Signal — {', '.join(_p42_trigger)} "
+                        f"[P42-SHADOW] blocking {direction.upper()} entry"
+                    )
+                    self._p42_veto_active = True
+                    self._p42_veto_reason = _p42_reason
+                    log.warning(
+                        "[P42-SHADOW] PRE-ZEROTH VETO direction=%s: %s "
+                        "(data_age=%.0fs spy_btc_r=%.3f)",
+                        direction, _p42_reason, self._p42_data_age_secs,
+                        self._p42_spy_btc_corr,
+                    )
+                    _append_veto_audit_file(
+                        symbol  = direction,
+                        reason  = _p42_reason,
+                        details = (
+                            f"spy_5m={self._p42_spy_drop_pct:+.4f}% "
+                            f"dxy_5m={self._p42_dxy_spike_pct:+.4f}% "
+                            f"age={self._p42_data_age_secs:.0f}s "
+                            f"spy_btc_r={self._p42_spy_btc_corr:.4f} [P42-SHADOW]"
+                        ),
+                    )
+                    return 0.0
+                else:
+                    # Reset veto flag when conditions normalise
+                    self._p42_veto_active = False
+                    self._p42_veto_reason = ""
+            elif _p42_stale:
+                log.debug(
+                    "[P42-SHADOW] PRE-ZEROTH gate SKIPPED — feed stale (age=%.0fs > 300s). "
+                    "Fail-open: no macro veto applied.",
+                    self._p42_data_age_secs,
+                )
+                self._p42_veto_active = False
+                self._p42_veto_reason = "feed_stale"
+        except Exception as exc:
+            log.debug("[P42-SHADOW] pre-zeroth gate error: %s", exc)
+        # ── [/P42-SHADOW] ────────────────────────────────────────────────────
+
+        # ── [P37-VPIN] Flow Toxicity Veto — ZEROTH gate ───────────────────────
         # If the Volume-Clock ToxicityScore (set via set_flow_toxicity()) exceeds
         # P37_TOXICITY_THRESHOLD, informed selling / institutional flow is detected.
         # Block the entry unconditionally so no other factor can override the signal.
         try:
             if self._p37_toxicity_score > P37_TOXICITY_THRESHOLD:
-                # Compute entropy for escalation check.
-                # If the caller provided recent_returns, derive entropy_norm now;
-                # otherwise fall back to the cached value from the last full scoring.
-                _en_norm = 0.5  # neutral default
+                _en_norm = 0.5
                 try:
                     _en_bits = compute_shannon_entropy(recent_returns)
                     _en_norm = normalize_entropy(_en_bits)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    log.warning("[IL] suppressed: %s", _exc)
                 self._p37_last_entropy_norm = _en_norm
 
                 _escalated = _en_norm < P37_LOW_ENTROPY_THRESHOLD
@@ -1710,7 +2053,66 @@ class VetoArbitrator:
             log.debug("[P37-VPIN] flow toxicity pre-check error: %s", exc)
         # ── [/P37-VPIN] ──────────────────────────────────────────────────────
 
-        # ── [P36.1-DETECT] Manipulation Veto — MUST run before ALL other checks ─
+        # ── [P38-OFI] Order Flow Imbalance Veto — FIRST gate ─────────────────
+        # Fires when the OFI is directionally adverse (selling pressure against
+        # a long, or buying pressure against a short) and its magnitude exceeds
+        # P38_OFI_VETO_THRESHOLD.  Skipped when direction is not supplied.
+        try:
+            if (
+                direction in ("long", "short")
+                and abs(self._p38_ofi_score) > P38_OFI_VETO_THRESHOLD
+            ):
+                _ofi_blocks_long  = (
+                    direction == "long"
+                    and self._p38_ofi_score < -P38_OFI_VETO_THRESHOLD
+                )
+                _ofi_blocks_short = (
+                    direction == "short"
+                    and self._p38_ofi_score > P38_OFI_VETO_THRESHOLD
+                )
+
+                if _ofi_blocks_long or _ofi_blocks_short:
+                    # Wall-pull escalation: pulled bid wall on long = fake support
+                    # removed immediately before the drop.  Pulled ask wall on
+                    # short = fake resistance removed before the squeeze.
+                    _wall_pulled = (
+                        (direction == "long"  and self._p38_bid_wall_pulled)
+                        or (direction == "short" and self._p38_ask_wall_pulled)
+                    )
+                    _escalated_ofi = _wall_pulled and P38_WALL_PULL_ESCALATE
+                    _p38_reason = (
+                        "ESCALATED VETO: Adverse OFI + Wall Pull Detected "
+                        "(Passive Wall Manipulation)"
+                        if _escalated_ofi
+                        else "VETO: Adverse Order Flow Imbalance"
+                    )
+                    log.warning(
+                        "[P38-OFI] %s symbol=%s ofi=%.4f direction=%s "
+                        "threshold=%.2f bid_pull=%s ask_pull=%s "
+                        "→ compute_p_success → 0.0",
+                        _p38_reason,
+                        self._p38_ofi_symbol, self._p38_ofi_score,
+                        direction, P38_OFI_VETO_THRESHOLD,
+                        self._p38_bid_wall_pulled, self._p38_ask_wall_pulled,
+                    )
+                    _append_veto_audit_file(
+                        symbol  = self._p38_ofi_symbol,
+                        reason  = _p38_reason,
+                        details = (
+                            f"ofi={self._p38_ofi_score:.4f} "
+                            f"direction={direction} "
+                            f"threshold={P38_OFI_VETO_THRESHOLD:.2f} "
+                            f"bid_pull={self._p38_bid_wall_pulled} "
+                            f"ask_pull={self._p38_ask_wall_pulled} "
+                            f"escalated={_escalated_ofi} [P38-OFI]"
+                        ),
+                    )
+                    return 0.0
+        except Exception as exc:
+            log.debug("[P38-OFI] OFI pre-check error: %s", exc)
+        # ── [/P38-OFI] ───────────────────────────────────────────────────────
+
+        # ── [P36.1-DETECT] Manipulation Veto — SECOND gate ───────────────────
         # If the Mimic Order Engine confirmed active spoofing for this symbol,
         # force p_success=0.0 and record the reason in the veto audit log.
         try:
@@ -1757,6 +2159,12 @@ class VetoArbitrator:
         # ── [/P35.1-HEDGE] ───────────────────────────────────────────────────
 
         # ── [P34.1-SKEW] Price Skew Veto — runs AFTER P36 Manipulation Veto ──
+        # [FIX-SKEW-INIT] Always initialize skew_penalty to 1.0 (no-op) so the
+        # apply-block below never raises UnboundLocalError when skew is within
+        # normal bounds.  skew_penalty < 1.0 is only set when skew_bps exceeds
+        # P34_MAX_SKEW_BPS; without this init the except clause silently swallowed
+        # the error and left p_success at 0.5000, blocking all trade entries.
+        skew_penalty: float = 1.0
         try:
             if (
                 local_price > 0.0
@@ -1764,14 +2172,31 @@ class VetoArbitrator:
                 and global_mid_price > 0.0
             ):
                 skew_bps = abs(local_price - global_mid_price) / global_mid_price * 10_000.0
-                if skew_bps > P34_MAX_SKEW_BPS:
+                hard_veto_bps = P34_MAX_SKEW_BPS * 2.0
+                if skew_bps > hard_veto_bps:
                     log.warning(
                         "[P34-SKEW] VETO: Price Skew Detected "
-                        "local=%.6f global=%.6f skew=%.2f bps > %.1f bps — "
+                        "local=%.6f global=%.6f skew=%.2f bps > %.1f bps (hard=%.1f) — "
                         "compute_p_success → 0.0 (local manipulation risk)",
-                        local_price, global_mid_price, skew_bps, P34_MAX_SKEW_BPS,
+                        local_price, global_mid_price, skew_bps, P34_MAX_SKEW_BPS, hard_veto_bps,
                     )
                     return 0.0
+                if skew_bps > P34_MAX_SKEW_BPS:
+                    # [FIX-P34-CALIBRATION] Use configurable P34_SOFT_SKEW_PENALTY
+                    # (default 0.65) instead of the former hardcoded 0.25.
+                    # The old 0.25× penalty reduced p_success by 75%, which when
+                    # applied to a baseline of ~0.75 produced p_success≈0.19 —
+                    # far below the 0.65 admission threshold and indistinguishable
+                    # from a hard block.  0.65× reduces p_success by 15%, which
+                    # is proportionate for a "soft" advisory signal while still
+                    # materially flagging elevated cross-exchange spread.
+                    skew_penalty = P34_SOFT_SKEW_PENALTY
+                    log.warning(
+                        "[P34-SKEW] SOFT VETO: Price Skew Detected "
+                        "local=%.6f global=%.6f skew=%.2f bps > %.1f bps — "
+                        "compute_p_success penalty ×%.2f (local manipulation risk)",
+                        local_price, global_mid_price, skew_bps, P34_MAX_SKEW_BPS, skew_penalty,
+                    )
         except Exception as exc:
             log.debug("[P34-SKEW] skew check error: %s", exc)
         # ── [/P34.1-SKEW] ────────────────────────────────────────────────────
@@ -1811,12 +2236,16 @@ class VetoArbitrator:
         components = sorted([entropy_score, corr_score, vel_score])
         p_success  = (components[1] + components[2]) / 2.0
 
-        log.debug(
+        # Apply soft skew penalty (P34) — skew_penalty is always initialised
+        # to 1.0 above, so this multiply is always safe (no try/except needed).
+        p_success *= skew_penalty  # [FIX-SKEW-APPLY] was: try/except → swallowed UnboundLocalError
+
+        log.info(
             "[P32-VETO-ARB] p_success=%.4f "
-            "(entropy_score=%.4f corr_score=%.4f vel_score=%.4f) "
-            "entropy_norm=%.4f vel_boost=%.4f",
+            "(entropy=%.3f corr=%.3f vel=%.3f) "
+            "entropy_norm=%.4f vel_boost=%.4f skew_penalty=%.3f",
             p_success, entropy_score, corr_score, vel_score,
-            entropy_norm, velocity_boost,
+            entropy_norm, velocity_boost, skew_penalty,
         )
         return round(p_success, 4)
 
@@ -2183,8 +2612,8 @@ class LLMContextVeto:
         try:
             cached = self._scraper._cache.get(symbol)
             n_headlines = len(cached[1]) if cached else 0
-        except Exception:
-            pass
+        except Exception as _exc:
+            log.warning("[IL] suppressed: %s", _exc)
 
         return NarrativeResult(
             symbol=symbol,

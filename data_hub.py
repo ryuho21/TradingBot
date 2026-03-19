@@ -1,6 +1,41 @@
 """
 data_hub.py  —  OKX WebSocket Hub + KuCoin Historical Backfill + InstrumentCache
 
+CHANGELOG — POST-ROADMAP TRACK 17: DCA / EXIT-PATH DECISION-TRACE EXPANSION
+═══════════════════════════════════════════════════════════════════════════════
+[TRACK17-SCHEMA]  _TRACK17_DT_MIGRATION constant added:
+               ALTER TABLE decision_trace ADD COLUMN pnl_pct REAL
+               ALTER TABLE decision_trace ADD COLUMN hold_time_secs REAL
+               Applied in _conn_obj() immediately after the TRACK16 block,
+               using the same duplicate-column-ignore pattern.  Old rows carry
+               NULL for both columns (correct — no data loss).  Safe no-op on
+               DBs where the columns already exist.
+
+[TRACK17-INSERT]  insert_decision_trace() updated to accept and persist
+               optional "pnl_pct" (float) and "hold_time_secs" (float) keys.
+               "source_path": "close" — records from _record_close
+               "source_path": "dca"   — records from _maybe_dca (successful add)
+               Absent keys → NULL stored (backward-compatible with all
+               pre-Track-17 callers).  Fail-open contract unchanged.
+
+CHANGELOG — POST-ROADMAP TRACK 16: DECISION-TRACE EXPANSION (EXPRESS PATH)
+═══════════════════════════════════════════════════════════════════════════════
+[TRACK16-DT-SCHEMA]  _TRACK16_DT_MIGRATION constant added:
+               ALTER TABLE decision_trace ADD COLUMN source_path TEXT
+               Applied in _conn_obj() immediately after the TRACK10
+               executescript block, using the same duplicate-column-ignore
+               pattern as all prior additive migrations.  Old rows carry
+               NULL source_path (correct — no data loss).  Safe no-op on
+               all DBs where the column already exists.
+
+[TRACK16-DT-INSERT]  insert_decision_trace() updated to accept and persist
+               an optional "source_path" key from the record dict.
+               "source_path": "entry"   — records from _maybe_enter
+               "source_path": "express" — records from trigger_atomic_express_trade
+               Absent key → NULL stored (backward-compatible with all
+               pre-Track-16 callers).  No behavioral change; fail-open
+               contract unchanged.
+
 Phase 37 additions:
   [P37-VPIN]   Volume-Clock & VPIN Calculation — TapeBuffer now maintains a
                VolumeBucket state machine.  Every trade accumulates buy/sell
@@ -55,6 +90,34 @@ PATCH — Task 4 additions:
   [TASK-4-C] Wire point in main_p20.py (comment only — see main_p20.py):
                hub._risk_executor = executor
                hub._risk_cb       = cb
+
+Stage 6.1 additions:
+  [S6.1-DBPATH]   Database canonical path is hub_data/powertrader.db (absolute),
+                  co-located with all other hub_data artifacts.  hub_data/ is
+                  created automatically on first use.  The resolved path is always
+                  absolute — constructed via Path(__file__).resolve().parent /
+                  "hub_data" / "powertrader.db" — so there is no ambiguity
+                  regardless of the process working directory.
+                  datahub.db is NOT used anywhere in this module.
+
+Stage 7A additions:
+  [S7A-DBPATH]    Explicit absolute-path guarantee documented and enforced in
+                  Database.__init__.  _conn_obj() logs and re-raises on any
+                  failure so callers and the boot ensure-ready step can detect it.
+
+Stage R1 additions:
+  [R1-A-DBPATH]   Database.__init__ ALWAYS constructs the canonical absolute path
+                  from Path(__file__).resolve().parent / "hub_data" / "powertrader.db".
+                  datahub.db is NEVER used.  hub_data/ is mkdir'd at __init__ time
+                  (not lazily) so the directory is guaranteed to exist before any
+                  caller attempts to open it.  Path is logged immediately at
+                  construction — before any connection is made.
+
+Stage CI-1 additions:
+  [CI-1-A]  Candle verified as @dataclass — no structural change required.
+  [CI-1-B]  Database.upsert_candles(candles) — batch upsert in a single
+            transaction/commit; empty list is a safe no-op; sqlite errors are
+            logged and re-raised (no silent loss).
 """
 from __future__ import annotations
 
@@ -81,6 +144,10 @@ from okx_gateway import (
 )
 
 log = logging.getLogger("data_hub")
+logging.getLogger("data_hub").addHandler(logging.NullHandler())
+
+# ── [P0-FIX-3/11] Shared safe env parsing from pt_utils ──────────────────────
+from pt_utils import _env_float, _env_int, atomic_write_json
 
 # ── Symbol / string sanitization helper ───────────────────────────────────────
 def _sanitize_sym(raw: str) -> str:
@@ -103,25 +170,25 @@ _clean_env = _sanitize_sym
 # ── General config ─────────────────────────────────────────────────────────────
 REDIS_URL            = os.environ.get("REDIS_URL",             "redis://localhost:6379/0")
 KUCOIN_REST          = "https://api.kucoin.com"
-INSTRUMENT_CACHE_TTL = int  (os.environ.get("INSTRUMENT_CACHE_TTL",    "3600"))
-FLASH_CRASH_DROP_PCT = float(os.environ.get("FLASH_CRASH_DROP_PCT",    "5.0"))
-FLASH_CRASH_WINDOW   = float(os.environ.get("FLASH_CRASH_WINDOW_SECS", "30.0"))
-EMERGENCY_PAUSE_SECS = float(os.environ.get("EMERGENCY_PAUSE_SECS",    "300.0"))
+INSTRUMENT_CACHE_TTL = _env_int("INSTRUMENT_CACHE_TTL", 3600)
+FLASH_CRASH_DROP_PCT = _env_float("FLASH_CRASH_DROP_PCT", 5.0)
+FLASH_CRASH_WINDOW   = _env_float("FLASH_CRASH_WINDOW_SECS", 30.0)
+EMERGENCY_PAUSE_SECS = _env_float("EMERGENCY_PAUSE_SECS", 300.0)
 
 # [P5-1]
-SENTIMENT_WINDOW_SECS = float(os.environ.get("SENTIMENT_WINDOW_SECS", "60.0"))
+SENTIMENT_WINDOW_SECS = _env_float("SENTIMENT_WINDOW_SECS", 60.0)
 
 # [P12-2]
-TAPE_BUFFER_SECS          = float(os.environ.get("P12_TAPE_BUFFER_SECS",     "60.0"))
-TAPE_MAX_EVENTS           = int  (os.environ.get("P12_TAPE_MAX_EVENTS",      "10000"))
-TAPE_VELOCITY_WINDOW_SECS = float(os.environ.get("P12_TAPE_VELOCITY_WINDOW", "5.0"))
-SWEEP_DIP_PCT             = float(os.environ.get("P12_SWEEP_DIP_PCT",        "0.3"))
-SWEEP_BUY_VOL_USD         = float(os.environ.get("P12_SWEEP_BUY_VOL_USD",    "250000"))
-SWEEP_WINDOW_SECS         = float(os.environ.get("P12_SWEEP_WINDOW_SECS",    "10.0"))
+TAPE_BUFFER_SECS          = _env_float("P12_TAPE_BUFFER_SECS", 60.0)
+TAPE_MAX_EVENTS           = _env_int("P12_TAPE_MAX_EVENTS", 10000)
+TAPE_VELOCITY_WINDOW_SECS = _env_float("P12_TAPE_VELOCITY_WINDOW", 5.0)
+SWEEP_DIP_PCT             = _env_float("P12_SWEEP_DIP_PCT", 0.3)
+SWEEP_BUY_VOL_USD         = _env_float("P12_SWEEP_BUY_VOL_USD", 250000.0)
+SWEEP_WINDOW_SECS         = _env_float("P12_SWEEP_WINDOW_SECS", 10.0)
 
 # [P12-1]
-OBI_LEVELS    = int(os.environ.get("P12_OBI_LEVELS",    "10"))
-OB_MAX_LEVELS = int(os.environ.get("P12_OB_MAX_LEVELS", "25"))
+OBI_LEVELS    = _env_int("P12_OBI_LEVELS", 10)
+OB_MAX_LEVELS = _env_int("P12_OB_MAX_LEVELS", 25)
 
 # [P15-3] Coinbase CDP credentials
 COINBASE_API_KEY        = os.environ.get("COINBASE_API_KEY",    "")
@@ -129,21 +196,59 @@ COINBASE_API_SECRET_RAW = os.environ.get("COINBASE_API_SECRET", "")
 
 # [TASK-4] Minimum equity value treated as valid for risk snapshot purposes.
 # Matches P7_CB_MIN_VALID_EQUITY so all risk subsystems use the same floor.
-_RISK_MIN_VALID_EQUITY = float(os.environ.get("P7_CB_MIN_VALID_EQUITY", "10.0"))
+_RISK_MIN_VALID_EQUITY = _env_float("P7_CB_MIN_VALID_EQUITY", 10.0)
 
 # ── [P34.1] Synthetic Mid-Price Discovery ────────────────────────────────────
-P34_OKX_WEIGHT      = float(os.environ.get("P34_OKX_WEIGHT",     "0.5"))
-P34_COINBASE_WEIGHT = float(os.environ.get("P34_COINBASE_WEIGHT", "0.5"))
-P34_STALENESS_SECS  = float(os.environ.get("P34_STALENESS_SECS",  "2.0"))
+P34_OKX_WEIGHT      = _env_float("P34_OKX_WEIGHT", 0.5)
+P34_COINBASE_WEIGHT = _env_float("P34_COINBASE_WEIGHT", 0.5)
+P34_STALENESS_SECS  = _env_float("P34_STALENESS_SECS", 2.0)
 
 # ── [P37-VPIN] Volume-Clock & Flow Toxicity config ────────────────────────────
-# Bucket size (BTC-equivalent units).  When cumulative trade volume across both
-# sides reaches this value, a VPIN sample is sealed and appended to the rolling
-# window.  Default 1.0 BTC = one volume-clock tick per bucket.
-P37_VPIN_BUCKET_SIZE = float(os.environ.get("P37_VPIN_BUCKET_SIZE", "1.0"))
-# Rolling window depth for VPIN history (last N sealed buckets).
-# 50 buckets provides a statistically meaningful CDF with low memory overhead.
-_P37_VPIN_WINDOW     = int(os.environ.get("P37_VPIN_WINDOW", "50"))
+P37_VPIN_BUCKET_SIZE = _env_float("P37_VPIN_BUCKET_SIZE", 1.0)
+_P37_VPIN_WINDOW     = _env_int("P37_VPIN_WINDOW", 50)
+
+# ── [P38-OFI] Predictive Order Flow Imbalance config ──────────────────────────
+# P38_OFI_LEVELS  : how many depth levels to include in the delta computation.
+#                   5 covers ~80% of typical institutional book activity without
+#                   noise from deep passive liquidity.
+# P38_OFI_WINDOW  : number of snapshots to keep in the per-symbol deque.
+#                   2 = only the most recent pair (sufficient for single-tick OFI).
+#                   Higher values enable rolling-average smoothing in the future.
+# P38_WALL_MIN_VOL: minimum size (in base coin) for a passive level to be
+#                   classified as a "wall" — below this it is noise, not intent.
+#                   Default 0.5 BTC / 5 ETH equivalent; adjust per instrument.
+P38_OFI_LEVELS   = _env_int("P38_OFI_LEVELS", 5)
+P38_OFI_WINDOW   = _env_int("P38_OFI_WINDOW", 3)
+P38_WALL_MIN_VOL = _env_float("P38_WALL_MIN_VOL", 0.5)
+
+# ── [P42-SHADOW] Global Market Correlation Sentinel config ────────────────────
+# Polling interval in seconds between Yahoo Finance REST requests.
+# Default 30 s — fast enough to catch a 1-minute equity crash within 1 cycle.
+P42_POLL_INTERVAL_SECS = _env_float("P42_POLL_INTERVAL_SECS", 30.0)
+# Lookback window (seconds) for SPY / DXY delta calculation.
+# Default 300 s (5 minutes) — matches the roadmap spec exactly.
+P42_LOOKBACK_SECS      = _env_float("P42_LOOKBACK_SECS", 300.0)
+# Maximum data age before the veto gate is considered stale and skipped (fail-open).
+P42_MAX_STALE_SECS     = _env_float("P42_MAX_STALE_SECS", 300.0)
+# Yahoo Finance tickers — free, no API key required.
+P42_SPY_TICKER = os.environ.get("P42_SPY_TICKER", "SPY")
+P42_DXY_TICKER = os.environ.get("P42_DXY_TICKER", "DX-Y.NYB")
+# ── [/P42-SHADOW] ─────────────────────────────────────────────────────────────
+
+# ── [TRACK12-PRUNE] decision_trace retention / pruning config ─────────────────
+# DT_RETAIN_DAYS         : rows older than this many days are deleted on each
+#                          prune pass.  Default 30 days — generous forensic
+#                          window; well above the dashboard's maximum days_back
+#                          filter (currently 90d slider cap, but the table only
+#                          grows from Track 10 onwards so 30d is safe for fresh
+#                          installs and configurable for older ones).
+# DT_PRUNE_INTERVAL_SECS : how often the background prune loop runs.
+#                          Default 6 hours (21 600 s) — keeps the table bounded
+#                          without hammering the DB.  Set to a lower value (e.g.
+#                          3 600) in environments with very high signal frequency.
+DT_RETAIN_DAYS         = _env_int("DT_RETAIN_DAYS",         30)
+DT_PRUNE_INTERVAL_SECS = _env_int("DT_PRUNE_INTERVAL_SECS", 21_600)
+# ── [/TRACK12-PRUNE] ──────────────────────────────────────────────────────────
 
 _WS_SUPPORTED_BARS: Dict[str, str] = {
     "1hour": "1H", "2hour": "2H", "4hour": "4H",
@@ -160,6 +265,320 @@ _TF_SECS: Dict[str, int] = {
     "1hour": 3600, "2hour": 7200,  "4hour": 14400,
     "8hour": 28800, "12hour": 43200, "1day": 86400, "1week": 604800,
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [P42-SHADOW] Global Market Sentinel — SPY / DXY Macro Crash Monitor
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GlobalMarketSentinel:
+    """
+    [P42-SHADOW] Phase 42 Shadow Correlation Matrix — macro market feed.
+
+    Polls the Yahoo Finance free REST endpoint every P42_POLL_INTERVAL_SECS
+    seconds (default 30 s) for SPY and DXY minute-bar data.  No API key is
+    required — this uses the public v8/finance/chart endpoint.
+
+    Public API (thread-safe, async-safe):
+        get_spy_5m_pct()          → float  (5-min SPY % change, negative = falling)
+        get_dxy_5m_pct()          → float  (5-min DXY % change, positive = rising)
+        get_data_age_secs()       → float  (seconds since last successful poll)
+        get_status_snapshot()     → dict   (dashboard telemetry)
+
+    Fail-open design:
+        All network failures are silently swallowed.  The Executor / VetoArbitrator
+        check data_age_secs > P42_MAX_STALE_SECS (default 300 s) and skip the
+        veto gate when the feed is stale, so a Yahoo Finance outage cannot halt
+        trading.
+
+    Integration:
+        Instantiated and task-launched by DataHub.start().
+        DataHub exposes get_global_market_status() which proxies this class.
+    """
+
+    _YF_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    _PARAMS = "?interval=1m&range=12m"   # 12-minute bar range gives us 5-min delta
+
+    def __init__(self) -> None:
+        # Rolling price history: deque of (ts_epoch: float, close: float)
+        # One entry per polling cycle per ticker.
+        self._spy_history: deque = deque(maxlen=20)   # 20 × 30 s = 10 min
+        self._dxy_history: deque = deque(maxlen=20)
+
+        # ── [P42-CORR] BTC price history for SPY/BTC rolling correlation ──────
+        # Fed externally by DataHub.feed_btc_price_for_correlation() each cycle.
+        # maxlen matches _spy_history so aligned-window correlation is trivial.
+        self._btc_history: deque = deque(maxlen=20)
+        # Cached Pearson r ∈ [-1, +1].  Starts at 1.0 (assume correlated until
+        # proven otherwise) so the SPY-drop-blocker is active on cold-start.
+        self._spy_btc_corr: float = 1.0
+        # ── [/P42-CORR] ──────────────────────────────────────────────────────
+
+        # Computed 5-minute deltas — updated after each successful poll.
+        self._spy_5m_pct: float = 0.0
+        self._dxy_5m_pct: float = 0.0
+
+        # Timestamp of the last *successful* data fetch (epoch seconds).
+        self._last_success_ts: float = 0.0
+
+        # Human-readable status string for dashboard display.
+        self._last_status: str = "INITIALISING"
+        self._running: bool = False
+
+        # aiohttp session — created lazily in _poll_loop so it lives inside
+        # the running event loop (avoids "no current event loop" errors).
+        self._session: Optional[Any] = None
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    def get_spy_5m_pct(self) -> float:
+        """Return SPY 5-minute % price change. Negative = falling."""
+        return self._spy_5m_pct
+
+    def get_dxy_5m_pct(self) -> float:
+        """Return DXY 5-minute % price change. Positive = rising dollar."""
+        return self._dxy_5m_pct
+
+    def get_data_age_secs(self) -> float:
+        """Seconds since the last successful Yahoo Finance poll."""
+        if self._last_success_ts == 0.0:
+            return 9999.0
+        return time.time() - self._last_success_ts
+
+    # ── [P42-CORR] ────────────────────────────────────────────────────────────
+
+    def record_btc_price(self, price: float) -> None:
+        """
+        [P42-CORR] Feed a live BTC price sample into the correlation window.
+
+        Called by DataHub.feed_btc_price_for_correlation() each executor cycle
+        whenever a fresh OKX/Binance BTC mid-price is available.  Each call
+        triggers a Pearson-r recomputation against the aligned SPY return series.
+
+        Parameters
+        ----------
+        price : float — current BTC/USDT mid-price (bid+ask)/2 or last trade.
+                        Ignored if <= 0.
+        """
+        if price <= 0:
+            return
+        now = time.time()
+        self._btc_history.append((now, float(price)))
+        self._recompute_spy_btc_corr()
+
+    def get_spy_btc_corr(self) -> float:
+        """
+        [P42-CORR] Return the cached rolling Pearson r between SPY and BTC.
+
+        ∈ [-1, +1].  1.0 means perfectly positively correlated (SPY-blocker
+        is fully active).  Values < P42_CORR_DECOUPLE_THRESHOLD (default 0.3)
+        indicate that crypto is trading independently of equity markets and
+        the SPY-drop-blocker should stand down.
+        """
+        return self._spy_btc_corr
+
+    def _recompute_spy_btc_corr(self) -> None:
+        """
+        [P42-CORR] Pearson-r over the aligned SPY/BTC return windows.
+
+        Algorithm
+        ---------
+        1. Extract log-returns from the most recent N samples of each series
+           where N = min(len(spy), len(btc)).
+        2. Require at least 5 matched return pairs — below that, leave the
+           cached value unchanged (avoids thrashing on cold-start noise).
+        3. Compute Pearson r without any scipy dependency (pure Python/stdlib).
+        4. Clamp result to [-1, +1] and update self._spy_btc_corr.
+
+        Fail-safe: any arithmetic error leaves the cached value unchanged so
+        the gate defaults to the last known state rather than crashing.
+        """
+        try:
+            spy_px = [p for _, p in self._spy_history]
+            btc_px = [p for _, p in self._btc_history]
+            n = min(len(spy_px), len(btc_px))
+            if n < 6:
+                return   # not enough data — keep prior cached value
+
+            # Aligned slices: use the LAST n samples from each.
+            spy_w = spy_px[-n:]
+            btc_w = btc_px[-n:]
+
+            # Log-returns: r_i = ln(p_i / p_{i-1})
+            spy_r = [math.log(spy_w[i] / spy_w[i-1])
+                     for i in range(1, n) if spy_w[i-1] > 0 and spy_w[i] > 0]
+            btc_r = [math.log(btc_w[i] / btc_w[i-1])
+                     for i in range(1, n) if btc_w[i-1] > 0 and btc_w[i] > 0]
+
+            m = min(len(spy_r), len(btc_r))
+            if m < 5:
+                return
+
+            spy_r = spy_r[-m:]
+            btc_r = btc_r[-m:]
+
+            # Pearson r — pure Python (no numpy/scipy dependency).
+            mean_s = sum(spy_r) / m
+            mean_b = sum(btc_r) / m
+            cov    = sum((spy_r[i] - mean_s) * (btc_r[i] - mean_b) for i in range(m))
+            std_s  = math.sqrt(sum((x - mean_s) ** 2 for x in spy_r))
+            std_b  = math.sqrt(sum((x - mean_b) ** 2 for x in btc_r))
+
+            if std_s < 1e-12 or std_b < 1e-12:
+                return   # degenerate case (flat series) — keep prior value
+
+            r = max(-1.0, min(1.0, cov / (std_s * std_b)))
+            self._spy_btc_corr = round(r, 4)
+            log.debug(
+                "[P42-CORR] SPY/BTC rolling Pearson r=%.4f (n=%d return pairs)",
+                self._spy_btc_corr, m,
+            )
+        except Exception as exc:
+            log.debug("[P42-CORR] _recompute_spy_btc_corr error (non-fatal): %s", exc)
+
+    # ── [/P42-CORR] ───────────────────────────────────────────────────────────
+
+    def get_status_snapshot(self) -> dict:
+        """[P42-SHADOW] Serialisable snapshot for DataHub.get_global_market_status()."""
+        age = self.get_data_age_secs()
+        return {
+            "spy_5m_pct":        round(self._spy_5m_pct,  4),
+            "dxy_5m_pct":        round(self._dxy_5m_pct,  4),
+            "data_age_secs":     round(age, 1),
+            "feed_stale":        age > P42_MAX_STALE_SECS,
+            "status":            self._last_status,
+            "spy_ticker":        P42_SPY_TICKER,
+            "dxy_ticker":        P42_DXY_TICKER,
+            "poll_interval_secs": P42_POLL_INTERVAL_SECS,
+            "lookback_secs":     P42_LOOKBACK_SECS,
+            # ── [P42-CORR] Rolling SPY/BTC Pearson r ─────────────────────────
+            # < P42_CORR_DECOUPLE_THRESHOLD (0.3) → SPY-drop-blocker stands down
+            "spy_btc_corr":      self._spy_btc_corr,
+            "btc_samples":       len(self._btc_history),
+        }
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Launch the background polling loop as an asyncio task."""
+        if self._running:
+            return
+        self._running = True
+        asyncio.create_task(self._poll_loop(), name="p42_global_market_sentinel")
+        log.info(
+            "[P42-SHADOW] GlobalMarketSentinel started. "
+            "Polling SPY=%s DXY=%s every %.0fs (lookback=%.0fs).",
+            P42_SPY_TICKER, P42_DXY_TICKER,
+            P42_POLL_INTERVAL_SECS, P42_LOOKBACK_SECS,
+        )
+
+    def stop(self) -> None:
+        self._running = False
+
+    # ── Internal polling loop ──────────────────────────────────────────────────
+
+    async def _poll_loop(self) -> None:
+        """Main polling coroutine — runs until stop() is called."""
+        try:
+            import aiohttp as _aiohttp
+            self._session = _aiohttp.ClientSession(
+                timeout=_aiohttp.ClientTimeout(total=10.0),
+                headers={"User-Agent": "Mozilla/5.0 PowerTraderAI/42"},
+            )
+        except Exception as exc:
+            log.warning("[P42-SHADOW] aiohttp unavailable — sentinel disabled: %s", exc)
+            self._last_status = f"DISABLED (aiohttp: {exc})"
+            return
+
+        log.debug("[P42-SHADOW] Poll loop started.")
+        while self._running:
+            try:
+                await self._poll_ticker(P42_SPY_TICKER, self._spy_history, "SPY")
+                await self._poll_ticker(P42_DXY_TICKER, self._dxy_history, "DXY")
+                self._compute_deltas()
+                self._last_success_ts = time.time()
+                self._last_status = (
+                    f"OK spy_5m={self._spy_5m_pct:+.3f}% "
+                    f"dxy_5m={self._dxy_5m_pct:+.3f}%"
+                )
+                log.debug(
+                    "[P42-SHADOW] Poll OK: SPY_5m=%+.3f%% DXY_5m=%+.3f%%",
+                    self._spy_5m_pct, self._dxy_5m_pct,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._last_status = f"POLL_ERROR: {exc}"
+                log.debug("[P42-SHADOW] Poll error (non-fatal): %s", exc)
+            await asyncio.sleep(P42_POLL_INTERVAL_SECS)
+
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+        except Exception as _exc:
+            log.debug("[DATA_HUB] cleanup: %s", _exc)
+        log.debug("[P42-SHADOW] Poll loop exited.")
+
+    async def _poll_ticker(
+        self, ticker: str, history: deque, label: str,
+    ) -> None:
+        """Fetch the latest minute-bar for `ticker` and append to `history`."""
+        url = self._YF_URL.format(ticker=ticker) + self._PARAMS
+        try:
+            async with self._session.get(url) as resp:
+                if resp.status != 200:
+                    log.debug(
+                        "[P42-SHADOW] %s HTTP %d — skipping.", label, resp.status,
+                    )
+                    return
+                raw = await resp.json(content_type=None)
+        except Exception as exc:
+            log.debug("[P42-SHADOW] %s fetch error: %s", label, exc)
+            return
+
+        try:
+            result  = raw["chart"]["result"][0]
+            meta    = result.get("meta", {})
+            # Use regularMarketPrice as the most recent price.
+            current = float(meta.get("regularMarketPrice") or 0)
+            ts_now  = float(meta.get("regularMarketTime") or time.time())
+            if current <= 0:
+                return
+            history.append((ts_now, current))
+            log.debug("[P42-SHADOW] %s current=%.4f ts=%d", label, current, int(ts_now))
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            log.debug("[P42-SHADOW] %s parse error: %s", label, exc)
+
+    def _compute_deltas(self) -> None:
+        """
+        Recompute 5-minute percentage deltas from the rolling price history.
+
+        Uses the oldest observation within the last P42_LOOKBACK_SECS window
+        as the baseline, and the most recent observation as the current price.
+        This gives a true 5-min change without bias from polling timing jitter.
+        """
+        self._spy_5m_pct = self._delta(self._spy_history)
+        self._dxy_5m_pct = self._delta(self._dxy_history)
+
+    @staticmethod
+    def _delta(history: deque) -> float:
+        """Return (newest - oldest_within_window) / oldest × 100, or 0.0."""
+        if len(history) < 2:
+            return 0.0
+        now = time.time()
+        cutoff = now - P42_LOOKBACK_SECS
+        # Find the oldest entry still within the lookback window.
+        baseline_px: Optional[float] = None
+        for ts, px in history:
+            if ts >= cutoff:
+                baseline_px = px
+                break   # history is time-ordered oldest→newest
+        if baseline_px is None or baseline_px <= 0:
+            return 0.0
+        newest_px = history[-1][1]
+        if newest_px <= 0:
+            return 0.0
+        return (newest_px - baseline_px) / baseline_px * 100.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,6 +680,7 @@ class Tick:
     ts:     float = field(default_factory=time.time)
 
 
+# [CI-1-A] Candle is a @dataclass — verified, no structural change required.
 @dataclass
 class Candle:
     symbol:    str
@@ -292,10 +712,6 @@ class InstrumentMeta:
     inst_type: str
     ct_val:    float = 0.0
     # [P36.1-PRICEGUARD] OKX exchange-mandated price bands.
-    # buyLmt  = maximum price allowed for a BUY order (upper band).
-    # sellLmt = minimum price allowed for a SELL order (lower band).
-    # Populated by InstrumentCache.refresh_price_limits() via the OKX
-    # ticker endpoint.  Default 0.0 = unknown / not yet fetched.
     buyLmt:    float = 0.0
     sellLmt:   float = 0.0
 
@@ -367,6 +783,150 @@ class OrderBook:
         return max(sides, key=lambda x: x[1])
 
 
+# ── [P38-OFI] Predictive Order Flow Imbalance Monitor ────────────────────────
+
+class OBIMonitor:
+    """
+    [P38-OFI] Predictive Order Book Imbalance — Order Flow Imbalance tracker.
+
+    Standard OBI (P12-1) is a single-snapshot ratio of bid vs ask volume.
+    OFI is the *delta* between successive snapshots — it measures whether
+    passive walls are being **stacked** or **pulled** between ticks.
+
+    Mathematical model
+    ──────────────────
+    For each depth level l in [0, P38_OFI_LEVELS):
+
+        bid_delta[l] = curr_bid_size[price] − prev_bid_size[price]
+        ask_delta[l] = curr_ask_size[price] − prev_ask_size[price]
+
+    Prices are matched across snapshots.  A price that appears in the current
+    snapshot but not the previous one contributes its full size as a positive
+    delta (wall appearing).  A price that existed in the previous snapshot but
+    not the current one contributes −prev_size (wall disappearing / pulled).
+
+    Raw OFI = Σ bid_delta − Σ ask_delta (positive = buy-side pressure)
+    Normalized OFI = raw_ofi / total_curr_depth  ∈ [−1.0, +1.0]
+
+    Wall-Pull Detection
+    ───────────────────
+    A "wall pull" is when a passive level with size ≥ P38_WALL_MIN_VOL
+    disappears entirely in a single tick.  Pulled bid walls before a long
+    entry and pulled ask walls before a short entry are manipulation red flags
+    (fake support / resistance removed to bait directional entries).
+
+    Thread / coroutine safety
+    ─────────────────────────
+    update() is called from DataHub._on_book() inside the async event loop.
+    get_ofi_snapshot() is called from executor._cycle(), also async.
+    No concurrent writes → no lock required (single asyncio event loop).
+    """
+
+    def __init__(self) -> None:
+        # Rolling deque of recent OrderBook snapshots.
+        # maxlen = P38_OFI_WINDOW + 1 so we always have prev + curr available.
+        self._snapshots:      deque = deque(maxlen=P38_OFI_WINDOW + 1)
+        self._last_ofi:       float = 0.0
+        self._bid_wall_pulled: bool = False
+        self._ask_wall_pulled: bool = False
+        self._update_count:   int   = 0
+
+    # ── Public interface ───────────────────────────────────────────────────────
+
+    def update(self, book: "OrderBook") -> None:
+        """
+        Push a new OrderBook snapshot and recompute OFI against the previous.
+        No-op until at least two snapshots have been received.
+        """
+        if self._snapshots:
+            prev = self._snapshots[-1]
+            try:
+                self._last_ofi = self._compute_ofi(prev, book)
+                self._detect_wall_pulls(prev, book)
+            except Exception as exc:
+                log.debug("[P38-OFI] OBIMonitor.update error: %s", exc)
+        self._snapshots.append(book)
+        self._update_count += 1
+
+    def get_ofi_snapshot(self) -> Tuple[float, bool, bool]:
+        """
+        Return the current OFI state as a three-tuple:
+            (ofi_score, bid_wall_pulled, ask_wall_pulled)
+
+        ofi_score ∈ [−1.0, +1.0]:
+            > 0  → net buying pressure (bid walls building / ask walls thinning)
+            < 0  → net selling pressure (ask walls building / bid walls thinning)
+
+        bid_wall_pulled → True when a large bid level vanished in the last tick.
+        ask_wall_pulled → True when a large ask level vanished in the last tick.
+        """
+        return self._last_ofi, self._bid_wall_pulled, self._ask_wall_pulled
+
+    @property
+    def ready(self) -> bool:
+        """True once at least two snapshots have been processed."""
+        return self._update_count >= 2
+
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _compute_ofi(self, prev: "OrderBook", curr: "OrderBook") -> float:
+        """Price-matched OFI across top P38_OFI_LEVELS depth levels."""
+        prev_bids: Dict[float, float] = {
+            px: sz for px, sz in prev.bids[:P38_OFI_LEVELS]
+        }
+        curr_bids: Dict[float, float] = {
+            px: sz for px, sz in curr.bids[:P38_OFI_LEVELS]
+        }
+        prev_asks: Dict[float, float] = {
+            px: sz for px, sz in prev.asks[:P38_OFI_LEVELS]
+        }
+        curr_asks: Dict[float, float] = {
+            px: sz for px, sz in curr.asks[:P38_OFI_LEVELS]
+        }
+
+        # Bid delta: positive when bid-side volume grows (buying pressure)
+        all_bid_px = set(prev_bids) | set(curr_bids)
+        bid_delta  = sum(
+            curr_bids.get(px, 0.0) - prev_bids.get(px, 0.0)
+            for px in all_bid_px
+        )
+
+        # Ask delta: positive when ask-side volume grows (selling pressure)
+        all_ask_px = set(prev_asks) | set(curr_asks)
+        ask_delta  = sum(
+            curr_asks.get(px, 0.0) - prev_asks.get(px, 0.0)
+            for px in all_ask_px
+        )
+
+        # Normalise by current total depth so cross-symbol values are comparable
+        total_depth = (
+            sum(sz for _, sz in curr.bids[:P38_OFI_LEVELS])
+            + sum(sz for _, sz in curr.asks[:P38_OFI_LEVELS])
+        )
+        if total_depth <= 0.0:
+            return 0.0
+
+        raw = bid_delta - ask_delta
+        return max(-1.0, min(1.0, raw / total_depth))
+
+    def _detect_wall_pulls(self, prev: "OrderBook", curr: "OrderBook") -> None:
+        """
+        Detect disappearance of large passive walls between snapshots.
+        A level is considered a wall when its previous size ≥ P38_WALL_MIN_VOL.
+        """
+        curr_bid_px: set = {px for px, _ in curr.bids[:P38_OFI_LEVELS]}
+        curr_ask_px: set = {px for px, _ in curr.asks[:P38_OFI_LEVELS]}
+
+        self._bid_wall_pulled = any(
+            sz >= P38_WALL_MIN_VOL and px not in curr_bid_px
+            for px, sz in prev.bids[:P38_OFI_LEVELS]
+        )
+        self._ask_wall_pulled = any(
+            sz >= P38_WALL_MIN_VOL and px not in curr_ask_px
+            for px, sz in prev.asks[:P38_OFI_LEVELS]
+        )
+
+
 # ── [P12-2] Tape Buffer ────────────────────────────────────────────────────────
 
 @dataclass
@@ -391,17 +951,11 @@ class TapeBuffer:
         self._lock = asyncio.Lock()
 
         # ── [P37-VPIN] Volume-Clock bucket state ─────────────────────────────
-        # Active bucket accumulators (reset after each bucket completion).
-        self._vpin_buy_vol:   float = 0.0   # buy-side volume in current bucket
-        self._vpin_sell_vol:  float = 0.0   # sell-side volume in current bucket
-        self._vpin_total_vol: float = 0.0   # total volume in current bucket
-        # Sealed VPIN samples — rolling window of last _P37_VPIN_WINDOW buckets.
-        # Each entry is a float ∈ [0.0, 1.0]: abs(buy-sell)/total for one bucket.
+        self._vpin_buy_vol:   float = 0.0
+        self._vpin_sell_vol:  float = 0.0
+        self._vpin_total_vol: float = 0.0
         self._vpin_buckets: deque = deque(maxlen=_P37_VPIN_WINDOW)
-        # ToxicityScore derived from CDF of _vpin_buckets.  Updated every time
-        # a new bucket is sealed.  0.0 when < 2 buckets have been sealed.
         self._vpin_toxicity: float = 0.0
-        # ── [/P37-VPIN] ──────────────────────────────────────────────────────
 
     async def add(self, side: str, qty: float, price: float) -> None:
         async with self._lock:
@@ -409,8 +963,6 @@ class TapeBuffer:
                 TapeEvent(ts=time.time(), side=side, qty=qty,
                           price=price, usd=qty * price)
             )
-            # ── [P37-VPIN] Volume-Clock accumulation ─────────────────────────
-            # Classify trade direction into the active bucket.
             try:
                 _qty = max(0.0, float(qty))
                 if side == "buy":
@@ -419,46 +971,28 @@ class TapeBuffer:
                     self._vpin_sell_vol += _qty
                 self._vpin_total_vol += _qty
 
-                # Bucket completion: seal when cumulative volume crosses threshold.
                 if self._vpin_total_vol >= P37_VPIN_BUCKET_SIZE:
                     _total = self._vpin_total_vol
                     _buy   = self._vpin_buy_vol
                     _sell  = self._vpin_sell_vol
 
-                    # VPIN formula with zero-division guard.
                     if _total > 0.0:
                         _vpin = abs(_buy - _sell) / _total
-                        _vpin = max(0.0, min(1.0, _vpin))  # clamp to [0, 1]
+                        _vpin = max(0.0, min(1.0, _vpin))
                     else:
                         _vpin = 0.0
 
                     self._vpin_buckets.append(_vpin)
                     self._vpin_toxicity = self._compute_toxicity_score(_vpin)
 
-                    # Reset bucket accumulators for the next volume-clock tick.
                     self._vpin_buy_vol   = 0.0
                     self._vpin_sell_vol  = 0.0
                     self._vpin_total_vol = 0.0
-            except Exception:
-                pass  # VPIN accumulation is always non-fatal
-            # ── [/P37-VPIN] ──────────────────────────────────────────────────
+            except Exception as _exc:
+                log.warning("[DATA_HUB] suppressed: %s", _exc)
 
     def _compute_toxicity_score(self, latest_vpin: float) -> float:
-        """
-        [P37-VPIN] Derive ToxicityScore ∈ [0.0, 1.0] from where latest_vpin
-        sits in the empirical CDF of the current _vpin_buckets history.
-
-        CDF position = fraction of historical buckets with VPIN ≤ latest_vpin.
-        A score of 0.90 means that 90% of recent volume-clock buckets had lower
-        order-flow imbalance than the current one — i.e. the current bucket is
-        in the 90th percentile of toxicity.
-
-        Safeguards
-        ----------
-        • Empty or single-bucket history → returns 0.0 (insufficient data).
-        • latest_vpin clamped to [0.0, 1.0] before CDF lookup.
-        • Zero-division impossible: denominator is always len(_vpin_buckets) > 0.
-        """
+        """[P37-VPIN] Derive ToxicityScore ∈ [0.0, 1.0] from empirical CDF."""
         history = list(self._vpin_buckets)
         if len(history) < 2:
             return 0.0
@@ -471,16 +1005,7 @@ class TapeBuffer:
             return 0.0
 
     def get_flow_toxicity(self) -> float:
-        """
-        [P37-VPIN] Return the current ToxicityScore ∈ [0.0, 1.0].
-
-        Thread-safe: reads the cached _vpin_toxicity scalar which is updated
-        atomically inside the asyncio.Lock in add().  Callers must not hold the
-        lock themselves when calling this method (it is a simple attribute read).
-
-        Returns 0.0 until at least two volume-clock buckets have been sealed,
-        so the VetoArbitrator never acts on a single-sample artefact.
-        """
+        """[P37-VPIN] Return the current ToxicityScore ∈ [0.0, 1.0]."""
         return self._vpin_toxicity
 
     def _recent(self, window_secs: float) -> List[TapeEvent]:
@@ -679,10 +1204,6 @@ class InstrumentCache:
         self._cache:      Dict[str, InstrumentMeta] = {}
         self._lock        = asyncio.Lock()
         self._fetched_at: Dict[str, float] = {}
-        # [P36.1-PRICEGUARD] Per-instrument price limits fetched from OKX tickers.
-        # Key = inst_id (e.g. "BTC-USDT"), Value = (buyLmt, sellLmt).
-        # Populated by refresh_price_limits(); consumed by executor._execute_order
-        # and the Whale Sniper to prevent OKX Error 51006.
         self._price_limits: Dict[str, Tuple[float, float]] = {}
         self._price_limits_lock: asyncio.Lock = asyncio.Lock()
 
@@ -743,27 +1264,12 @@ class InstrumentCache:
                 log.warning("InstrumentCache: no metadata for %s.", inst_id)
             return meta
 
-    # ── [P36.1-PRICEGUARD] Price Limit Cache ─────────────────────────────────
-
     async def refresh_price_limits(
         self,
         symbols: List[str],
         include_swap: bool = True,
     ) -> None:
-        """
-        [P36.1-PRICEGUARD] Fetch OKX exchange-enforced price bands (buyLmt /
-        sellLmt) from the /api/v5/market/tickers endpoint and store them in the
-        _price_limits cache keyed by inst_id.
-
-        These limits change throughout the day as OKX adjusts its price bands.
-        In demo mode the executor refreshes them every 30 minutes (1800 s);
-        in live mode every 24 hours is sufficient.
-
-        Parameters
-        ----------
-        symbols      : list of base symbols, e.g. ["BTC", "ETH"]
-        include_swap : if True, also fetch SWAP ticker limits
-        """
+        """[P36.1-PRICEGUARD] Fetch OKX price bands (buyLmt/sellLmt)."""
         inst_types = ["SPOT"]
         if include_swap:
             inst_types.append("SWAP")
@@ -783,7 +1289,6 @@ class InstrumentCache:
                         sell_lmt= float(row.get("sellLmt") or 0)
                         if iid and (buy_lmt > 0 or sell_lmt > 0):
                             self._price_limits[iid] = (buy_lmt, sell_lmt)
-                            # Also propagate into InstrumentMeta if cached
                             meta = self._cache.get(iid)
                             if meta is not None:
                                 meta.buyLmt  = buy_lmt
@@ -800,22 +1305,8 @@ class InstrumentCache:
                 )
 
     def get_price_limits(self, inst_id: str) -> Tuple[float, float]:
-        """
-        [P36.1-PRICEGUARD] Return the cached (buyLmt, sellLmt) for an
-        instrument.  Returns (0.0, 0.0) when the limits have not yet been
-        fetched — callers must treat a 0.0 as 'unknown / skip clamping'.
-
-        Parameters
-        ----------
-        inst_id : full OKX instrument ID, e.g. "BTC-USDT" or "BTC-USDT-SWAP"
-
-        Returns
-        -------
-        Tuple[float, float] — (buyLmt, sellLmt)
-        """
+        """[P36.1-PRICEGUARD] Return cached (buyLmt, sellLmt); (0.0, 0.0) if unknown."""
         return self._price_limits.get(inst_id, (0.0, 0.0))
-
-    # ── [/P36.1-PRICEGUARD] ──────────────────────────────────────────────────
 
     @staticmethod
     def _decimals(step: float) -> int:
@@ -941,10 +1432,179 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 );
 """
 
+# [PHASE1] Additive-only migration SQL.
+# Adds trade_id and exit_reason_type columns to an existing trades table.
+# IF NOT EXISTS guards make this safe to run on every boot — no-op if already present.
+# Old rows receive NULL for both columns; no data is rewritten.
+_PHASE1_MIGRATION = """
+ALTER TABLE trades ADD COLUMN trade_id             TEXT;
+ALTER TABLE trades ADD COLUMN exit_reason_type     TEXT;
+ALTER TABLE trades ADD COLUMN exit_reason_category TEXT;
+"""
+
+# [PHASE4] Additive-only migration SQL.
+# Adds is_close_leg column: 1 = canonical close row, 0 = open/add/noise row.
+# DEFAULT 0 means historical rows are treated as non-close, which is safe
+# because KPI filters select is_close_leg = 1 (opt-in truth).
+# Old rows are never rewritten; new writes populate the column explicitly.
+_PHASE4_MIGRATION = """
+ALTER TABLE trades ADD COLUMN is_close_leg INTEGER DEFAULT 0;
+"""
+
+# [PHASE6] Additive-only migration SQL — root-cause loss diagnostics.
+# Adds three diagnostic columns to close-leg rows only:
+#   entry_confidence — Signal.confidence at position entry (NULL on historical rows)
+#   entry_kelly_f    — Signal.kelly_f at position entry (NULL on historical rows)
+#   hold_time_secs   — seconds held from entry_ts to close fill (NULL on historical rows)
+# All three default to NULL so historical rows remain valid; KPI filters are
+# unaffected (they key on is_close_leg, not on these columns).
+_PHASE6_MIGRATION = """
+ALTER TABLE trades ADD COLUMN entry_confidence REAL;
+ALTER TABLE trades ADD COLUMN entry_kelly_f    REAL;
+ALTER TABLE trades ADD COLUMN hold_time_secs   REAL;
+"""
+
+# [PHASE10] Additive-only migration SQL — execution friction persistence.
+# Adds two friction columns to close-leg rows only:
+#   close_slippage_bps  — signed; positive = adverse (fill worse than expected bid/ask).
+#                         NULL for pre-Phase-10 rows, pre-Phase-15 HEDGE_TRIM rows,
+#                         or any row where tick data was unavailable at close time.
+#                         Phase 15 added tick-based friction for HEDGE_TRIM and
+#                         liquidation exits; post-Phase-15 rows may be non-NULL.
+#   spread_at_close_bps — raw bid-ask spread in bps at close order submission time.
+#                         NULL where tick was unavailable at close time.
+# Both default to NULL; historical rows are never rewritten.  KPI filters key on
+# is_close_leg=1 and are unaffected by the new columns.
+_PHASE10_MIGRATION = """
+ALTER TABLE trades ADD COLUMN close_slippage_bps  REAL;
+ALTER TABLE trades ADD COLUMN spread_at_close_bps REAL;
+"""
+
+# [POST-ROADMAP-DT] Additive-only migration — entry-context signal fields.
+# Adds three columns to close-leg rows only:
+#   entry_regime    — Signal.regime at position entry (e.g. "bull", "bear", "chop")
+#   entry_direction — Signal.direction at position entry ("long" | "short")
+#   entry_z_score   — Signal.z_score at position entry (float)
+# All three default to NULL; historical rows are never rewritten.  KPI filters
+# key on is_close_leg=1 and are unaffected by the new columns.
+_DT_MIGRATION = """
+ALTER TABLE trades ADD COLUMN entry_regime    TEXT;
+ALTER TABLE trades ADD COLUMN entry_direction TEXT;
+ALTER TABLE trades ADD COLUMN entry_z_score   REAL;
+"""
+
+# [TRACK16-DT] Additive-only migration — add source_path column to
+# decision_trace.  Distinguishes "entry" (_maybe_enter) from "express"
+# (trigger_atomic_express_trade) records.
+#   source_path TEXT — "entry" | "express"; NULL on pre-Track-16 rows.
+# Same duplicate-column-ignore pattern used by all prior migrations.
+_TRACK16_DT_MIGRATION = """
+ALTER TABLE decision_trace ADD COLUMN source_path TEXT;
+"""
+
+# [TRACK17-SCHEMA] Additive migration: pnl_pct and hold_time_secs columns for
+# close and DCA lifecycle trace records.  NULL on all pre-Track-17 rows.
+_TRACK17_DT_MIGRATION = """
+ALTER TABLE decision_trace ADD COLUMN pnl_pct REAL;
+ALTER TABLE decision_trace ADD COLUMN hold_time_secs REAL;
+"""
+
+# [TRACK10-DT] New decision_trace table — cross-session history for all
+# _maybe_enter admission outcomes.  This is a NEW table (not an ALTER TABLE),
+# so CREATE TABLE IF NOT EXISTS is fully idempotent on every boot — no
+# duplicate-column risk, no data loss on existing installations.
+#
+# Schema rationale:
+#   ts, symbol, direction, regime, confidence, z_score, kelly_f — core signal
+#     snapshot fields, captured before any signal mutation.
+#   mtf_aligned, sniper_boost, oracle_boosted — boolean flags (stored as INTEGER
+#     0/1 for SQLite compatibility).
+#   whale_mult — float multiplier from oracle signal.
+#   outcome — "ADMITTED" | "BLOCKED" | "SHADOW"
+#   gate_name — gate that blocked, or "PASS" / "SHADOW" if admitted.
+#   reason — brief human-readable detail (max ~120 chars in executor).
+#   llm_verdict — LLM verdict string if consulted, else empty string.
+#   p32_p_success — VetoArbitrator p_success when computed, else NULL.
+#   sizing_usd — final notional if admitted, else NULL.
+#   risk_off, p39_snipe — boolean modifier flags (INTEGER 0/1).
+#   p39_size_boost, conviction_mult — float modifier values.
+#     Flattened from the "modifiers" dict so all fields are directly queryable.
+#
+# Indexes:
+#   idx_dt_ts       — descending ts for time-ordered dashboard queries.
+#   idx_dt_sym_ts   — (symbol, ts DESC) for per-symbol filtering.
+#   idx_dt_outcome  — (outcome, ts DESC) for outcome-bucket aggregation.
+_TRACK10_DT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS decision_trace (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               REAL    NOT NULL,
+    symbol           TEXT    NOT NULL,
+    direction        TEXT,
+    regime           TEXT,
+    confidence       REAL,
+    z_score          REAL,
+    kelly_f          REAL,
+    mtf_aligned      INTEGER,
+    sniper_boost     INTEGER,
+    oracle_boosted   INTEGER,
+    whale_mult       REAL,
+    outcome          TEXT    NOT NULL,
+    gate_name        TEXT    NOT NULL,
+    reason           TEXT,
+    llm_verdict      TEXT,
+    p32_p_success    REAL,
+    sizing_usd       REAL,
+    risk_off         INTEGER,
+    p39_snipe        INTEGER,
+    p39_size_boost   REAL,
+    conviction_mult  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_dt_ts      ON decision_trace(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_dt_sym_ts  ON decision_trace(symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_dt_outcome ON decision_trace(outcome, ts DESC);
+"""
+
 
 class Database:
+    """
+    [S6.1-DBPATH / S7A-DBPATH / R1-A-DBPATH]
+
+    Canonical DB path: hub_data/powertrader.db — expressed as an ABSOLUTE path
+    constructed from the resolved directory of this module file:
+
+        Path(__file__).resolve().parent / "hub_data" / "powertrader.db"
+
+    This path is ALWAYS absolute regardless of the process working directory.
+    datahub.db is NEVER used anywhere in this codebase.
+
+    hub_data/ is created at __init__ time (not lazily) so the directory is
+    guaranteed to exist before any caller attempts to open the DB.
+
+    The resolved absolute path is logged immediately in __init__ — before any
+    connection is made — so it appears in the boot log for easy verification
+    against the dashboard's expected path.
+
+    On connection failure _conn_obj() logs the error and re-raises (fail-closed)
+    so callers and the boot ensure-ready step can detect it immediately.
+
+    Schema tables: candles, trades (extended by Phase 1 migration with
+    trade_id, exit_reason_type, exit_reason_category columns),
+    account_snapshots, decision_trace (Track 10 — cross-session admission
+    outcome history, created via idempotent CREATE TABLE IF NOT EXISTS).
+
+    [CI-1-B] upsert_candles(candles) — batch upsert in a single
+    transaction/commit.  Empty list is a safe no-op.  sqlite errors are logged
+    and re-raised so the caller is never left with silent data loss.
+
+    [TRACK10-DT] insert_decision_trace(record) — fail-open INSERT for one
+    admission-outcome record from _maybe_enter.  Never raises; failures are
+    logged at DEBUG so the admission pipeline is never blocked by observability
+    writes.  Called only via asyncio.ensure_future() from executor.py.
+    """
+
     def __init__(self, path: Optional[str] = None):
-        # Default DB must match the dashboard (datahub.db in this directory).
+        # [R1-A-DBPATH] module_dir is the resolved absolute directory that
+        # contains this file — never the process CWD.
         module_dir = Path(__file__).resolve().parent
 
         if path and str(path).strip():
@@ -955,22 +1615,38 @@ class Database:
                 p = p.resolve()
             self._path = str(p)
         else:
-            self._path = str((module_dir / "datahub.db").resolve())
-
-        # Legacy DB path (older builds used powertrader.db). We migrate once on first open.
-        self._legacy_path = str((module_dir / "powertrader.db").resolve())
+            # [R1-A-DBPATH] Canonical absolute path:
+            #   <module_dir>/hub_data/powertrader.db
+            # datahub.db is NEVER used.
+            hub_dir = module_dir / "hub_data"
+            try:
+                # mkdir at __init__ time — not lazily — so the directory is
+                # guaranteed to exist before any connection is attempted.
+                hub_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                log.error(
+                    "[R1-A-DBPATH] Cannot create hub_data directory %s: %s",
+                    hub_dir, exc,
+                )
+                raise
+            self._path = str((hub_dir / "powertrader.db").resolve())
 
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = asyncio.Lock()
 
+        # [R1-A-DBPATH] Log the absolute DB path immediately at construction
+        # time — before any connection — so it appears in the very first log
+        # lines and can be compared directly with the dashboard's expected path.
+        log.info("[R1-A-DBPATH] Database absolute path (canonical): %s", self._path)
+
     def _conn_obj(self) -> sqlite3.Connection:
         """
         Return the shared SQLite connection, creating it on first call.
-        Applies schema, WAL pragmas, and performs a one-time legacy migration
-        (powertrader.db → datahub.db) only if the destination DB is empty.
+        Applies WAL pragmas and schema; commits immediately.
 
-        This prevents the dashboard from appearing "stuck" on old fills when the
-        bot is writing to a different database file.
+        [R1-A-DBPATH] Fail-closed: on any failure the error is logged and
+        re-raised so the caller (and the boot ensure-ready step) can detect it.
+        The connection slot is reset to None so a subsequent call will retry.
         """
         if self._conn is None:
             try:
@@ -982,138 +1658,185 @@ class Database:
                 self._conn.execute("PRAGMA synchronous=NORMAL;")
                 self._conn.executescript(_SCHEMA)
                 self._conn.commit()
-
+                # [PHASE1] Additive migration: add trade_id, exit_reason_type,
+                # exit_reason_category columns to trades table if not present.
+                # SQLite does not support IF NOT EXISTS on ALTER TABLE, so we
+                # catch OperationalError per column and ignore "duplicate column"
+                # errors — any other error is logged at ERROR and re-raised so
+                # the outer handler sets _conn=None and fails boot (fail-closed).
+                for _col_sql in _PHASE1_MIGRATION.strip().splitlines():
+                    _col_sql = _col_sql.strip()
+                    if not _col_sql:
+                        continue
+                    try:
+                        self._conn.execute(_col_sql)
+                    except Exception as _mig_exc:
+                        _msg = str(_mig_exc).lower()
+                        if "duplicate column" in _msg:
+                            pass   # already present — safe no-op
+                        else:
+                            log.error(
+                                "[PHASE1] trades migration failed (non-recoverable): %s — %s",
+                                _col_sql, _mig_exc,
+                            )
+                            raise
+                self._conn.commit()
+                log.info(
+                    "[R1-A-DBPATH] Database opened and schema applied: %s",
+                    self._path,
+                )
+                # [PHASE4] Additive migration: add is_close_leg column.
+                # Same pattern as Phase 1 — catch duplicate-column errors
+                # and ignore them; any other error is fatal.
+                for _col_sql in _PHASE4_MIGRATION.strip().splitlines():
+                    _col_sql = _col_sql.strip()
+                    if not _col_sql:
+                        continue
+                    try:
+                        self._conn.execute(_col_sql)
+                    except Exception as _mig4_exc:
+                        _msg4 = str(_mig4_exc).lower()
+                        if "duplicate column" in _msg4:
+                            pass   # already present — safe no-op
+                        else:
+                            log.error(
+                                "[PHASE4] trades migration failed (non-recoverable): %s — %s",
+                                _col_sql, _mig4_exc,
+                            )
+                            raise
+                self._conn.commit()
+                # [PHASE6] Additive migration: add entry_confidence, entry_kelly_f,
+                # hold_time_secs diagnostic columns to close-leg rows.
+                # Same pattern as Phase 1/4 — duplicate-column ignored, other errors fatal.
+                for _col_sql in _PHASE6_MIGRATION.strip().splitlines():
+                    _col_sql = _col_sql.strip()
+                    if not _col_sql:
+                        continue
+                    try:
+                        self._conn.execute(_col_sql)
+                    except Exception as _mig6_exc:
+                        _msg6 = str(_mig6_exc).lower()
+                        if "duplicate column" in _msg6:
+                            pass   # already present — safe no-op
+                        else:
+                            log.error(
+                                "[PHASE6] trades migration failed (non-recoverable): %s — %s",
+                                _col_sql, _mig6_exc,
+                            )
+                            raise
+                self._conn.commit()
+                # [PHASE10] Additive migration: add close_slippage_bps and
+                # spread_at_close_bps friction columns to close-leg rows.
+                # Same pattern as Phases 1/4/6 — duplicate-column errors are
+                # silently ignored; any other error is fatal (fail-closed boot).
+                for _col_sql in _PHASE10_MIGRATION.strip().splitlines():
+                    _col_sql = _col_sql.strip()
+                    if not _col_sql:
+                        continue
+                    try:
+                        self._conn.execute(_col_sql)
+                    except Exception as _mig10_exc:
+                        _msg10 = str(_mig10_exc).lower()
+                        if "duplicate column" in _msg10:
+                            pass   # already present — safe no-op
+                        else:
+                            log.error(
+                                "[PHASE10] trades migration failed (non-recoverable): %s — %s",
+                                _col_sql, _mig10_exc,
+                            )
+                            raise
+                self._conn.commit()
+                # [POST-ROADMAP-DT] Additive migration: add entry_regime,
+                # entry_direction, entry_z_score signal-context columns to
+                # close-leg rows.  Same pattern as Phases 1/4/6/10 —
+                # duplicate-column errors are silently ignored; any other
+                # error is fatal (fail-closed boot).
+                for _col_sql in _DT_MIGRATION.strip().splitlines():
+                    _col_sql = _col_sql.strip()
+                    if not _col_sql:
+                        continue
+                    try:
+                        self._conn.execute(_col_sql)
+                    except Exception as _mig_dt_exc:
+                        _msg_dt = str(_mig_dt_exc).lower()
+                        if "duplicate column" in _msg_dt:
+                            pass   # already present — safe no-op
+                        else:
+                            log.error(
+                                "[POST-ROADMAP-DT] trades migration failed "
+                                "(non-recoverable): %s — %s",
+                                _col_sql, _mig_dt_exc,
+                            )
+                            raise
+                self._conn.commit()
+                # [TRACK10-DT] Create decision_trace table and its indexes if
+                # not already present.  Uses executescript() with CREATE TABLE
+                # IF NOT EXISTS and CREATE INDEX IF NOT EXISTS — fully idempotent
+                # on every boot.  No ALTER TABLE on existing tables; no risk to
+                # existing rows.  A failure here is fatal (fail-closed) because
+                # it means the DB is inaccessible for writes — the same policy
+                # as the _SCHEMA application above.
                 try:
-                    self._maybe_migrate_legacy(self._conn)
-                except Exception as exc:
-                    log.warning("Database: legacy migration skipped/failed: %s", exc, exc_info=True)
-
-                log.info("Database: opened and schema applied for %s", self._path)
+                    self._conn.executescript(_TRACK10_DT_SCHEMA)
+                    self._conn.commit()
+                    log.info("[TRACK10-DT] decision_trace table ready: %s", self._path)
+                except Exception as _mig10dt_exc:
+                    log.error(
+                        "[TRACK10-DT] decision_trace schema failed (non-recoverable): %s",
+                        _mig10dt_exc,
+                    )
+                    raise
+                # [TRACK16-DT] Additive migration: add source_path column to
+                # decision_trace.  Same duplicate-column-ignore pattern as all
+                # prior migrations.  Old rows carry NULL source_path, which is
+                # correct — callers that do not supply it also get NULL.
+                for _col_sql in _TRACK16_DT_MIGRATION.strip().splitlines():
+                    _col_sql = _col_sql.strip()
+                    if not _col_sql:
+                        continue
+                    try:
+                        self._conn.execute(_col_sql)
+                    except Exception as _mig16_exc:
+                        _msg16 = str(_mig16_exc).lower()
+                        if "duplicate column" in _msg16:
+                            pass   # already present — safe no-op
+                        else:
+                            log.error(
+                                "[TRACK16-DT] decision_trace migration failed "
+                                "(non-recoverable): %s — %s",
+                                _col_sql, _mig16_exc,
+                            )
+                            raise
+                self._conn.commit()
+                # [TRACK17-SCHEMA] Additive migration: pnl_pct and
+                # hold_time_secs columns for close/DCA trace records.
+                # Same duplicate-column-ignore pattern as Track 16.
+                for _col_sql in _TRACK17_DT_MIGRATION.strip().splitlines():
+                    _col_sql = _col_sql.strip()
+                    if not _col_sql:
+                        continue
+                    try:
+                        self._conn.execute(_col_sql)
+                    except Exception as _mig17_exc:
+                        _msg17 = str(_mig17_exc).lower()
+                        if "duplicate column" in _msg17:
+                            pass   # already present — safe no-op
+                        else:
+                            log.error(
+                                "[TRACK17-SCHEMA] decision_trace migration failed "
+                                "(non-recoverable): %s — %s",
+                                _col_sql, _mig17_exc,
+                            )
+                            raise
+                self._conn.commit()
             except Exception:
                 log.error(
-                    "Database._conn_obj: failed to open/init %s",
+                    "[R1-A-DBPATH] Database._conn_obj: failed to open/init %s",
                     self._path, exc_info=True,
                 )
+                self._conn = None
                 raise
         return self._conn
-
-    def _maybe_migrate_legacy(self, conn: sqlite3.Connection) -> None:
-        """One-time migration from legacy powertrader.db → datahub.db.
-
-        Only runs if:
-          - legacy DB exists
-          - destination DB is empty (no candles/trades/snapshots)
-          - legacy DB has the relevant tables
-
-        Uses INSERT OR IGNORE / OR REPLACE to avoid duplicates and to remain safe
-        under retransmits and restarts.
-        """
-        try:
-            if not self._legacy_path:
-                return
-            if os.path.abspath(self._legacy_path) == os.path.abspath(self._path):
-                return
-            if not os.path.exists(self._legacy_path):
-                return
-        except Exception:
-            return
-
-        # Do not migrate if destination already contains data.
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(1) FROM trades")
-            dst_trades = int(cur.fetchone()[0] or 0)
-            cur.execute("SELECT COUNT(1) FROM account_snapshots")
-            dst_snaps = int(cur.fetchone()[0] or 0)
-            cur.execute("SELECT COUNT(1) FROM candles")
-            dst_candles = int(cur.fetchone()[0] or 0)
-            if (dst_trades + dst_snaps + dst_candles) > 0:
-                return
-        except Exception:
-            return
-
-        log.warning("Database: migrating legacy DB %s → %s (destination empty)", self._legacy_path, self._path)
-
-        legacy = sqlite3.connect(self._legacy_path, check_same_thread=False, timeout=10)
-        legacy.row_factory = sqlite3.Row
-        try:
-            lcur = legacy.cursor()
-            lcur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = {r[0] for r in lcur.fetchall() if r and r[0]}
-
-            if "trades" in tables:
-                rows = lcur.execute(
-                    "SELECT ts,symbol,side,qty,price,cost_basis,pnl_pct,realized_usd,tag,order_id,inst_type FROM trades"
-                ).fetchall()
-                if rows:
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO trades(ts,symbol,side,qty,price,cost_basis,pnl_pct,realized_usd,tag,order_id,inst_type) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        [
-                            (
-                                int(r[0] or 0),
-                                str(r[1] or ""),
-                                str(r[2] or ""),
-                                float(r[3] or 0.0),
-                                float(r[4] or 0.0),
-                                float(r[5] or 0.0),
-                                float(r[6] or 0.0),
-                                float(r[7] or 0.0),
-                                str(r[8] or ""),
-                                str(r[9] or ""),
-                                str(r[10] or ""),
-                            )
-                            for r in rows
-                        ],
-                    )
-
-            if "account_snapshots" in tables:
-                rows = lcur.execute(
-                    "SELECT ts,total_equity,buying_power,margin_ratio FROM account_snapshots"
-                ).fetchall()
-                if rows:
-                    conn.executemany(
-                        "INSERT INTO account_snapshots(ts,total_equity,buying_power,margin_ratio) VALUES(?,?,?,?)",
-                        [
-                            (
-                                int(r[0] or 0),
-                                float(r[1] or 0.0),
-                                float(r[2] or 0.0),
-                                float(r[3] or 0.0),
-                            )
-                            for r in rows
-                        ],
-                    )
-
-            if "candles" in tables:
-                rows = lcur.execute(
-                    "SELECT symbol,tf,ts,open,high,low,close,volume FROM candles"
-                ).fetchall()
-                if rows:
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO candles(symbol,tf,ts,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?)",
-                        [
-                            (
-                                str(r[0] or ""),
-                                str(r[1] or ""),
-                                int(r[2] or 0),
-                                float(r[3] or 0.0),
-                                float(r[4] or 0.0),
-                                float(r[5] or 0.0),
-                                float(r[6] or 0.0),
-                                float(r[7] or 0.0),
-                            )
-                            for r in rows
-                        ],
-                    )
-
-            conn.commit()
-            log.warning("Database: legacy migration complete")
-        finally:
-            try:
-                legacy.close()
-            except Exception:
-                pass
 
     async def _run(self, fn: Callable) -> Any:
         loop = asyncio.get_event_loop()
@@ -1131,12 +1854,87 @@ class Database:
             conn.commit()
         await self._run(_fn)
 
-    async def insert_trade(self, t: dict) -> None:
+    async def upsert_candles(self, candles: List[Candle]) -> None:
         """
-        Insert a trade record into the `trades` table.
+        [CI-1-B] Batch-upsert a list of Candle objects in a single transaction.
 
-        Uses INSERT OR IGNORE to handle the UNIQUE constraint on order_id without
-        crashing on duplicate fills (e.g. WS retransmit).
+        Behaviour:
+          • Empty list → safe no-op (no DB round-trip).
+          • All rows are inserted/replaced in one executemany() call and
+            committed in a single conn.commit() so the write is atomic.
+          • sqlite3.Error and unexpected exceptions are logged with full
+            context (symbol, tf range, count) and re-raised — no silent loss.
+        """
+        if not candles:
+            return
+
+        def _fn():
+            conn = self._conn_obj()
+            rows = [
+                (c.symbol, c.tf, c.ts, c.open, c.high, c.low, c.close, c.volume)
+                for c in candles
+            ]
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO candles"
+                    "(symbol,tf,ts,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?,?)",
+                    rows,
+                )
+                conn.commit()
+                log.debug(
+                    "[CI-1-B] upsert_candles: committed %d rows "
+                    "(symbol=%s tf=%s ts_range=[%d,%d])",
+                    len(rows),
+                    candles[0].symbol,
+                    candles[0].tf,
+                    candles[0].ts,
+                    candles[-1].ts,
+                )
+            except sqlite3.Error as _exc:
+                log.error(
+                    "[CI-1-B] upsert_candles: sqlite error — "
+                    "count=%d symbol=%s tf=%s: %s",
+                    len(rows),
+                    candles[0].symbol if candles else "?",
+                    candles[0].tf if candles else "?",
+                    _exc,
+                )
+                raise
+            except Exception as _exc:
+                log.error(
+                    "[CI-1-B] upsert_candles: unexpected error — "
+                    "count=%d symbol=%s tf=%s: %s",
+                    len(rows),
+                    candles[0].symbol if candles else "?",
+                    candles[0].tf if candles else "?",
+                    _exc,
+                )
+                raise
+
+        await self._run(_fn)
+
+    async def insert_trade(self, t: dict) -> None:
+        """Insert a trade record; uses INSERT OR IGNORE on duplicate order_id.
+
+        [PHASE1] Accepts optional keys:
+          trade_id             — links open and close rows for one round-trip
+          exit_reason_type     — ExitReason.value string (typed exit reason)
+          exit_reason_category — ExitReasonCategory.value string (coarse bucket)
+        [PHASE4] Accepts optional key:
+          is_close_leg         — 1 for canonical close rows, 0 (default) for all others
+        [PHASE6] Accepts optional keys (close-leg only; NULL for open/noise rows):
+          entry_confidence     — Signal.confidence at position entry
+          entry_kelly_f        — Signal.kelly_f at position entry
+          hold_time_secs       — seconds held from entry_ts to close fill
+        [PHASE10] Accepts optional keys (close-leg only; NULL for HEDGE_TRIM and
+          pre-Phase-10 rows):
+          close_slippage_bps   — signed execution slippage at close (positive = adverse)
+          spread_at_close_bps  — bid-ask spread in bps at close order submission time
+        [POST-ROADMAP-DT] Accepts optional keys (close-leg only; NULL for historical rows):
+          entry_regime         — Signal.regime at position entry
+          entry_direction      — Signal.direction at position entry
+          entry_z_score        — Signal.z_score at position entry
+        These keys are ignored gracefully if absent (old callers unaffected).
         """
         def _fn():
             try:
@@ -1144,10 +1942,51 @@ class Database:
                 conn.execute(
                     "INSERT OR IGNORE INTO trades"
                     "(ts,symbol,side,qty,price,cost_basis,pnl_pct,"
-                    "realized_usd,tag,order_id,inst_type) VALUES"
+                    "realized_usd,tag,order_id,inst_type,"
+                    "trade_id,exit_reason_type,exit_reason_category,"
+                    "is_close_leg,"
+                    "entry_confidence,entry_kelly_f,hold_time_secs,"
+                    "close_slippage_bps,spread_at_close_bps,"
+                    "entry_regime,entry_direction,entry_z_score) VALUES"
                     "(:ts,:symbol,:side,:qty,:price,:cost_basis,:pnl_pct,"
-                    ":realized_usd,:tag,:order_id,:inst_type)",
-                    t,
+                    ":realized_usd,:tag,:order_id,:inst_type,"
+                    ":trade_id,:exit_reason_type,:exit_reason_category,"
+                    ":is_close_leg,"
+                    ":entry_confidence,:entry_kelly_f,:hold_time_secs,"
+                    ":close_slippage_bps,:spread_at_close_bps,"
+                    ":entry_regime,:entry_direction,:entry_z_score)",
+                    {
+                        "ts":                   t.get("ts"),
+                        "symbol":               t.get("symbol"),
+                        "side":                 t.get("side"),
+                        "qty":                  t.get("qty"),
+                        "price":                t.get("price"),
+                        "cost_basis":           t.get("cost_basis"),
+                        "pnl_pct":              t.get("pnl_pct"),
+                        "realized_usd":         t.get("realized_usd"),
+                        "tag":                  t.get("tag"),
+                        "order_id":             t.get("order_id"),
+                        "inst_type":            t.get("inst_type"),
+                        # [PHASE1] New columns — None when not supplied (old callers).
+                        "trade_id":             t.get("trade_id"),
+                        "exit_reason_type":     t.get("exit_reason_type"),
+                        "exit_reason_category": t.get("exit_reason_category"),
+                        # [PHASE4] is_close_leg: default 0 (non-close/open/add rows).
+                        "is_close_leg":         int(t.get("is_close_leg") or 0),
+                        # [PHASE6] Close-leg diagnostic columns — None for non-close rows.
+                        "entry_confidence":     t.get("entry_confidence"),
+                        "entry_kelly_f":        t.get("entry_kelly_f"),
+                        "hold_time_secs":       t.get("hold_time_secs"),
+                        # [PHASE10] Friction columns — None for HEDGE_TRIM and
+                        # pre-Phase-10 rows; old callers default gracefully to None.
+                        "close_slippage_bps":   t.get("close_slippage_bps"),
+                        "spread_at_close_bps":  t.get("spread_at_close_bps"),
+                        # [POST-ROADMAP-DT] Entry-context columns — None for historical
+                        # rows and non-close rows; old callers default gracefully to None.
+                        "entry_regime":         t.get("entry_regime"),
+                        "entry_direction":      t.get("entry_direction"),
+                        "entry_z_score":        t.get("entry_z_score"),
+                    },
                 )
                 conn.commit()
             except sqlite3.Error as _exc:
@@ -1164,8 +2003,149 @@ class Database:
                 raise
         await self._run(_fn)
 
+    async def patch_open_attribution(
+        self,
+        order_id: str,
+        trade_id: str,
+        tag: str,
+    ) -> int:
+        """[PHASE4] Enrich an open-leg row that was written by _on_fill_event before
+        the canonical entry path had a chance to set the position.
+
+        UPDATEs the row matching order_id with:
+          - trade_id (links this row to the close leg via round-trip id)
+          - tag      (canonical entry tag, e.g. "LONG_ENTRY")
+          - is_close_leg = 0 (explicit; default but made unambiguous)
+
+        Returns the number of rows updated (0 = row not yet written; 1 = patched).
+        If 0 is returned, the caller's subsequent INSERT OR IGNORE acts as the
+        fallback write.  This method never raises on a missing row.
+        """
+        def _fn() -> int:
+            try:
+                conn  = self._conn_obj()
+                cur   = conn.execute(
+                    "UPDATE trades SET trade_id=?, tag=?, is_close_leg=0"
+                    " WHERE order_id=?",
+                    (trade_id, tag, order_id),
+                )
+                conn.commit()
+                return cur.rowcount
+            except sqlite3.Error as _exc:
+                log.error(
+                    "Database.patch_open_attribution: sqlite error order_id=%s: %s",
+                    order_id, _exc,
+                )
+                raise
+        return await self._run(_fn)
+
+    async def patch_close_attribution(
+        self,
+        order_id: str,
+        trade_id: str,
+        tag: str,
+        exit_reason_type: str,
+        exit_reason_category: str,
+        pnl_pct: float,
+        realized_usd: float,
+        entry_confidence: Optional[float] = None,
+        entry_kelly_f: Optional[float] = None,
+        hold_time_secs: Optional[float] = None,
+        close_slippage_bps: Optional[float] = None,
+        spread_at_close_bps: Optional[float] = None,
+        entry_regime: Optional[str] = None,
+        entry_direction: Optional[str] = None,
+        entry_z_score: Optional[float] = None,
+    ) -> int:
+        """[PHASE4] Enrich a close-leg row that was written by _on_fill_event with
+        full attribution: trade linkage, PnL, and typed exit reason.
+
+        [PHASE6] Also writes entry_confidence, entry_kelly_f, hold_time_secs when
+        supplied (None values leave those columns unchanged / NULL).
+
+        [PHASE10] Also writes close_slippage_bps, spread_at_close_bps when supplied.
+        Both default to None (NULL) so all existing callers are unaffected.
+        [PHASE15] HEDGE_TRIM and liquidation rows now supply non-None values when a
+        pre-order tick was available; None is passed only when tick fetch returned no data.
+
+        [POST-ROADMAP-DT] Also writes entry_regime, entry_direction, entry_z_score
+        when supplied.  All three default to None so all existing callers are unaffected.
+        Populated from Signal fields at position entry; NULL on historical rows.
+
+        UPDATEs the row matching order_id with all canonical close-leg fields.
+        Sets is_close_leg = 1 so KPI filters can identify it as a finalized close.
+
+        Returns rows updated (0 = fill-event row not yet written; 1 = patched).
+        Callers should INSERT OR IGNORE as fallback when 0 is returned.
+        """
+        def _fn() -> int:
+            try:
+                conn  = self._conn_obj()
+                cur   = conn.execute(
+                    "UPDATE trades SET"
+                    "  trade_id=?, tag=?, is_close_leg=1,"
+                    "  exit_reason_type=?, exit_reason_category=?,"
+                    "  pnl_pct=?, realized_usd=?,"
+                    "  entry_confidence=?, entry_kelly_f=?, hold_time_secs=?,"
+                    "  close_slippage_bps=?, spread_at_close_bps=?,"
+                    "  entry_regime=?, entry_direction=?, entry_z_score=?"
+                    " WHERE order_id=?",
+                    (
+                        trade_id, tag, exit_reason_type, exit_reason_category,
+                        pnl_pct, realized_usd,
+                        entry_confidence, entry_kelly_f, hold_time_secs,
+                        close_slippage_bps, spread_at_close_bps,
+                        entry_regime, entry_direction, entry_z_score,
+                        order_id,
+                    ),
+                )
+                conn.commit()
+                return cur.rowcount
+            except sqlite3.Error as _exc:
+                log.error(
+                    "Database.patch_close_attribution: sqlite error order_id=%s: %s",
+                    order_id, _exc,
+                )
+                raise
+        return await self._run(_fn)
+
+    async def patch_close_friction(
+        self,
+        trade_id: str,
+        entry_confidence: Optional[float],
+        entry_kelly_f: Optional[float],
+        hold_time_secs: Optional[float],
+    ) -> int:
+        """[PHASE6] Back-fill diagnostic columns on a close-leg row already written
+        via INSERT (i.e. when patch_close_attribution returned 0 and the fallback
+        INSERT path was used).  Matches on trade_id + is_close_leg=1.
+
+        This is a best-effort write; failures are logged at DEBUG and do not raise,
+        so the critical close path is never blocked by a diagnostic update failure.
+
+        Returns rows updated (0 = row not found or already populated).
+        """
+        def _fn() -> int:
+            try:
+                conn = self._conn_obj()
+                cur  = conn.execute(
+                    "UPDATE trades SET"
+                    "  entry_confidence=?, entry_kelly_f=?, hold_time_secs=?"
+                    " WHERE trade_id=? AND is_close_leg=1",
+                    (entry_confidence, entry_kelly_f, hold_time_secs, trade_id),
+                )
+                conn.commit()
+                return cur.rowcount
+            except sqlite3.Error as _exc:
+                log.debug(
+                    "Database.patch_close_friction: sqlite error trade_id=%s: %s",
+                    trade_id, _exc,
+                )
+                return 0
+        return await self._run(_fn)
+
     async def insert_snapshot(self, s: dict) -> None:
-        """Insert an account snapshot into `account_snapshots`."""
+        """Insert an account snapshot into account_snapshots."""
         def _fn():
             try:
                 conn = self._conn_obj()
@@ -1190,8 +2170,166 @@ class Database:
                 raise
         await self._run(_fn)
 
+    async def insert_decision_trace(self, record: dict) -> None:
+        """[TRACK10-DT] Insert one admission-outcome record into decision_trace.
 
-# ── Redis cache ────────────────────────────────────────────────────────────────
+        This method is FAIL-OPEN by design: all exceptions are caught and logged
+        at DEBUG level.  It must never raise into the caller — it is fired via
+        asyncio.ensure_future() from _maybe_enter and must not affect admission
+        logic under any circumstances.
+
+        This intentionally differs from insert_trade (which raises on error)
+        because decision_trace rows are observability data, not authoritative
+        fill truth.
+
+        Accepts the standard Track 09/10 record dict with keys:
+            ts, symbol, direction, regime, confidence, z_score, kelly_f,
+            mtf_aligned, sniper_boost, oracle_boosted, whale_mult,
+            outcome, gate_name, reason, llm_verdict, p32_p_success,
+            sizing_usd, modifiers (dict with risk_off, p39_snipe,
+            p39_size_boost, conviction_mult).
+
+        [TRACK16-DT] Also accepts optional source_path (str):
+            "entry"   — from _maybe_enter (standard signal path)
+            "express" — from trigger_atomic_express_trade (oracle/whale path)
+            None / absent — pre-Track-16 callers; stored as NULL.
+
+        [TRACK17-DT] Also accepts optional lifecycle fields:
+            "source_path": "close" — from _record_close (any exit)
+            "source_path": "dca"   — from _maybe_dca (successful add)
+            "pnl_pct"       (float) — realized PnL pct for close rows; NULL otherwise.
+            "hold_time_secs" (float) — hold duration for close rows; NULL otherwise.
+            Absent keys → NULL stored (backward-compatible).
+
+        The modifiers dict is flattened into individual columns for
+        direct SQL queryability.
+        """
+        def _fn() -> None:
+            try:
+                conn = self._conn_obj()
+                mods = record.get("modifiers") or {}
+                conn.execute(
+                    "INSERT INTO decision_trace"
+                    "(ts,symbol,direction,regime,confidence,z_score,kelly_f,"
+                    "mtf_aligned,sniper_boost,oracle_boosted,whale_mult,"
+                    "outcome,gate_name,reason,llm_verdict,p32_p_success,"
+                    "sizing_usd,risk_off,p39_snipe,p39_size_boost,conviction_mult,"
+                    "source_path,pnl_pct,hold_time_secs)"
+                    " VALUES"
+                    "(:ts,:symbol,:direction,:regime,:confidence,:z_score,:kelly_f,"
+                    ":mtf_aligned,:sniper_boost,:oracle_boosted,:whale_mult,"
+                    ":outcome,:gate_name,:reason,:llm_verdict,:p32_p_success,"
+                    ":sizing_usd,:risk_off,:p39_snipe,:p39_size_boost,:conviction_mult,"
+                    ":source_path,:pnl_pct,:hold_time_secs)",
+                    {
+                        "ts":             record.get("ts"),
+                        "symbol":         record.get("symbol"),
+                        "direction":      record.get("direction"),
+                        "regime":         record.get("regime"),
+                        "confidence":     record.get("confidence"),
+                        "z_score":        record.get("z_score"),
+                        "kelly_f":        record.get("kelly_f"),
+                        "mtf_aligned":    int(bool(record.get("mtf_aligned"))),
+                        "sniper_boost":   int(bool(record.get("sniper_boost"))),
+                        "oracle_boosted": int(bool(record.get("oracle_boosted"))),
+                        "whale_mult":     record.get("whale_mult"),
+                        "outcome":        record.get("outcome", ""),
+                        "gate_name":      record.get("gate_name", ""),
+                        "reason":         (record.get("reason") or "")[:120],
+                        "llm_verdict":    record.get("llm_verdict") or "",
+                        "p32_p_success":  record.get("p32_p_success"),
+                        "sizing_usd":     record.get("sizing_usd"),
+                        # Flattened modifier columns
+                        "risk_off":        int(bool(mods.get("risk_off", False))),
+                        "p39_snipe":       int(bool(mods.get("p39_snipe", False))),
+                        "p39_size_boost":  mods.get("p39_size_boost"),
+                        "conviction_mult": mods.get("conviction_mult"),
+                        # [TRACK16-DT] Source path — NULL when caller omits the key.
+                        "source_path":     record.get("source_path"),
+                        # [TRACK17-DT] Lifecycle fields — NULL for non-close rows.
+                        "pnl_pct":         record.get("pnl_pct"),
+                        "hold_time_secs":  record.get("hold_time_secs"),
+                    },
+                )
+                conn.commit()
+            except Exception as _dt_exc:
+                # Fail-open: observability writes must never surface into
+                # the admission pipeline.  DEBUG only — not ERROR.
+                log.debug(
+                    "[TRACK10-DT] insert_decision_trace: swallowed error "
+                    "sym=%s outcome=%s: %s",
+                    record.get("symbol", "?"),
+                    record.get("outcome", "?"),
+                    _dt_exc,
+                )
+        try:
+            await self._run(_fn)
+        except Exception as _outer_exc:
+            log.debug(
+                "[TRACK10-DT] insert_decision_trace: _run failed sym=%s: %s",
+                record.get("symbol", "?"), _outer_exc,
+            )
+
+    async def prune_decision_trace(self, retain_days: int) -> int:
+        """[TRACK12-PRUNE] Delete decision_trace rows older than retain_days.
+
+        Executes a single parameterized DELETE against the ts column index
+        (idx_dt_ts), which makes the operation a fast index range scan rather
+        than a full table scan.
+
+        This method is FAIL-OPEN by design: all exceptions are caught and
+        logged at WARNING level.  It never raises into its caller — neither
+        the background _dt_prune_loop nor the on-boot call in DataHub.start()
+        must be able to fail because of a prune error.
+
+        Parameters
+        ----------
+        retain_days : int
+            Rows with ts < (now - retain_days * 86400) are deleted.
+            Must be > 0; values ≤ 0 are treated as a no-op with a warning.
+
+        Returns
+        -------
+        int
+            Number of rows deleted, or 0 on any error / no-op.
+        """
+        if retain_days <= 0:
+            log.warning(
+                "[TRACK12-PRUNE] prune_decision_trace called with retain_days=%d "
+                "(≤ 0) — skipping to avoid deleting all history.",
+                retain_days,
+            )
+            return 0
+
+        def _fn() -> int:
+            try:
+                conn  = self._conn_obj()
+                cutoff = time.time() - retain_days * 86_400.0
+                conn.execute(
+                    "DELETE FROM decision_trace WHERE ts < :cutoff",
+                    {"cutoff": cutoff},
+                )
+                conn.commit()
+                return conn.total_changes
+            except Exception as _prune_exc:
+                log.warning(
+                    "[TRACK12-PRUNE] prune_decision_trace DELETE failed "
+                    "(retain_days=%d): %s",
+                    retain_days, _prune_exc,
+                )
+                return 0
+
+        try:
+            deleted: int = await self._run(_fn)
+            return deleted if isinstance(deleted, int) else 0
+        except Exception as _outer_exc:
+            log.warning(
+                "[TRACK12-PRUNE] prune_decision_trace: _run failed "
+                "(retain_days=%d): %s",
+                retain_days, _outer_exc,
+            )
+            return 0
+
 
 class Cache:
     def __init__(self):
@@ -1231,8 +2369,8 @@ class Cache:
         if not self._use_local and self._redis:
             try:
                 await self._redis.publish(channel, json.dumps(msg))
-            except Exception:
-                pass
+            except Exception as _exc:
+                log.debug("[DATA_HUB] cleanup: %s", _exc)
 
 
 # ── OKX Market Feed ────────────────────────────────────────────────────────────
@@ -1468,6 +2606,13 @@ class DataHub:
       self._risk_executor : Executor | None — injected by main_p20 after wiring
       self._risk_cb       : CircuitBreaker | None — injected by main_p20 after wiring
       get_risk_status_snapshot()     → dict — unified Phase 4/7/15/20 risk state
+
+    R1-A additions:
+      Database is always constructed with the canonical absolute path
+      Path(__file__).resolve().parent / "hub_data" / "powertrader.db".
+      datahub.db is never used.  The absolute path is logged at DataHub.__init__
+      time and again inside Database.__init__ so it appears in the first log
+      lines of every boot.
     """
 
     def __init__(
@@ -1476,23 +2621,30 @@ class DataHub:
         timeframes: List[str],
         demo: bool = OKX_DEMO_MODE,
     ):
-        # Sanitize all incoming symbols: strip whitespace and literal quote chars
-        # that can survive .env parsing (e.g. SYMBOLS="BTC,ETH" → ['BTC', 'ETH']).
         self.symbols    = [_sanitize_sym(s).upper() for s in symbols if _sanitize_sym(s)]
         self.timeframes = timeframes
         self.demo       = demo
 
+        # [R1-A-DBPATH] Database() with no path argument always resolves to the
+        # canonical absolute path: <module_dir>/hub_data/powertrader.db.
+        # datahub.db is NEVER used.
         self.db               = Database()
         self.cache            = Cache()
         self.rest             = OKXRestClient()
         self.instrument_cache = InstrumentCache(self.rest)
         self.volatility_guard = VolatilityGuard()
 
-        # [P5-1] Sentiment buffers
+        # [R1-A-DBPATH] Log the resolved DB path at DataHub construction time
+        # (Database.__init__ also logs it, but this provides a second boot-log
+        # reference with "DataHub" context for easy grep).
+        log.info(
+            "[R1-A-DBPATH] DataHub: using DB at absolute path: %s",
+            self.db._path,
+        )
+
         self._sentiment: Dict[str, SentimentBuffer] = {
             f"{s}-USDT": SentimentBuffer() for s in self.symbols
         }
-        # [P12-2] Tape buffers
         self._tapes: Dict[str, TapeBuffer] = {
             f"{s}-USDT": TapeBuffer() for s in self.symbols
         }
@@ -1519,63 +2671,42 @@ class DataHub:
             on_account=self._on_account, on_fill=self._on_fill, demo=demo,
         )
 
-        # [P15-3] Credential validator — always initialised so status_snapshot is safe
         self.cb_creds: CoinbaseCDPCredentials = CoinbaseCDPCredentials()
 
-        # [P15-1] Oracle and [P15-4] GlobalTapeAggregator
-        # These are None until start() is called (requires event loop).
-        self.oracle      = None   # CoinbaseOracle | None
-        self.global_tape = None   # GlobalTapeAggregator | None
+        self.oracle      = None
+        self.global_tape = None
 
         self._oracle_task: Optional[asyncio.Task] = None
 
-        # [TASK-4-A] Risk state references — injected by main_p20 after both
-        # objects exist (after gate.install() in main_p20.py::main()).
-        # Wire with:
-        #   hub._risk_executor = executor
-        #   hub._risk_cb       = cb
-        self._risk_executor = None   # Executor | None
-        self._risk_cb       = None   # CircuitBreaker | None
+        self._risk_executor = None
+        self._risk_cb       = None
 
-        # ── [P36.1-DETECT] Spoof Toxicity Store ──────────────────────────────
-        # Per-symbol spoof probability written by the Executor's Mimic Order
-        # Engine (_p36_run_mimic_test) and consumed by VetoArbitrator.
-        # Values decay toward 0.0 on every clean (non-spoof) cycle and spike
-        # to 1.0 when a spoof wall evaporation is detected.
-        # Protected by an asyncio.Lock for thread-safe concurrent access.
         self._p36_spoof_probs: Dict[str, float] = {}
         self._p36_spoof_lock: asyncio.Lock = asyncio.Lock()
-        # ── [/P36.1-DETECT] ──────────────────────────────────────────────────
 
-        # ── [STAGE-3] Binance TPS ingestion state ────────────────────────────
-        # Rolling deque of epoch timestamps for Binance trades received within
-        # the last _binance_tps_window seconds.  TPS is recomputed on every
-        # record_binance_trade() call (lock-free; deque pops are O(1)).
-        # Populated by the _binance_tape_ingestor background task in main.py.
+        # ── [P42-SHADOW] Global Market Sentinel ───────────────────────────────
+        # Polls Yahoo Finance for SPY / DXY every 30 s (configurable).
+        # Started as an asyncio task in DataHub.start().
+        # Public API: get_global_market_status(), get_spy_5m_pct(), get_dxy_5m_pct().
+        self.p42_sentinel: GlobalMarketSentinel = GlobalMarketSentinel()
+        # ── [/P42-SHADOW] ─────────────────────────────────────────────────────
+
+        # ── [P38-OFI] Per-symbol Order Flow Imbalance monitors ────────────────
+        # Keyed by instrument ID (e.g. "BTC-USDT") matching self._books keys.
+        # OBIMonitor.update() is called from _on_book() every WebSocket tick.
+        self._p38_obi: Dict[str, OBIMonitor] = {
+            f"{s}-USDT": OBIMonitor()
+            for s in self.symbols
+        }
+        # ── [/P38-OFI] ────────────────────────────────────────────────────────
+
         self._binance_trade_ts: deque = deque()
-        # Rolling window for TPS computation (seconds).
-        self._binance_tps_window: float = float(
-            os.environ.get("BINANCE_TPS_WINDOW_SECS", "10.0")
-        )
-        # ── [/STAGE-3] ───────────────────────────────────────────────────────
+        self._binance_tps_window: float = _env_float("BINANCE_TPS_WINDOW_SECS", 10.0)
 
     # ── [STAGE-3] Binance TPS API ─────────────────────────────────────────────
 
     def record_binance_trade(self) -> None:
-        """
-        [STAGE-3] Record a single Binance trade tick and recompute the rolling
-        TPS counter.
-
-        Called by the _binance_tape_ingestor background task in main.py on
-        every validated trade message.  This method is deliberately synchronous
-        (no asyncio.Lock) because the deque is only ever mutated from a single
-        asyncio task and popleft/append are individually GIL-atomic in CPython.
-        Exceptions are swallowed so a malformed message can never crash the
-        event loop.
-
-        TPS formula: count of trade timestamps within the last
-        _binance_tps_window seconds, divided by the window length.
-        """
+        """[STAGE-3] Record a single Binance trade tick and recompute rolling TPS."""
         try:
             now = time.time()
             self._binance_trade_ts.append(now)
@@ -1586,14 +2717,7 @@ class DataHub:
             log.debug("[STAGE-3] record_binance_trade error (non-fatal): %s", exc)
 
     def get_binance_tps(self) -> float:
-        """
-        [STAGE-3] Return the current Binance trades-per-second value, computed
-        over the rolling _binance_tps_window.
-
-        Recomputes by pruning stale timestamps before dividing so the caller
-        always gets an up-to-date value even if no new trades have arrived
-        recently.  Returns 0.0 on any error or when the window is empty.
-        """
+        """[STAGE-3] Return current Binance trades-per-second over rolling window."""
         try:
             now = time.time()
             cutoff = now - self._binance_tps_window
@@ -1604,8 +2728,6 @@ class DataHub:
             return 0.0
         except Exception:
             return 0.0
-
-    # ── [/STAGE-3] ────────────────────────────────────────────────────────────
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -1663,6 +2785,11 @@ class DataHub:
     async def _on_book(self, book: OrderBook) -> None:
         async with self._book_lock:
             self._books[book.symbol] = book
+        # [P38-OFI] Feed the delta-OFI monitor on every book tick.
+        # No lock needed — _on_book runs exclusively in the asyncio event loop.
+        mon = self._p38_obi.get(book.symbol)
+        if mon is not None:
+            mon.update(book)
         await self._emit("book", book)
 
     async def _on_funding(self, spot_inst_id: str, rate: float) -> None:
@@ -1709,11 +2836,6 @@ class DataHub:
                 await self._emit("candle", agg[-1])
 
     async def _on_account(self, snap: AccountSnapshot) -> None:
-        # [GHOST-STATE] Validate equity before storing and broadcasting.
-        # If the WS delivers a sub-floor ghost value, we still emit it so that
-        # downstream subscribers (executor._on_account_update) can apply their
-        # own state-aware validation — but we do NOT overwrite _last_account
-        # with a ghost value, which would corrupt the public API.
         if snap.total_equity > _RISK_MIN_VALID_EQUITY or self._last_account is None:
             self._last_account = snap
         else:
@@ -1744,10 +2866,17 @@ class DataHub:
     # ── Public API — OKX data ──────────────────────────────────────────────────
 
     async def get_tick(self, symbol: str) -> Optional[Tick]:
-        # Sanitize incoming symbol — strip whitespace and literal quotes that
-        # may survive from .env parsing (e.g.  P35_HEDGE_SYMBOL="BTC-USDT-SWAP").
         symbol = _sanitize_sym(symbol)
-        inst   = f"{symbol.upper()}-USDT"
+        # [P35.1-FIX] Build a valid OKX instId without blindly appending -USDT.
+        # Previously "BTC-USDT-SWAP" → "BTC-USDT-SWAP-USDT" (invalid → REST 400 → None).
+        # Rule: if symbol already carries a recognised OKX suffix or has 2+ dashes
+        # it is already a fully-qualified instId; otherwise append spot quote pair.
+        _s = symbol.upper().strip()
+        _OKX_SUFFIXES = ("-USDT", "-USDC", "-USD", "-SWAP", "-FUTURES")
+        if any(_s.endswith(sfx) for sfx in _OKX_SUFFIXES) or _s.count("-") >= 2:
+            inst = _s          # already a fully-qualified OKX instId (swap/futures/spot)
+        else:
+            inst = f"{_s}-USDT"  # bare base symbol e.g. "BTC" → "BTC-USDT"
         cached = await self.cache.get(f"tick:{inst}")
         if cached:
             try:
@@ -1757,9 +2886,6 @@ class DataHub:
         try:
             d    = await self.rest.get("/api/v5/market/ticker", params={"instId": inst})
             data = d.get("data") or []
-            # ── [P36.1-FALLBACK] Prevent raw index access on empty lists ──────
-            # An empty data list is a valid OKX response for unknown instruments
-            # and must never cause an IndexError that crashes the data thread.
             if not data or len(data) == 0:
                 log.warning(
                     "Tick REST fallback: empty data list for %s — returning None.", symbol
@@ -1777,25 +2903,11 @@ class DataHub:
             return None
 
     async def get_price(self, symbol: str) -> Optional[float]:
-        """
-        [ROBUSTNESS] Return the last-traded price for *symbol*, or ``None`` when
-        the tick cannot be retrieved.
-
-        Thin wrapper around ``get_tick`` that:
-          • Sanitizes the symbol (strips whitespace + literal quotes from .env).
-          • Catches ALL exceptions so a failure for the hedge symbol never crashes
-            the DataHub cycle.
-          • Returns None — never raises — so callers can do a simple null-check.
-
-        Designed for use by ``PortfolioGovernor._p35_evaluate_and_hedge`` and any
-        other location that needs a scalar price for the hedge symbol.
-        """
+        """Return the last-traded price for symbol, or None on any failure."""
         try:
             tick = await self.get_tick(symbol)
             if tick is None:
-                log.warning(
-                    "[PRICE-CHECK] get_price: no tick for %s — returning None.", symbol,
-                )
+                log.warning("[PRICE-CHECK] get_price: no tick for %s — returning None.", symbol)
                 return None
             price = tick.last or tick.bid or tick.ask
             if not price or price <= 0:
@@ -1855,30 +2967,29 @@ class DataHub:
 
     async def get_flow_toxicity(self, symbol: str) -> float:
         """
-        [P37-VPIN] Return the Volume-Clock ToxicityScore ∈ [0.0, 1.0] for a
-        symbol.
+        [P37-VPIN / P47] Return Volume-Clock ToxicityScore ∈ [0.0, 1.0] for symbol.
 
-        ToxicityScore is the CDF position of the most-recently-sealed VPIN
-        bucket within the rolling 50-bucket history.  A score near 1.0 indicates
-        that the current order-flow imbalance (abs(BuyVol-SellVol)/TotalVol) is
-        at the extreme upper tail of recent history — a reliable signal of
-        informed, directional institutional trading.
-
-        Safeguards
-        ----------
-        • Returns 0.0 for an unknown symbol (no tape buffer).
-        • Returns 0.0 until at least two buckets are sealed (insufficient data).
-        • All exceptions are caught and yield 0.0 so the caller is never blocked.
-
-        Parameters
-        ----------
-        symbol : str — base symbol, e.g. "BTC" or "BTC-USDT"
-
-        Returns
-        -------
-        float ∈ [0.0, 1.0] — 0.0 = clean (uninformed) flow, 1.0 = maximally
-        toxic (perfectly one-sided institutional pressure).
+        [P47] When a Rust bridge reference has been injected (hub._p47_bridge) and
+        P47_ENABLE=1, the bridge-computed value is returned when fresh
+        (age ≤ P47_STALENESS_SECS).  Falls back to Python VPIN math silently.
         """
+        # ── [P47] Bridge-computed fast path ───────────────────────────────────
+        try:
+            _bridge47 = getattr(self, "_p47_bridge", None)
+            if _bridge47 is not None:
+                _tox47, _ofi47, _bp, _ap, _fresh = _bridge47.get_p47_microstructure(symbol)
+                if _fresh:
+                    if getattr(_bridge47, "_p47_enabled", False) and \
+                            __import__("os").environ.get("P47_LOG_SOURCE", "0") == "1":
+                        __import__("logging").getLogger("data_hub").debug(
+                            "[P47] get_flow_toxicity %s: source=BRIDGE tox=%.4f", symbol, _tox47
+                        )
+                    return _tox47
+        except Exception as _p47_exc:
+            __import__("logging").getLogger("data_hub").debug(
+                "[P47] bridge toxicity fallback %s: %s", symbol, _p47_exc
+            )
+        # ── [/P47] fall through to Python VPIN ────────────────────────────────
         try:
             buf = self._tape_buf(symbol)
             if buf is None:
@@ -1887,6 +2998,131 @@ class DataHub:
         except Exception as exc:
             log.debug("[P37-VPIN] get_flow_toxicity error %s: %s", symbol, exc)
             return 0.0
+
+    # ── [P42-SHADOW] Global Market Sentinel public API ─────────────────────────
+
+    def get_global_market_status(self) -> dict:
+        """
+        [P42-SHADOW] Return a serialisable snapshot of the GlobalMarketSentinel state.
+
+        Used by the Executor's _cycle() to inject SPY/DXY deltas into the
+        VetoArbitrator each loop iteration, and by the Dashboard to display the
+        macro veto status tile.
+
+        Returns a dict with keys:
+            spy_5m_pct        : float  — SPY 5-min % change (negative = falling)
+            dxy_5m_pct        : float  — DXY 5-min % change (positive = rising $)
+            data_age_secs     : float  — seconds since last successful poll
+            feed_stale        : bool   — True when age > P42_MAX_STALE_SECS
+            status            : str    — human-readable status string
+            spy_ticker        : str
+            dxy_ticker        : str
+            poll_interval_secs: float
+            lookback_secs     : float
+        """
+        try:
+            return self.p42_sentinel.get_status_snapshot()
+        except Exception as exc:
+            log.debug("[P42-SHADOW] get_global_market_status error: %s", exc)
+            return {
+                "spy_5m_pct": 0.0, "dxy_5m_pct": 0.0,
+                "data_age_secs": 9999.0, "feed_stale": True,
+                "status": f"ERROR: {exc}",
+                "spy_ticker": P42_SPY_TICKER, "dxy_ticker": P42_DXY_TICKER,
+                "poll_interval_secs": P42_POLL_INTERVAL_SECS,
+                "lookback_secs": P42_LOOKBACK_SECS,
+            }
+
+    def get_spy_5m_pct(self) -> float:
+        """[P42-SHADOW] SPY 5-minute percentage change. Negative = equity falling."""
+        try:
+            return self.p42_sentinel.get_spy_5m_pct()
+        except Exception:
+            return 0.0
+
+    def get_dxy_5m_pct(self) -> float:
+        """[P42-SHADOW] DXY 5-minute percentage change. Positive = dollar rising."""
+        try:
+            return self.p42_sentinel.get_dxy_5m_pct()
+        except Exception:
+            return 0.0
+
+    def get_p42_data_age_secs(self) -> float:
+        """[P42-SHADOW] Seconds since last successful Yahoo Finance poll."""
+        try:
+            return self.p42_sentinel.get_data_age_secs()
+        except Exception:
+            return 9999.0
+
+    def feed_btc_price_for_correlation(self, price: float) -> None:
+        """
+        [P42-CORR] Push the current BTC mid-price into GlobalMarketSentinel's
+        rolling correlation window.
+
+        Called by the Executor each _cycle() after reading the live BTC tick so
+        the Pearson-r between SPY returns and BTC returns is always fresh.  No-op
+        when the sentinel is unavailable or price <= 0.
+
+        Parameters
+        ----------
+        price : float — current BTC/USDT mid-price (bid+ask)/2 or last trade.
+        """
+        try:
+            if price > 0:
+                self.p42_sentinel.record_btc_price(price)
+        except Exception as exc:
+            log.debug("[P42-CORR] feed_btc_price_for_correlation error: %s", exc)
+
+    # ── [/P42-SHADOW] ─────────────────────────────────────────────────────────
+
+    async def get_ofi_score(
+        self, symbol: str
+    ) -> tuple:
+        """
+        [P38-OFI / P47] Return the current Order Flow Imbalance snapshot for symbol.
+
+        Returns
+        -------
+        Tuple[ofi_score, bid_wall_pulled, ask_wall_pulled]
+
+        ofi_score ∈ [-1.0, +1.0]:
+            Positive → net buy-side delta pressure.
+            Negative → net sell-side delta pressure.
+
+        [P47] When a Rust bridge reference has been injected (hub._p47_bridge) and
+        P47_ENABLE=1, the bridge-computed OFI is returned when fresh
+        (age ≤ P47_STALENESS_SECS).  Falls back to Python OBIMonitor silently.
+
+        Returns (0.0, False, False) when no monitor exists or fewer than two
+        snapshots have been received (cold-start guard — safe neutral value).
+        """
+        # ── [P47] Bridge-computed fast path ───────────────────────────────────
+        try:
+            _bridge47 = getattr(self, "_p47_bridge", None)
+            if _bridge47 is not None:
+                _tox47, _ofi47, _bp47, _ap47, _fresh = _bridge47.get_p47_microstructure(symbol)
+                if _fresh:
+                    if getattr(_bridge47, "_p47_enabled", False) and \
+                            __import__("os").environ.get("P47_LOG_SOURCE", "0") == "1":
+                        __import__("logging").getLogger("data_hub").debug(
+                            "[P47] get_ofi_score %s: source=BRIDGE ofi=%.4f "
+                            "bid_pull=%s ask_pull=%s", symbol, _ofi47, _bp47, _ap47
+                        )
+                    return _ofi47, _bp47, _ap47
+        except Exception as _p47_exc:
+            __import__("logging").getLogger("data_hub").debug(
+                "[P47] bridge OFI fallback %s: %s", symbol, _p47_exc
+            )
+        # ── [/P47] fall through to Python OBIMonitor ──────────────────────────
+        try:
+            inst = f"{symbol.upper()}-USDT"
+            mon  = self._p38_obi.get(inst)
+            if mon is None or not mon.ready:
+                return 0.0, False, False
+            return mon.get_ofi_snapshot()
+        except Exception as exc:
+            log.debug("[P38-OFI] get_ofi_score error %s: %s", symbol, exc)
+            return 0.0, False, False
 
     async def get_sentiment(self, symbol: str) -> SentimentSnapshot:
         buf = self._sentiment_buf(symbol)
@@ -1903,10 +3139,7 @@ class DataHub:
     # ── [P15] Public API — Oracle / HV Mode ───────────────────────────────────
 
     def get_oracle_signal(self, symbol: str):
-        """
-        [P15-2] Return the latest valid OracleSignal for symbol, or None.
-        Safe to call even before oracle is initialised.
-        """
+        """[P15-2] Return the latest valid OracleSignal for symbol, or None."""
         if self.oracle is None:
             return None
         try:
@@ -1916,24 +3149,12 @@ class DataHub:
             return None
 
     async def get_global_mid_price(self, symbol: str) -> Optional[float]:
-        """
-        [P34.1-SYNTH] Synthetic mid-price: weighted average of OKX and Coinbase.
-
-        Weights are configured via P34_OKX_WEIGHT / P34_COINBASE_WEIGHT env vars
-        (default 50/50).  If one source is stale (>P34_STALENESS_SECS), the weight
-        shifts 100% to the fresh source.  Returns None only when both sources are
-        unavailable or stale.
-
-        Staleness definition:
-            OKX    — order book returned no best bid/ask
-            Coinbase — oracle.latest_price() returns None or timestamp too old
-        """
+        """[P34.1-SYNTH] Synthetic mid-price: weighted average of OKX and Coinbase."""
         now = time.time()
         okx_mid: Optional[float] = None
         cb_mid:  Optional[float] = None
         cb_ts:   Optional[float] = None
 
-        # ── OKX mid-price ────────────────────────────────────────────────────
         try:
             book = await self.get_order_book(symbol)
             if book and book.bids and book.asks:
@@ -1941,7 +3162,6 @@ class DataHub:
         except Exception as exc:
             log.debug("[P34.1-SYNTH] OKX order-book error %s: %s", symbol, exc)
 
-        # ── Coinbase last-trade mid-price ────────────────────────────────────
         try:
             if self.oracle is not None:
                 px_entry = self.oracle.latest_price(symbol)
@@ -1950,30 +3170,23 @@ class DataHub:
         except Exception as exc:
             log.debug("[P34.1-SYNTH] Coinbase price error %s: %s", symbol, exc)
 
-        # ── Staleness flags ──────────────────────────────────────────────────
         okx_stale = okx_mid is None
         cb_stale  = cb_mid is None or cb_ts is None or (now - cb_ts) > P34_STALENESS_SECS
 
         if okx_stale and cb_stale:
             log.debug("[P34.1-SYNTH] Both sources stale for %s — returning None", symbol)
             return None
-
         if okx_stale:
             log.info("[P34.1-SYNTH] %s OKX stale → 100%% Coinbase mid=%.4f", symbol, cb_mid)
             return cb_mid
-
         if cb_stale:
             log.info("[P34.1-SYNTH] %s Coinbase stale → 100%% OKX mid=%.4f", symbol, okx_mid)
             return okx_mid
 
-        # ── Both fresh: weighted average ─────────────────────────────────────
         global_mid = (okx_mid * P34_OKX_WEIGHT) + (cb_mid * P34_COINBASE_WEIGHT)
         log.debug(
-            "[P34.1-SYNTH] %s global_mid=%.4f (OKX=%.4f w=%.2f  CB=%.4f w=%.2f  "
-            "cb_age=%.2fs)",
-            symbol, global_mid,
-            okx_mid, P34_OKX_WEIGHT,
-            cb_mid,  P34_COINBASE_WEIGHT,
+            "[P34.1-SYNTH] %s global_mid=%.4f (OKX=%.4f w=%.2f  CB=%.4f w=%.2f  cb_age=%.2fs)",
+            symbol, global_mid, okx_mid, P34_OKX_WEIGHT, cb_mid, P34_COINBASE_WEIGHT,
             now - cb_ts,
         )
         return global_mid
@@ -1998,19 +3211,13 @@ class DataHub:
             return 0.0
 
     def get_global_tape_status(self) -> dict:
-        """[P15-4] Full GlobalTapeAggregator status dict for status cache.
-
-        [STAGE-3] Injects live binance_tps from the DataHub Binance tape
-        ingestion counter (_binance_trade_ts) and recomputes combined_tps as
-        coinbase_tps + binance_tps so the dashboard reflects real data.
-        """
-        # [STAGE-3] Compute Binance TPS once; injected into both paths below.
+        """[P15-4] Full GlobalTapeAggregator status dict for status cache."""
         _binance_tps = self.get_binance_tps()
 
         base: dict = {
             "coinbase_tps":         0.0,
             "binance_tps":          _binance_tps,
-            "combined_tps":         _binance_tps,   # coinbase=0 + binance
+            "combined_tps":         _binance_tps,
             "high_volatility_mode": False,
             "hv_stop_extra_pct":    0.0,
             "cb_credentials":       self.cb_creds.status_snapshot(),
@@ -2020,9 +3227,6 @@ class DataHub:
         try:
             snap = self.global_tape.status_snapshot()
             snap["cb_credentials"] = self.cb_creds.status_snapshot()
-            # [STAGE-3] Override binance_tps with live DataHub counter and
-            # recompute combined_tps.  The GlobalTapeAggregator's own
-            # binance_tps is always 0.0 (it has no Binance feed of its own).
             snap["binance_tps"]  = _binance_tps
             snap["combined_tps"] = snap.get("coinbase_tps", 0.0) + _binance_tps
             return snap
@@ -2033,45 +3237,7 @@ class DataHub:
     # ── [TASK-4-B] Unified risk state snapshot ────────────────────────────────
 
     def get_risk_status_snapshot(self) -> dict:
-        """
-        [TASK-4-B] Returns a unified risk-state dict that merges:
-          • Phase 4  — VolatilityGuard (emergency_pause, pause_remaining_secs)
-          • Phase 7  — CircuitBreaker  (cb_tripped, cb_drawdown_pct, …)
-          • Phase 15 — CoinbaseOracle  (oracle_connected, hv_mode)
-          • Phase 20 — Zombie Mode / HWM (zombie_active, drawdown_pct, …)
-
-        This is the single source of truth for the GUI's "block reason" banner
-        and for any diagnostic tooling that needs to know WHY entries are gated.
-
-        All fields default to safe, falsy values when the referenced objects
-        have not yet been injected or have not yet received a real reading —
-        no field ever contains None; every numeric field is a float.
-
-        Wire in main_p20.py immediately after gate.install():
-            hub._risk_executor = executor
-            hub._risk_cb       = cb
-
-        Returns
-        -------
-        dict
-            cb_tripped           bool   CircuitBreaker has fired
-            cb_drawdown_pct      float  last measured hourly drawdown %
-            cb_peak_equity       float  CB high-water mark
-            cb_latest_equity     float  CB latest equity reading
-            cb_tripped_at        float  unix ts of last trip (0.0 = never)
-            cb_in_grace_period   bool   startup grace window still active
-            zombie_active        bool   P20 Zombie Mode is active
-            zombie_pct           float  configured zombie trigger threshold %
-            peak_equity          float  brain HWM (P20 source of truth)
-            current_equity       float  executor._equity (last valid reading)
-            drawdown_pct         float  (HWM - equity) / HWM * 100
-            emergency_pause      bool   VolatilityGuard flash-crash pause
-            pause_remaining_secs float  seconds until emergency_pause lifts
-            oracle_connected     bool   Coinbase WS is live
-            hv_mode              bool   GlobalTapeAggregator HV flag
-            block_reason         str    primary human-readable block reason
-        """
-        # ── Safe defaults — no field is ever None ─────────────────────────────
+        """[TASK-4-B] Unified Phase 4/7/15/20 risk state for the GUI."""
         snap: dict = {
             "cb_tripped":           False,
             "cb_drawdown_pct":      0.0,
@@ -2091,56 +3257,38 @@ class DataHub:
             "block_reason":         "none",
         }
 
-        # ── Phase 7: CircuitBreaker ────────────────────────────────────────────
         cb = self._risk_cb
         if cb is not None:
             try:
                 snap["cb_tripped"] = bool(cb.is_tripped)
-
                 raw_dd = getattr(cb, "last_drawdown_pct", None)
                 snap["cb_drawdown_pct"] = float(raw_dd) if raw_dd is not None else 0.0
-
                 raw_pk = getattr(cb, "peak_equity", None)
                 snap["cb_peak_equity"] = float(raw_pk) if raw_pk is not None else 0.0
-
                 raw_lt = getattr(cb, "latest_equity", None)
                 snap["cb_latest_equity"] = float(raw_lt) if raw_lt is not None else 0.0
-
                 raw_ta = getattr(cb, "tripped_at", None)
                 snap["cb_tripped_at"] = float(raw_ta) if raw_ta is not None else 0.0
-
-                # GracedCircuitBreaker exposes _in_grace(); plain CB does not.
                 if hasattr(cb, "_in_grace") and callable(cb._in_grace):
                     try:
                         snap["cb_in_grace_period"] = bool(cb._in_grace())
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        log.warning("[DATA_HUB] suppressed: %s", _exc)
             except Exception as exc:
                 log.debug("[TASK-4] get_risk_status_snapshot CB read: %s", exc)
 
-        # ── Phase 20: Zombie Mode / HWM / Executor equity ─────────────────────
         executor = self._risk_executor
         if executor is not None:
             try:
-                snap["zombie_active"] = bool(
-                    getattr(executor, "_p20_zombie_mode", False)
-                )
-
+                snap["zombie_active"] = bool(getattr(executor, "_p20_zombie_mode", False))
                 raw_eq = getattr(executor, "_equity", None)
                 cur_eq = float(raw_eq) if raw_eq is not None else 0.0
-                # Only surface equity values that passed the min-valid floor.
-                if cur_eq >= _RISK_MIN_VALID_EQUITY:
-                    snap["current_equity"] = cur_eq
-                else:
-                    snap["current_equity"] = 0.0
-
-                # brain.peak_equity may be a guarded property — read safely.
+                snap["current_equity"] = cur_eq if cur_eq >= _RISK_MIN_VALID_EQUITY else 0.0
                 brain = getattr(executor, "brain", None)
                 if brain is not None:
                     raw_hwm = getattr(brain, "peak_equity", None)
                     hwm = float(raw_hwm) if raw_hwm is not None else 0.0
                     snap["peak_equity"] = hwm
-
                     valid_eq = snap["current_equity"]
                     if hwm > 0.0 and valid_eq > 0.0:
                         try:
@@ -2148,43 +3296,30 @@ class DataHub:
                             snap["drawdown_pct"] = round(float(dd), 4)
                         except (TypeError, ZeroDivisionError):
                             pass
-
                 risk_mgr = getattr(executor, "_p20_risk_manager", None)
                 if risk_mgr is not None:
                     raw_zpct = getattr(risk_mgr, "_zombie_pct", None)
                     snap["zombie_pct"] = float(raw_zpct) if raw_zpct is not None else 0.0
-
             except Exception as exc:
-                log.debug(
-                    "[TASK-4] get_risk_status_snapshot executor read: %s", exc
-                )
+                log.debug("[TASK-4] get_risk_status_snapshot executor read: %s", exc)
 
-        # ── Phase 4: VolatilityGuard ───────────────────────────────────────────
         try:
             snap["emergency_pause"] = bool(self.volatility_guard.emergency_pause)
-            snap["pause_remaining_secs"] = float(
-                self.volatility_guard.pause_remaining_secs
-            )
+            snap["pause_remaining_secs"] = float(self.volatility_guard.pause_remaining_secs)
         except Exception as exc:
             log.debug("[TASK-4] get_risk_status_snapshot VolatilityGuard: %s", exc)
 
-        # ── Phase 15: Oracle connectivity ─────────────────────────────────────
         try:
             if self.oracle is not None:
-                snap["oracle_connected"] = bool(
-                    getattr(self.oracle, "_ws_connected", False)
-                )
+                snap["oracle_connected"] = bool(getattr(self.oracle, "_ws_connected", False))
         except Exception as exc:
             log.debug("[TASK-4] get_risk_status_snapshot oracle: %s", exc)
 
-        # ── Phase 15-4: HV Mode ───────────────────────────────────────────────
         try:
             snap["hv_mode"] = self.is_hv_mode()
         except Exception as exc:
             log.debug("[TASK-4] get_risk_status_snapshot hv_mode: %s", exc)
 
-        # ── Unified block_reason — priority order ─────────────────────────────
-        # Zombie Mode > CircuitBreaker > EmergencyPause > HV Mode > none
         if snap["zombie_active"]:
             snap["block_reason"] = (
                 f"P20_ZOMBIE_MODE "
@@ -2211,27 +3346,8 @@ class DataHub:
     # ── [P36.1-DETECT] Spoof Toxicity Public API ──────────────────────────────
 
     async def update_spoof_toxicity(self, symbol: str, spoof_prob: float) -> None:
-        """
-        [P36.1-DETECT] Write a spoof probability sample for a symbol.
-
-        Called by the Executor's _p36_run_mimic_test() after each Passive Spoof
-        Test completes.  The value is stored in _p36_spoof_probs and consumed by
-        VetoArbitrator.set_spoof_probability() on the next compute_p_success()
-        call.
-
-        A simple Exponential Moving Average (alpha=0.5) is applied so that a
-        single clean cycle quickly reduces an elevated spoof signal rather than
-        requiring manual reset.  Alpha can be adjusted via the P36_SPOOF_EMA_ALPHA
-        env var (defaults to 0.5).
-
-        Parameters
-        ----------
-        symbol     : str   — base symbol, e.g. "BTC"
-        spoof_prob : float — detected probability ∈ [0.0, 1.0];
-                             1.0 = wall evaporated immediately (confirmed spoof),
-                             0.0 = wall held (not a spoof this cycle).
-        """
-        _alpha = float(os.environ.get("P36_SPOOF_EMA_ALPHA", "0.5"))
+        """[P36.1-DETECT] Write a spoof probability EMA sample for a symbol."""
+        _alpha = _env_float("P36_SPOOF_EMA_ALPHA", 0.5)
         try:
             spoof_prob = max(0.0, min(1.0, float(spoof_prob)))
             sym_upper  = symbol.upper()
@@ -2248,17 +3364,7 @@ class DataHub:
             log.warning("[P36.1-DETECT] update_spoof_toxicity error %s: %s", symbol, exc)
 
     async def get_spoof_probability(self, symbol: str) -> float:
-        """
-        [P36.1-DETECT] Return the current spoof probability EMA for a symbol.
-
-        Parameters
-        ----------
-        symbol : str — base symbol, e.g. "BTC"
-
-        Returns
-        -------
-        float — EMA spoof probability ∈ [0.0, 1.0].  0.0 for an unknown symbol.
-        """
+        """[P36.1-DETECT] Return current spoof probability EMA ∈ [0.0, 1.0]."""
         try:
             sym_upper = symbol.upper().replace("-USDT", "").replace("-SWAP", "")
             async with self._p36_spoof_lock:
@@ -2270,31 +3376,7 @@ class DataHub:
     # ── [P36.2-SELFHEAL] Self-Healing Triggered Refresh ──────────────────────
 
     async def force_immediate_refresh(self, symbol: str) -> None:
-        """
-        [P36.2-SELFHEAL] Bypass the 1800-second timer and immediately fetch
-        fresh buyLmt / sellLmt price bands for ``symbol`` from the OKX REST API.
-
-        Called by the Executor whenever an sCode 51006 rejection is detected so
-        the next order has accurate, up-to-date price-limit data without waiting
-        for the next scheduled InstrumentCache refresh cycle.
-
-        Strategy
-        --------
-        1. Build the OKX inst_id strings for SPOT and SWAP variants of symbol.
-        2. Call /api/v5/market/tickers for both instTypes and filter to just the
-           two relevant instruments (avoids fetching the full ticker list when
-           only a single symbol is needed).
-        3. Update _price_limits cache and the InstrumentMeta.buyLmt / sellLmt
-           fields atomically under the price_limits_lock.
-        4. Log the refreshed bands so operators can confirm the update.
-
-        All exceptions are caught internally; failure is non-fatal (the Price
-        Limit Guard will use the previous cached values on the next order).
-
-        Parameters
-        ----------
-        symbol : str — base symbol, e.g. "BTC" or "ETH"
-        """
+        """[P36.2-SELFHEAL] Bypass the timer and fetch fresh price limits immediately."""
         sym_upper = _clean_env(symbol).upper().replace("-USDT", "").replace("-SWAP", "")
         spot_id   = f"{sym_upper}-USDT"
         swap_id   = f"{sym_upper}-USDT-SWAP"
@@ -2326,7 +3408,6 @@ class DataHub:
                             continue
                         if buy_lmt > 0 or sell_lmt > 0:
                             self.instrument_cache._price_limits[iid] = (buy_lmt, sell_lmt)
-                            # Propagate into InstrumentMeta if available.
                             meta = self.instrument_cache._cache.get(iid)
                             if meta is not None:
                                 meta.buyLmt  = buy_lmt
@@ -2351,22 +3432,41 @@ class DataHub:
                 "— clamping will use previously cached values.", sym_upper,
             )
 
-    # ── [/P36.2-SELFHEAL] ────────────────────────────────────────────────────
-
     # ── [P15-2] Oracle cancel ──────────────────────────────────────────────────
 
     async def cycle_oracle_cancel(self, symbols: List[str]) -> None:
-        """
-        [P15-2] Called by Executor when master.cancel_buys_flag is True.
+        """[P15-2] Cancel ALL open OKX BUY limit orders for the given symbols.
 
-        Cancels ALL open OKX BUY limit orders for the given symbols via REST.
-        Failures per symbol are caught and logged without stopping the loop.
-
-        ⚠  This only cancels OKX orders. It does NOT interact with Coinbase.
+        [P15-2-THROTTLE] Per-symbol REST call guard: skips the full cancel sweep
+        if called within 20s of the previous call for the same symbol.  Prevents
+        hammering /api/v5/trade/orders-pending on every executor cycle (~0.5s)
+        while a 30s whale signal is live.  The window is 20s (< 30s whale TTL)
+        so a genuine new whale within the TTL window still fires once.
         """
+        import time as _t
+        _now = _t.time()
+        _CANCEL_COOLDOWN_SECS = 20.0
+        if not hasattr(self, "_oracle_cancel_ts"):
+            self._oracle_cancel_ts: dict = {}
+
+        # Filter to only symbols not recently cancelled
+        symbols_due = [
+            s for s in symbols
+            if _now - self._oracle_cancel_ts.get(s.upper(), 0.0) >= _CANCEL_COOLDOWN_SECS
+        ]
+        if not symbols_due:
+            log.debug(
+                "[P15-2] cycle_oracle_cancel: ALL symbols throttled (< %.0fs since last cancel) "
+                "— skipping REST sweep for %s", _CANCEL_COOLDOWN_SECS, symbols,
+            )
+            return
+
+        for s in symbols_due:
+            self._oracle_cancel_ts[s.upper()] = _now
+
         log.warning(
             "[P15-2] cycle_oracle_cancel: Coinbase Whale SELL — "
-            "cancelling all OKX BUY limit orders for %s", symbols,
+            "cancelling all OKX BUY limit orders for %s (throttled symbols skipped)", symbols_due,
         )
         for inst_type in ("SPOT", "SWAP"):
             try:
@@ -2436,19 +3536,28 @@ class DataHub:
                                 pass
                         buf = await self._get_buf(inst, tf)
                         await buf.bulk_load(candles)
+                        # [FIX-KUCOIN-DB] Also persist to DB so dashboard's
+                        # _query() can see this data immediately.  Previously
+                        # bulk_load() was memory-only and the dashboard showed
+                        # "NO CANDLES" until CI-2 REST completed its first sweep.
+                        if candles:
+                            try:
+                                await self.db.upsert_candles(candles)
+                            except Exception as _db_exc:
+                                log.warning(
+                                    "KuCoin backfill DB upsert %s %s: %s",
+                                    sym, tf, _db_exc,
+                                )
                         log.info("Backfill %s %s: %d candles", sym, tf, len(candles))
                     except Exception as exc:
                         log.warning("KuCoin backfill %s %s: %s", sym, tf, exc)
                     await asyncio.sleep(0.15)
-        # [TASK-4] Per-symbol exception isolation: a failure rebuilding aggregated
-        # candles for one instrument must never block the remaining symbols.
         for sym in self.symbols:
             try:
                 await self._rebuild_aggregated(f"{sym}-USDT")
             except Exception as exc:
                 log.error(
-                    "[TASK-4] _rebuild_aggregated failed for %s — skipping, "
-                    "bot continues: %s", sym, exc,
+                    "[TASK-4] _rebuild_aggregated failed for %s — skipping: %s", sym, exc,
                 )
 
     # ── Startup ────────────────────────────────────────────────────────────────
@@ -2456,8 +3565,6 @@ class DataHub:
     async def start(self) -> None:
         await self.cache.connect()
         await self.instrument_cache.warm(self.symbols, include_swap=True)
-        # [P36.1-PRICEGUARD] Populate initial buyLmt / sellLmt price bands
-        # at startup so the Price Limit Guard has data on the very first order.
         try:
             await self.instrument_cache.refresh_price_limits(
                 self.symbols, include_swap=True,
@@ -2468,8 +3575,7 @@ class DataHub:
             )
         except Exception as _pl_exc:
             log.warning(
-                "[P36.1-PRICEGUARD] Initial price limit load failed "
-                "(non-fatal — limits will be fetched on first refresh cycle): %s",
+                "[P36.1-PRICEGUARD] Initial price limit load failed (non-fatal): %s",
                 _pl_exc,
             )
         await self._backfill_kucoin()
@@ -2501,18 +3607,29 @@ class DataHub:
         except Exception as exc:
             log.warning("Initial account REST failed: %s. Relying on WS push.", exc)
 
-        # [P15] Initialise Coinbase Oracle and GlobalTapeAggregator
         from arbitrator import CoinbaseOracle, GlobalTapeAggregator, Arbitrator
 
         oracle = CoinbaseOracle(symbols=self.symbols)
-        await oracle.start()
-        self._oracle_task = asyncio.create_task(
-            oracle.run(), name="p15_coinbase_oracle",
-        )
+        # [FIX-DUAL-ORACLE] Store oracle but do NOT call oracle.start() here.
+        # main() wires the whale callback and starts the oracle AFTER hub.start()
+        # returns.  Previously DataHub.start() called oracle.start() AND main()
+        # called it again → double WebSocket connection on the same object.
+        self._oracle_task = None   # will be set by main() after oracle.start()
         self.oracle = oracle
 
         _stub_arb = Arbitrator(symbols=self.symbols)
         self.global_tape = GlobalTapeAggregator(oracle=oracle, arbitrator=_stub_arb)
+
+        # ── [P42-SHADOW] Start the Global Market Sentinel ─────────────────────
+        try:
+            await self.p42_sentinel.start()
+            log.info("[P42-SHADOW] GlobalMarketSentinel armed. SPY/DXY macro veto active.")
+        except Exception as _p42_start_exc:
+            log.warning(
+                "[P42-SHADOW] GlobalMarketSentinel start failed (non-fatal — "
+                "macro veto disabled until next restart): %s", _p42_start_exc,
+            )
+        # ── [/P42-SHADOW] ─────────────────────────────────────────────────────
 
         log.info(
             "DataHub live. demo=%s symbols=%s "
@@ -2521,40 +3638,42 @@ class DataHub:
             "started", self.cb_creds.is_valid(),
         )
 
-        # [FIX-INSTRUMENT-CACHE] Schedule a background task that refreshes the
-        # InstrumentCache every 24 hours so exchange-side changes to minSz /
-        # tickSize are picked up without restarting the bot.
         asyncio.create_task(
             self._instrument_cache_refresh_loop(),
             name="instrument_cache_refresh",
         )
 
+        # ── [TRACK12-PRUNE] On-boot prune + periodic prune loop ───────────────
+        # One immediate prune on startup clears any existing backlog accumulated
+        # before Track 12 was deployed, without waiting for the first loop tick.
+        # Wrapped in try/except so a prune failure can never abort startup.
+        try:
+            _boot_deleted = await self.db.prune_decision_trace(DT_RETAIN_DAYS)
+            log.info(
+                "[TRACK12-PRUNE] Boot prune: deleted %d decision_trace row(s) "
+                "older than %d day(s).",
+                _boot_deleted, DT_RETAIN_DAYS,
+            )
+        except Exception as _boot_prune_exc:
+            log.warning(
+                "[TRACK12-PRUNE] Boot prune failed (non-fatal): %s",
+                _boot_prune_exc,
+            )
+        asyncio.create_task(
+            self._dt_prune_loop(),
+            name="dt_prune_loop",
+        )
+        # ── [/TRACK12-PRUNE] ──────────────────────────────────────────────────
+
     async def _instrument_cache_refresh_loop(
         self,
-        interval_secs: float = 86_400.0,  # 24 hours (overridden by demo mode below)
+        interval_secs: float = 86_400.0,
     ) -> None:
-        """
-        [FIX-INSTRUMENT-CACHE] Background task that refreshes SPOT and SWAP
-        instrument metadata from OKX every 24 hours (or 30 minutes in demo mode).
-
-        Exchange-side changes to minSz, lotSz, or tickSize are reflected
-        automatically without requiring a bot restart.  A short initial delay
-        skips the first refresh (warm() is called during start()).
-
-        [P36.1-PRICEGUARD] Also refreshes buyLmt / sellLmt price bands every
-        cycle so the executor's Price Limit Guard has fresh data.
-
-        Demo-Mode Refresh:
-            OKX_DEMO_MODE == "1" → interval forced to 1800 s (30 minutes).
-            In demo trading the price bands update far more frequently than in
-            production and stale limits cause a spike in sCode 51006 rejections.
-        """
-        # [P36.1-PRICEGUARD] In demo mode, refresh far more often so price
-        # limits stay accurate and sCode 51006 rejections are minimised.
+        """[FIX-INSTRUMENT-CACHE] Refresh SPOT and SWAP instrument metadata periodically."""
         if OKX_DEMO_MODE:
-            interval_secs = 1_800.0  # 30 minutes
+            interval_secs = 1_800.0
             log.info(
-                "[FIX-INSTRUMENT-CACHE] Demo mode detected — "
+                "[FIX-INSTRUMENT-CACHE] Demo mode — "
                 "InstrumentCache + price-limit refresh interval set to 30 min (1800 s)."
             )
         else:
@@ -2565,35 +3684,69 @@ class DataHub:
         while True:
             await asyncio.sleep(interval_secs)
             try:
-                log.info(
-                    "[FIX-INSTRUMENT-CACHE] Refreshing InstrumentCache "
-                    "(SPOT + SWAP) …"
-                )
-                # Force re-fetch by clearing the TTL timestamps so _fetch()
-                # does not short-circuit.
+                log.info("[FIX-INSTRUMENT-CACHE] Refreshing InstrumentCache (SPOT + SWAP)…")
                 async with self.instrument_cache._lock:
                     self.instrument_cache._fetched_at.clear()
                 await self.instrument_cache.warm(self.symbols, include_swap=True)
                 log.info(
-                    "[FIX-INSTRUMENT-CACHE] InstrumentCache refreshed OK — "
-                    "%d instruments cached.",
+                    "[FIX-INSTRUMENT-CACHE] InstrumentCache refreshed OK — %d instruments cached.",
                     len(self.instrument_cache._cache),
                 )
-                # [P36.1-PRICEGUARD] Also refresh buyLmt / sellLmt price bands
-                # so the Price Limit Guard has fresh data for every cycle.
                 await self.instrument_cache.refresh_price_limits(
                     self.symbols, include_swap=True,
                 )
             except asyncio.CancelledError:
-                log.info(
-                    "[FIX-INSTRUMENT-CACHE] InstrumentCache refresh loop cancelled."
-                )
+                log.info("[FIX-INSTRUMENT-CACHE] InstrumentCache refresh loop cancelled.")
                 return
             except Exception as exc:
                 log.error(
                     "[FIX-INSTRUMENT-CACHE] InstrumentCache refresh failed: %s "
                     "(will retry in %.0fs).",
                     exc, interval_secs,
+                )
+
+    async def _dt_prune_loop(self) -> None:
+        """[TRACK12-PRUNE] Periodic background pruning of old decision_trace rows.
+
+        Sleeps for DT_PRUNE_INTERVAL_SECS (default 6 h), then calls
+        db.prune_decision_trace(DT_RETAIN_DAYS).  Runs indefinitely until the
+        task is cancelled (clean shutdown).
+
+        Design constraints:
+          - All exceptions except CancelledError are caught and logged at
+            WARNING so the loop continues on the next interval.
+          - CancelledError is re-raised so asyncio task cancellation (on
+            DataHub.close()) propagates correctly.
+          - The loop never calls prune_decision_trace directly — it delegates
+            entirely to the fail-open Database method, so no DB exception can
+            ever escape this loop.
+        """
+        log.info(
+            "[TRACK12-PRUNE] dt_prune_loop started "
+            "(interval=%ds, retain=%dd).",
+            DT_PRUNE_INTERVAL_SECS, DT_RETAIN_DAYS,
+        )
+        while True:
+            try:
+                await asyncio.sleep(DT_PRUNE_INTERVAL_SECS)
+            except asyncio.CancelledError:
+                log.info("[TRACK12-PRUNE] dt_prune_loop cancelled.")
+                return
+            try:
+                _deleted = await self.db.prune_decision_trace(DT_RETAIN_DAYS)
+                log.info(
+                    "[TRACK12-PRUNE] Periodic prune: deleted %d decision_trace "
+                    "row(s) older than %d day(s).",
+                    _deleted, DT_RETAIN_DAYS,
+                )
+            except asyncio.CancelledError:
+                log.info("[TRACK12-PRUNE] dt_prune_loop cancelled during prune.")
+                return
+            except Exception as _exc:
+                log.warning(
+                    "[TRACK12-PRUNE] dt_prune_loop: unexpected error "
+                    "(will retry in %ds): %s",
+                    DT_PRUNE_INTERVAL_SECS, _exc,
                 )
 
     async def close(self) -> None:

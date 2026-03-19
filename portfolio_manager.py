@@ -44,6 +44,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 log = logging.getLogger("portfolio_manager")
+logging.getLogger("portfolio_manager").addHandler(logging.NullHandler())
+from pt_utils import _env_float, _env_int, atomic_write_json  # [P0-UTIL]
+
+# [P0-FIX-11] env helpers → pt_utils
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [SANITIZER] Institutional Environment Sanitizer
@@ -51,45 +55,37 @@ log = logging.getLogger("portfolio_manager")
 # portfolio_manager is a standalone importable module.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _clean_env(raw: str) -> str:
-    """
-    Strip leading/trailing whitespace and literal single/double quote characters
-    from .env values.  Prevents the OKX_PASSPHRASE="$Khalil21z" dollar-sign
-    passphrase from being confused with a quoted symbol like "BTC-USDT-SWAP".
-    Only surrounding quote characters are removed; the content is preserved.
-    """
-    return raw.strip().strip("'\"").strip()
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-CORR_LOOKBACK_CANDLES   = int  (os.environ.get("P10_CORR_LOOKBACK",         "168"))
-CORR_UPDATE_INTERVAL    = float(os.environ.get("P10_CORR_UPDATE_SECS",      "300.0"))
-MAX_CORR_PENALTY        = float(os.environ.get("P10_MAX_CORR_PENALTY",      "0.60"))
-MIN_CORR_ALLOC_FRAC     = float(os.environ.get("P10_MIN_CORR_ALLOC_FRAC",   "0.40"))
-CORR_HIGH_THRESHOLD     = float(os.environ.get("P10_CORR_HIGH_THRESHOLD",   "0.75"))
+CORR_LOOKBACK_CANDLES   = _env_int("P10_CORR_LOOKBACK", 168)
+CORR_UPDATE_INTERVAL    = _env_float("P10_CORR_UPDATE_SECS", 300.0)
+MAX_CORR_PENALTY        = _env_float("P10_MAX_CORR_PENALTY", 0.6)
+MIN_CORR_ALLOC_FRAC     = _env_float("P10_MIN_CORR_ALLOC_FRAC", 0.4)
+CORR_HIGH_THRESHOLD     = _env_float("P10_CORR_HIGH_THRESHOLD", 0.75)
 
-REBAL_DRIFT_PCT         = float(os.environ.get("P10_REBAL_DRIFT_PCT",       "5.0"))
-REBAL_COOLDOWN_SECS     = float(os.environ.get("P10_REBAL_COOLDOWN_SECS",   "600.0"))
-REBAL_HARVEST_FRAC      = float(os.environ.get("P10_REBAL_HARVEST_FRAC",    "0.30"))
+REBAL_DRIFT_PCT         = _env_float("P10_REBAL_DRIFT_PCT", 5.0)
+REBAL_COOLDOWN_SECS     = _env_float("P10_REBAL_COOLDOWN_SECS", 600.0)
+REBAL_HARVEST_FRAC      = _env_float("P10_REBAL_HARVEST_FRAC", 0.3)
 
-DELTA_LONG_THRESHOLD    = float(os.environ.get("P10_DELTA_LONG_THRESHOLD",  "0.80"))
-DELTA_SHORT_THRESHOLD   = float(os.environ.get("P10_DELTA_SHORT_THRESHOLD", "-0.80"))
-DELTA_TARGET_PCT        = float(os.environ.get("P10_DELTA_TARGET_PCT",      "0.20"))
+DELTA_LONG_THRESHOLD    = _env_float("P10_DELTA_LONG_THRESHOLD", 0.8)
+DELTA_SHORT_THRESHOLD   = _env_float("P10_DELTA_SHORT_THRESHOLD", -0.8)
+DELTA_TARGET_PCT        = _env_float("P10_DELTA_TARGET_PCT", 0.2)
 DELTA_HEDGE_SYMBOL      = os.environ.get("P10_DELTA_HEDGE_SYMBOL",          "BTC")
-DELTA_CLOSE_THRESHOLD   = float(os.environ.get("P10_DELTA_CLOSE_THRESHOLD", "0.35"))
-DELTA_MIN_HEDGE_USD     = float(os.environ.get("P10_DELTA_MIN_HEDGE_USD",   "20.0"))
-DELTA_COOLDOWN_SECS     = float(os.environ.get("P10_DELTA_COOLDOWN_SECS",   "120.0"))
+DELTA_CLOSE_THRESHOLD   = _env_float("P10_DELTA_CLOSE_THRESHOLD", 0.35)
+DELTA_MIN_HEDGE_USD     = _env_float("P10_DELTA_MIN_HEDGE_USD", 20.0)
+DELTA_COOLDOWN_SECS     = _env_float("P10_DELTA_COOLDOWN_SECS", 120.0)
 
-REGIME_VOL_WINDOW       = int  (os.environ.get("P10_REGIME_VOL_WINDOW",     "14"))
-REGIME_ADX_WINDOW       = int  (os.environ.get("P10_REGIME_ADX_WINDOW",     "14"))
-REGIME_VOL_THRESHOLD    = float(os.environ.get("P10_REGIME_VOL_THRESHOLD",  "0.60"))
-REGIME_TREND_THRESHOLD  = float(os.environ.get("P10_REGIME_TREND_THRESHOLD","0.55"))
-REGIME_UPDATE_INTERVAL  = float(os.environ.get("P10_REGIME_UPDATE_SECS",    "60.0"))
+REGIME_VOL_WINDOW       = _env_int("P10_REGIME_VOL_WINDOW", 14)
+REGIME_ADX_WINDOW       = _env_int("P10_REGIME_ADX_WINDOW", 14)
+REGIME_VOL_THRESHOLD    = _env_float("P10_REGIME_VOL_THRESHOLD", 0.6)
+REGIME_TREND_THRESHOLD  = _env_float("P10_REGIME_TREND_THRESHOLD", 0.55)
+REGIME_UPDATE_INTERVAL  = _env_float("P10_REGIME_UPDATE_SECS", 60.0)
 
-BEARISH_SCORE_THRESHOLD = float(os.environ.get("NEWS_BEARISH_BLOCK_THRESHOLD", "-0.5"))
+BEARISH_SCORE_THRESHOLD = _env_float("NEWS_BEARISH_BLOCK_THRESHOLD", -0.5)
 
 # ── [P23-OPT-2] Small-account pivot config ────────────────────────────────────
-P23_SMALL_ACCT_THRESHOLD  = float(os.environ.get("P23_SMALL_ACCT_THRESHOLD",  "100.0"))
+P23_SMALL_ACCT_THRESHOLD  = _env_float("P23_SMALL_ACCT_THRESHOLD", 100.0)
 P23_SMALL_PIVOT_SYMS: List[str] = [
     s.strip().upper()
     for s in os.environ.get("P23_SMALL_PIVOT_SYMS", "XRP,DOGE").split(",")
@@ -97,27 +93,27 @@ P23_SMALL_PIVOT_SYMS: List[str] = [
 ]
 # Minimum USD allocation that is considered viable for a SWAP contract.
 # BTC/ETH require ~$5+ per contract; XRP/DOGE are a few cents.
-P23_MIN_VIABLE_ALLOC_USD  = float(os.environ.get("P23_MIN_VIABLE_ALLOC_USD",  "2.0"))
+P23_MIN_VIABLE_ALLOC_USD  = _env_float("P23_MIN_VIABLE_ALLOC_USD", 2.0)
 
 # ── [P35.1] Dynamic Delta-Neutral Hedging Engine ───────────────────────────────
 # Minimum absolute net Altcoin exposure (USD) before a BTC-SWAP hedge is opened.
-P35_HEDGE_THRESHOLD_USD   = float(os.environ.get("P35_HEDGE_THRESHOLD_USD",   "500.0"))
+P35_HEDGE_THRESHOLD_USD   = _env_float("P35_HEDGE_THRESHOLD_USD", 500.0)
 # Hedge size as a fraction of net Altcoin exposure.  1.0 = fully delta-neutral.
-P35_HEDGE_RATIO           = float(os.environ.get("P35_HEDGE_RATIO",           "1.0"))
+P35_HEDGE_RATIO           = _env_float("P35_HEDGE_RATIO", 1.0)
 # Minimum change (USD) in required hedge size before the hedge is rebalanced.
 # Prevents fee-wasting micro-adjustments.
-P35_MIN_HEDGE_CHANGE_USD  = float(os.environ.get("P35_MIN_HEDGE_CHANGE_USD",  "50.0"))
+P35_MIN_HEDGE_CHANGE_USD  = _env_float("P35_MIN_HEDGE_CHANGE_USD", 50.0)
 # Instrument used for the hedge leg — _clean_env strips literal quotes from .env
 # (e.g. P35_HEDGE_SYMBOL="BTC-USDT-SWAP"  →  BTC-USDT-SWAP).
 _p35_hedge_sym_raw        = os.environ.get("P35_HEDGE_SYMBOL", "BTC")
-P35_HEDGE_SYMBOL          = _clean_env(_p35_hedge_sym_raw) or "BTC"
+P35_HEDGE_SYMBOL          = _p35_hedge_sym_raw.strip().strip("'\" ").strip() or "BTC"
 if P35_HEDGE_SYMBOL != _p35_hedge_sym_raw.strip():
     log.warning(
         "[ENV-WARN] P35_HEDGE_SYMBOL contained surrounding quotes — "
         "sanitized to '%s'", P35_HEDGE_SYMBOL,
     )
 # Seconds between hedge evaluation cycles.
-P35_HEDGE_POLL_SECS       = float(os.environ.get("P35_HEDGE_POLL_SECS",       "60.0"))
+P35_HEDGE_POLL_SECS       = _env_float("P35_HEDGE_POLL_SECS", 60.0)
 # Base symbols explicitly excluded from the net-delta calculation.
 # The hedge instrument itself is always excluded regardless of this list.
 P35_EXCLUDE_SYMBOLS: List[str] = [
@@ -529,8 +525,8 @@ class PortfolioGovernor:
                 try:
                     pos_data = (self._exec._status.get("positions") or {}).get(sym, {})
                     conf = float(pos_data.get("signal_conf", 0.5))
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    log.warning("[PM] suppressed: %s", _exc)
 
                 conf_adj_w  = base_w * (0.5 + conf)
                 target_w    = conf_adj_w
@@ -1036,7 +1032,7 @@ class PortfolioGovernor:
         5. If the net delta has fallen below P35_HEDGE_THRESHOLD_USD, close
            any active hedge.
 
-        [P36.1-GUARD] hedge_symbol is loaded at module-level via _clean_env()
+        [P36.1-GUARD] hedge_symbol is loaded at module-level (quote-stripped from .env)
         so literal quote characters from .env files (e.g. P35_HEDGE_SYMBOL="BTC")
         can never reach the OKX order placement layer.
         """

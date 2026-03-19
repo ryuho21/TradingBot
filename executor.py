@@ -8,6 +8,164 @@ executor.py  —  Phase 40.3 OKX Execution Gateway
                          retained_equity (Binary Truth anchor).
 [ANALYTICS-NULL-SHIELD]  analytics and symbols always (data or {}) at construction.
 [READY-GATE-TIMEOUT]     _cycle() wraps _p40_ready_gate.wait() in 30s timeout.
+[FIX-SINGLE-WRITER]      executor._write_status_json() (cycle-end) is now the sole
+                         writer of trader_status.json.  The redundant start-of-cycle
+                         file write in _publish_status() has been removed.  _cycle()
+                         preserves supervisor-enriched keys across its self._status
+                         dict replacement via _SUPERVISOR_CARRY_KEYS / _carried_supervisor.
+                         engine_supervisor._gui_bridge() no longer writes the file;
+                         it merges into executor._status instead.
+                         _touch_hub_timestamp() and _on_bridge_ghost_healed() no longer
+                         write the file; they mutate self._status in-memory only.
+
+CHANGELOG — POST-ROADMAP TRACK 17: DCA / EXIT-PATH DECISION-TRACE EXPANSION
+═══════════════════════════════════════════════════════════════════════════════
+[TRACK17-EXIT]   _record_close(): after the log.info("CLOSE ...") line, a
+               fail-open try/except block emits one decision_trace record per
+               completed close via _append_decision_trace (JSON tail) and
+               asyncio.ensure_future(db.insert_decision_trace()) (DB).
+               Record shape reuses the standard schema:
+                 outcome     = "CLOSED"
+                 gate_name   = exit_reason.value   (e.g. "STRATEGY_TRAIL")
+                 regime      = exit_cat.value       (e.g. "STRATEGY", "RISK")
+                 source_path = "close"
+                 sizing_usd  = pos.usd_cost         (notional being closed)
+                 pnl_pct     = round(pnl_pct, 4)    (Track-17 new column)
+                 hold_time_secs = _hold_time_secs   (Track-17 new column)
+               Entry-signal fields (confidence, z_score, kelly_f) are taken
+               from the same _entry_confidence / _entry_z_score / _entry_kelly_f
+               locals already computed above the write.  None → 0.0.
+               No close logic altered.  No await on critical path.
+
+[TRACK17-DCA]    _maybe_dca(): after pos.dca_stages += 1 (successful add), a
+               fail-open try/except block emits one decision_trace record via
+               the same _append_decision_trace + asyncio.ensure_future pattern.
+               Record shape:
+                 outcome     = "DCA"
+                 gate_name   = f"DCA_{pos.dca_stages}"
+                 regime      = "dca"
+                 source_path = "dca"
+                 sizing_usd  = round(dca_usd, 2)
+                 pnl_pct     = None
+                 hold_time_secs = None
+               No DCA logic altered.  No await on critical path.
+
+CHANGELOG — POST-ROADMAP TRACK 16: DECISION-TRACE EXPANSION (EXPRESS PATH)
+═══════════════════════════════════════════════════════════════════════════════
+[TRACK16-ENTRY-SRC]  _maybe_enter(): "source_path": "entry" added to _dt_base.
+               Flows into all existing _dt() calls via {**_dt_base, ...}.
+               No other change to _maybe_enter logic or its _dt() call sites.
+
+[TRACK16-EXPRESS-DT] trigger_atomic_express_trade():
+               _express_dt_ts captured immediately after symbol/direction/mult
+               are resolved, before any early return.
+               _express_dt_base built with source_path="express", regime="express",
+               oracle_boosted=True, confidence/z_score/kelly_f=0.0 (no Signal).
+               _express_dt_llm_verdict / _express_dt_p32 local state vars track
+               LLM and VetoArb results as they are computed.
+               _express_dt() local closure mirrors the _dt() pattern from
+               _maybe_enter: calls _append_decision_trace (JSON tail) and
+               asyncio.ensure_future(db.insert_decision_trace()) (DB).
+               All writes are fail-open and observational only — no express
+               path exit or admission decision is altered.
+
+               Instrumented exit points:
+                 ZOMBIE, DRAWDOWN_KILLED, CIRCUIT_BREAKER, VOL_GUARD
+                 SYMBOL_NOT_TRACKED, MACRO_FLOOR, EXPRESS_DEDUPE
+                 LLM_CATASTROPHE, VETO_ARB, ALREADY_OPEN
+                 CONCURRENT_CAP / DEPLOYED_CAP / other admission gates
+                 ADMITTED (fill confirmed, sizing_usd populated)
+
+               Execution-plumbing returns (metadata absent, quantize fail,
+               fill timeout) are NOT instrumented — those are transient
+               execution failures, not admission-level decisions.
+
+CHANGELOG — POST-ROADMAP TRACK 15: OPERATOR-FACING CONTROL REFINEMENT
+═══════════════════════════════════════════════════════════════════════════
+[TRACK15-BOOT] async def run() startup block: two new [TRACK14-GATE] log.info
+               pairs appended after the existing [/PHASE14] boot-visibility
+               block.  CONCURRENT_CAP and DEPLOYED_CAP now log ENABLED/DISABLED
+               state at startup, matching the Phase 7/8/9 gate-visibility
+               pattern.  No gate logic changed.
+
+[TRACK15-SRC]  CoinPerf dataclass gains override_source: Optional[str] = None.
+               record() sets override_source = "auto" when autotune engine
+               engages an override.  set_override() sets override_source =
+               "manual" when operator Score Feedback Controls apply an override.
+               reset_override() clears override_source = None.
+               autotune_state status snapshot gains a "source" key per symbol.
+               Dashboard reads this for the Section 6 SOURCE column.
+               No override behavior changed.
+
+CHANGELOG — POST-ROADMAP TRACK 31: REGIME / DIRECTION WRITEBACK REFINEMENT
+═══════════════════════════════════════════════════════════════════════════
+[TRACK31-RR1] Two new control-queue event handlers added to the _drain_
+               control_queue dispatch block in _cycle(), immediately after
+               the existing [/TRACK07] close comment.
+
+               "reset_regime_weight" — reads "regime" from the event dict,
+               validates it is one of ("bull", "bear", "chop"), and dispatches
+               asyncio.create_task(self.brain.reset_regime_weight(regime)).
+               Unknown regime values are ignored with a WARNING log.
+
+               "reset_all_regime_weights" — dispatches
+               asyncio.create_task(self.brain.reset_all_weights()).
+
+               Both delegates exist on IntelligenceEngine already ([P6-RL]):
+                 reset_regime_weight(regime) → _rl_table.reset_regime(regime)
+                 reset_all_weights()         → _rl_table.reset_all()
+               No changes to brain.py, RegimeWeightTable, or RL learning math.
+
+               The RL state snapshot published via status["rl_regime_weights"]
+               each cycle will reflect the reset on the next status refresh.
+               No schema changes.  No DB writes.  No new methods.
+
+CHANGELOG — POST-ROADMAP TRACK 27: ADVANCED PORTFOLIO / EXPOSURE REFINEMENT
+═══════════════════════════════════════════════════════════════════════════
+[TRACK27-PSC1] ADMISSION_MAX_PER_SYMBOL_USD (float, env var, default 0.0 =
+               DISABLED).  When > 0.0, a new PER_SYMBOL_CAP gate fires inside
+               _admission_gate() (Check 1c — after DEPLOYED_CAP, before
+               SYMBOL_BLOCKED).  Blocks if the existing open position for the
+               entry symbol has a cost-basis (usd_cost) >= threshold.  Uses
+               self.positions[symbol].usd_cost — the same cost-basis field
+               maintained by _open_long / DCA.  Fails OPEN on any arithmetic
+               error (try/except, log at debug) so a corrupt usd_cost can never
+               silently suppress valid entries.  Gate is a no-op when the symbol
+               has no open position (no position means no accumulation to cap).
+               Returns AdmissionResult(gate_name="PER_SYMBOL_CAP").  No
+               behavioral change at default 0.0.
+               admission_policy snapshot extended with two new read-only fields:
+                 max_per_symbol_usd    : float — gate threshold (0.0 = disabled)
+                 current_per_symbol_usd: dict[symbol → float] — per-symbol
+                                         cost-basis for all open positions.
+               Startup log announces ENABLED/DISABLED matching TRACK14-GATE
+               pattern.  Dashboard reads max_per_symbol_usd and
+               current_per_symbol_usd for gate-visibility footnote.
+
+CHANGELOG — POST-ROADMAP TRACK 14: BETTER ALLOCATION / EXPOSURE CONTROL
+═══════════════════════════════════════════════════════════════════════════
+[TRACK14-GC1]  ADMISSION_MAX_OPEN_POSITIONS (int, env var, default 0 = DISABLED).
+               When > 0, a new CONCURRENT_CAP gate fires inside _admission_gate()
+               before any async I/O (Check 1a — after IN_FLIGHT, before
+               SYMBOL_BLOCKED).  Blocks if len(self.positions) >= threshold.
+               Single O(1) dict-len check.  Fails closed on the symbol; all other
+               symbols are unaffected.  Returns AdmissionResult(gate_name=
+               "CONCURRENT_CAP") which _maybe_enter() logs via the existing _dt()
+               decision-trace path.  No behavioral change at default 0.
+[TRACK14-GC2]  ADMISSION_MAX_DEPLOYED_PCT (float 0.0–1.0, env var, default 0.0 =
+               DISABLED).  When > 0.0, a new DEPLOYED_CAP gate fires inside
+               _admission_gate() (Check 1b — after CONCURRENT_CAP, before
+               SYMBOL_BLOCKED).  Blocks if sum(p.usd_cost)/self._equity >=
+               threshold.  Fails OPEN (never blocks) when self._equity <= 0 to
+               avoid false suppression during ghost-equity states.  Any position
+               with missing/malformed usd_cost is treated as 0.0 per-position —
+               the gate never raises or blocks due to partial data.  Returns
+               AdmissionResult(gate_name="DEPLOYED_CAP").  No behavioral change
+               at default 0.0.
+[TRACK14-AP]   admission_policy status snapshot enriched with six new read-only
+               fields: max_open_positions, max_deployed_pct (gate config) and
+               current_open_positions, current_deployed_usd, current_deployed_pct
+               (live state).  Dashboard reads these for gate-visibility footnote.
 """
 import asyncio
 import csv
@@ -40,14 +198,19 @@ try:
         BridgeNotConnectedError,
         BridgeOrderError,
         BridgeTimeoutError,
+        P49_ENABLE,          # [BUG-1-FIX] needed by _p48_send() P49 enrichment branch
+        P51_ENABLE as _P51_ENABLE_BRIDGE,  # [P51] used by _p51_twap/iceberg_via_bridge()
     )
     _BRIDGE_AVAILABLE = True
 except ImportError:
     _BRIDGE_AVAILABLE = False
     BridgeClient = None  # type: ignore[assignment,misc]
+    P49_ENABLE         = False  # safe fallback: disables enrichment when bridge module absent
+    _P51_ENABLE_BRIDGE = False  # safe fallback
 # ── [/P40] ────────────────────────────────────────────────────────────────────
 
-from brain import IntelligenceEngine, Signal, MAX_ALLOC_PCT, mtf_align_filter
+from brain import (IntelligenceEngine, Signal, MAX_ALLOC_PCT, mtf_align_filter,
+                   RL_LEARN_RATE, RL_MAX_MULT, RL_MIN_MULT, RL_MIN_TRADES)
 from data_hub import (
     AccountSnapshot, Candle, DataHub,
     InstrumentCache, InstrumentMeta, OrderBook, SentimentSnapshot, Tick,
@@ -55,82 +218,26 @@ from data_hub import (
 from arbitrator import OracleSignal, ORACLE_WHALE_BUY, ORACLE_WHALE_SELL
 from intelligence_layer import LLMContextVeto, NarrativeResult, VetoArbitrator   # [P17/P18/P20/P32]
 
-# Ensure the hub_data directory exists
-hub_path = os.path.join(os.path.dirname(__file__), "hub_data")
-if not os.path.exists(hub_path):
-    os.makedirs(hub_path)
-    print(f"Created missing directory: {hub_path}")
+# [PHASE1] Canonical trade lifecycle models
+from trade_models import (
+    AdmissionResult,
+    ExitReason, ExitReasonCategory, exit_reason_category,
+    tag_to_exit_reason,
+)
+
+# [P0-UTIL] Canonical env helpers and atomic write — pt_utils is the single source of truth.
+# Local duplicate helpers (_env_float, _env_int, _safe_float_env) have been removed.
+# All call sites use the pt_utils versions which already handle quote-stripping.
+from pt_utils import _env_float, _env_int, atomic_write_json, atomic_write_json_async
 
 log = logging.getLogger("executor")
 
-def _env_float(key: str, default: float) -> float:
-    """Parse float env var safely (falls back to default on missing/bad values)."""
-    raw = os.environ.get(key, "")
-    if raw is None or str(raw).strip() == "":
-        return float(default)
-    try:
-        return float(raw)
-    except Exception:
-        try:
-            log.warning("Invalid float env %s=%r; using default=%s", key, raw, default)
-        except Exception:
-            pass
-        return float(default)
-
-def _env_int(key: str, default: int) -> int:
-    """Parse int env var safely (falls back to default on missing/bad values)."""
-    raw = os.environ.get(key, "")
-    if raw is None or str(raw).strip() == "":
-        return int(default)
-    try:
-        return int(float(raw))
-    except Exception:
-        try:
-            log.warning("Invalid int env %s=%r; using default=%s", key, raw, default)
-        except Exception:
-            pass
-        return int(default)
-
-# Attach file handler to executor logger
-_log_file_handler = logging.FileHandler("executor.log", mode="a", encoding="utf-8")
-_log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
-log.addHandler(_log_file_handler)
-
-# [SANITIZER] Institutional Environment Sanitizer
-# Must be defined BEFORE any env-var constants so every loader below can use it.
-
+# [SANITIZER] String sanitizer — strips surrounding quotes from .env symbol values.
+# This is a pure string utility (not an env float/int parser) and is intentionally
+# kept local because pt_utils does not expose a symbol-string sanitizer.
+# Example: P35_HEDGE_SYMBOL="BTC-USDT-SWAP"  →  BTC-USDT-SWAP
 def _clean_env(raw: str) -> str:
-    """
-    Strip leading/trailing whitespace and literal single/double quote characters
-    that survive from .env files where values are wrapped in quotes, e.g.:
-        OKX_PASSPHRASE="$Khalil21z"  →  $Khalil21z      (passphrase preserved)
-        P35_HEDGE_SYMBOL="BTC-USDT-SWAP"  →  BTC-USDT-SWAP
-    The passphrase dollar-sign is intentionally kept; only the surrounding quote
-    characters are removed.
-    """
     return raw.strip().strip("'\"").strip()
-
-def _safe_float_env(key: str, default: float) -> float:
-    """
-    Defensive float loader: strips literal quotes introduced by .env parsers,
-    warns on missing/invalid keys, and always returns a valid float so a bad
-    .env line can never crash the module at import time.
-    """
-    _raw = os.environ.get(key, "")
-    _raw = _clean_env(_raw)
-    if not _raw:
-        log.warning(
-            "[ENV-WARN] %s not set — using safe default %.4f", key, default
-        )
-        return default
-    try:
-        return float(_raw)
-    except (ValueError, TypeError):
-        log.warning(
-            "[ENV-WARN] %s='%s' is not a valid float — using safe default %.4f",
-            key, _raw, default,
-        )
-        return default
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 MAX_DRAWDOWN_PCT     = _env_float("MAX_DRAWDOWN_PCT", 15.0)
@@ -159,6 +266,21 @@ TRADER_STATUS_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_data", "trader_status.json"),
 )
 
+# [P32-RESTART / PHASE13] Sidecar for _p32_limit_only_until persistence across restarts.
+# Stored adjacent to trader_status.json in hub_data/ so it survives process restarts.
+# Written atomically via atomic_write_json whenever the dict is mutated; loaded at boot.
+# Default is adjacent to TRADER_STATUS_PATH in hub_data/; not operator-configurable
+# because it is an internal state file, not an operator artifact.
+P32_LIMIT_ONLY_STATE_PATH: str = os.path.join(
+    os.path.dirname(os.path.abspath(
+        os.environ.get(
+            "TRADER_STATUS_PATH",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "hub_data", "trader_status.json"),
+        )
+    )),
+    "p32_limit_only.json",
+)
+
 LIQUIDITY_SLIPPAGE_MAX_PCT   = _env_float("LIQUIDITY_SLIPPAGE_MAX_PCT", 0.1)
 LIQUIDITY_CHASE_MAX_ATTEMPTS = int  (os.environ.get("LIQUIDITY_CHASE_MAX_ATTEMPTS", "5"))
 LIQUIDITY_CHASE_WAIT_SECS    = _env_float("LIQUIDITY_CHASE_WAIT_SECS", 3.0)
@@ -173,6 +295,18 @@ MAX_CONF_OVERRIDE        = _env_float("MAX_CONF_OVERRIDE", 0.90)
 
 HEDGE_TRIM_PCT      = _env_float("HEDGE_TRIM_PCT", 0.50)
 HEDGE_COOLDOWN_SECS = _env_float("HEDGE_COOLDOWN_SECS", 300.0)
+
+# [PHASE14] HEDGE_TRIM_MIN_HOLD_SECS — minimum position age in seconds before a
+# position may be selected for hedge trimming due to high cross-symbol correlation.
+# Default: 0.0 = DISABLED (no hold guard; existing behaviour is fully preserved).
+#
+# When > 0, any position younger than this value is skipped by _hedge_trim_smallest.
+# If ALL open positions are younger than the threshold, the trim is deferred entirely
+# (the cooldown is NOT consumed so the guard naturally retries on the next cycle).
+#
+# Set to e.g. 120 to prevent a freshly-entered position from being immediately
+# closed by a correlation-freeze event that was already present at entry time.
+HEDGE_TRIM_MIN_HOLD_SECS: float = _env_float("HEDGE_TRIM_MIN_HOLD_SECS", 0.0)
 
 WALL_DEPTH_PCT       = _env_float("WALL_DEPTH_PCT", 0.2)
 WALL_RATIO_THRESHOLD = _env_float("WALL_RATIO_THRESHOLD", 5.0)
@@ -259,22 +393,22 @@ if P35_HEDGE_SYMBOL != _p35_hedge_raw.strip():
 # ── [P36.1] Phase 36.1 — Adversarial HFT Mimicry & Active Spoof Detection ────
 # [P36-MIMIC] Reaction window (ms) after placing the mimic order.
 # If the whale wall evaporates within this window, the wall is flagged as Spoof.
-P36_SPOOF_REACTION_MS  = _safe_float_env("P36_SPOOF_REACTION_MS",  400.0)
+P36_SPOOF_REACTION_MS  = _env_float("P36_SPOOF_REACTION_MS",  400.0)
 # [P36-SIGNAL] Spoof probability above which the TWAPSlicer bypasses all limit
 # orders and switches immediately to Aggressive Taker (IOC).
-P36_SPOOF_THRESHOLD    = _safe_float_env("P36_SPOOF_THRESHOLD",    0.65)
+P36_SPOOF_THRESHOLD    = _env_float("P36_SPOOF_THRESHOLD",    0.65)
 # Minimum wall depth ratio (wall_qty / median_depth) for the mimic test to fire.
 # Reuses the P33 iceberg wall ratio to keep detection thresholds consistent.
-P36_MIMIC_WALL_RATIO   = _safe_float_env("P36_MIMIC_WALL_RATIO",   3.0)
+P36_MIMIC_WALL_RATIO   = _env_float("P36_MIMIC_WALL_RATIO",   3.0)
 # Minimum USD value of the suspected wall before firing the mimic test.
-P36_MIMIC_WALL_MIN_USD = _safe_float_env("P36_MIMIC_WALL_MIN_USD", 50000.0)
+P36_MIMIC_WALL_MIN_USD = _env_float("P36_MIMIC_WALL_MIN_USD", 50000.0)
 # Fraction of the wall depth that must disappear within the reaction window
 # for the wall to be classified as a spoof.  Default 0.70 = 70% evaporation.
-P36_SPOOF_EVAPORATION  = _safe_float_env("P36_SPOOF_EVAPORATION",  0.70)
+P36_SPOOF_EVAPORATION  = _env_float("P36_SPOOF_EVAPORATION",  0.70)
 # [P36-ENABLE] Master switch for Adversarial Mimicry (1 = enabled).
 P36_ENABLE_MIMICRY     = os.environ.get("P36_ENABLE_MIMICRY", "1").strip().strip("'\"") == "1"
 # [P36-MIMIC] Minimum USD size of the probe order placed during a mimic test.
-P36_MIMIC_SIZE_USD     = _safe_float_env("P36_MIMIC_SIZE_USD", 5.0)
+P36_MIMIC_SIZE_USD     = _env_float("P36_MIMIC_SIZE_USD", 5.0)
 
 # ── [P36.1-PRICEGUARD] Price Limit Buffer ─────────────────────────────────────
 # 5 basis points buffer added inside the exchange-enforced price bands.
@@ -286,14 +420,14 @@ PRICE_LIMIT_BUFFER = _env_float("PRICE_LIMIT_BUFFER", 0.0005)  # 5 bps
 # ── [P36.2] Phase 36.2 — Dynamic Clamping, Multi-Level Mimicry, Golden Build ──
 # [P36.2-DYNCLAMP] Rolling window (seconds) over which PriceVelocity is measured
 # per symbol to decide whether to apply the high-volatility DynamicBuffer.
-P362_VELOCITY_WINDOW_SECS  = _safe_float_env("P362_VELOCITY_WINDOW_SECS",  10.0)
+P362_VELOCITY_WINDOW_SECS  = _env_float("P362_VELOCITY_WINDOW_SECS",  10.0)
 # [P36.2-DYNCLAMP] If PriceVelocity over the window exceeds this % (0.5 = 0.5%),
 # the DynamicBuffer is doubled to P362_DYNAMIC_BUFFER_HIGH.
-P362_VELOCITY_THRESHOLD_PCT = _safe_float_env("P362_VELOCITY_THRESHOLD_PCT", 0.5)
+P362_VELOCITY_THRESHOLD_PCT = _env_float("P362_VELOCITY_THRESHOLD_PCT", 0.5)
 # [P36.2-DYNCLAMP] High-volatility buffer (10 bps) applied when PriceVelocity
 # exceeds P362_VELOCITY_THRESHOLD_PCT.  Replaces PRICE_LIMIT_BUFFER in all
 # price-guard clamp calls during high-velocity periods.
-P362_DYNAMIC_BUFFER_HIGH   = _safe_float_env("P362_DYNAMIC_BUFFER_HIGH",   0.0010)
+P362_DYNAMIC_BUFFER_HIGH   = _env_float("P362_DYNAMIC_BUFFER_HIGH",   0.0010)
 # [P36.2-GOLDEN] Number of consecutive successful cycles (zero 51006 + zero
 # IndexError) required to generate the GOLDEN_BUILD_REPORT.txt.
 P362_GOLDEN_BUILD_CYCLES   = _env_int("P362_GOLDEN_BUILD_CYCLES", 1000)
@@ -306,19 +440,210 @@ P362_GOLDEN_REPORT_PATH    = os.environ.get(
 # ── [P37] Phase 37 — Predictive Microstructure (VPIN / Flow Toxicity) ─────────
 # [P37-VPIN] CDF-based ToxicityScore threshold above which VetoArbitrator blocks
 # all new entries.  Injected into the VetoArbitrator via set_flow_toxicity().
-P37_TOXICITY_THRESHOLD       = _safe_float_env("P37_TOXICITY_THRESHOLD",       0.80)
+P37_TOXICITY_THRESHOLD       = _env_float("P37_TOXICITY_THRESHOLD",       0.80)
 # [P37-VPIN] ToxicityScore above which an open position triggers an immediate
 # IOC TWAPSlicer emergency exit to protect capital from a "Toxic Flush".
 # Must be strictly higher than P37_TOXICITY_THRESHOLD (0.95 > 0.80 default).
-P37_EMERGENCY_EXIT_TOXICITY  = _safe_float_env("P37_EMERGENCY_EXIT_TOXICITY",  0.95)
+P37_EMERGENCY_EXIT_TOXICITY  = _env_float("P37_EMERGENCY_EXIT_TOXICITY",  0.95)
+
+# P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED — how many consecutive tape-monitor
+#   ticks must show ToxicityScore > P37_EMERGENCY_EXIT_TOXICITY before the
+#   emergency exit fires.  Default: 1 = current behaviour (fires on first spike).
+#
+#   Increasing this to 2 or more mirrors the zombie-mode design
+#   (_P20_ZOMBIE_CONSECUTIVE_REQUIRED) and prevents a single transient VPIN spike
+#   from immediately liquidating a position.  The counter is per-symbol and resets
+#   to zero as soon as toxicity drops back below the threshold.
+#
+#   The guard is DISABLED by default (1 = fire on first reading) so existing live
+#   behaviour is fully preserved unless the operator explicitly enables it.
+P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED: int = max(
+    1, _env_int("P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED", 1)
+)
+
+# P37_EMERGENCY_EXIT_MIN_HOLD_SECS — minimum position age in seconds before the
+#   P37 emergency toxicity exit is permitted to fire.  Default: 0.0 = DISABLED
+#   (no hold guard).
+#
+#   When > 0, a position that was entered fewer than this many seconds ago is
+#   protected from VPIN emergency exits.  This guards against the scenario where
+#   a new entry is immediately forced out by a pre-existing transient toxicity
+#   spike that was already present at entry time.
+#
+#   The guard is DISABLED by default (0.0) so existing live behaviour is fully
+#   preserved unless the operator explicitly enables it.
+P37_EMERGENCY_EXIT_MIN_HOLD_SECS: float = _env_float(
+    "P37_EMERGENCY_EXIT_MIN_HOLD_SECS", 0.0
+)
+
+# ── [PHASE14] P18 CATASTROPHE_VETO Hardening ──────────────────────────────────
+#
+# P18_CATASTROPHE_CONSECUTIVE_REQUIRED — how many consecutive CATASTROPHE_VETO
+#   verdicts from the IntelligenceEngine council for a given symbol must be seen
+#   before nuclear liquidation fires.  Default: 1 = current behaviour (fires on
+#   the first verdict, byte-for-byte identical to Phase 13 baseline).
+#
+#   Increasing this to 2 or more mirrors the P37 VPIN and P20 zombie consecutive-
+#   guard design.  It prevents a single transient LLM low score (stale context,
+#   model quirk, brief headline spike) from immediately liquidating an otherwise
+#   healthy position.  The counter is per-symbol and resets to 0 whenever the
+#   intelligence council returns any verdict OTHER than CATASTROPHE_VETO for that
+#   symbol — so a genuine sustained catastrophe still fires after N readings.
+#
+#   In-memory only: resets to 0 on process restart (fail-open — consistent with
+#   the P37 consecutive-counter design).
+#
+#   The guard is DISABLED by default (1 = fire on first reading) so existing live
+#   behaviour is fully preserved unless the operator explicitly enables it.
+P18_CATASTROPHE_CONSECUTIVE_REQUIRED: int = max(
+    1, _env_int("P18_CATASTROPHE_CONSECUTIVE_REQUIRED", 1)
+)
+
+# P18_CATASTROPHE_MIN_HOLD_SECS — minimum position age in seconds before a
+#   P18 CATASTROPHE_VETO is permitted to liquidate it.  Default: 0.0 = DISABLED
+#   (no hold guard; existing behaviour fully preserved).
+#
+#   When > 0, a position that has been open for fewer than this many seconds is
+#   immune to P18 liquidation, even if the consecutive threshold is met.  This
+#   guards against the scenario where a position opens and an LLM catastrophe
+#   verdict — driven by news already present at entry time — fires before the
+#   position has had any chance to develop.
+#
+#   Mirrors the P37 VPIN hold guard (P37_EMERGENCY_EXIT_MIN_HOLD_SECS) in design.
+#   The guard is DISABLED by default (0.0) so existing live behaviour is fully
+#   preserved unless the operator explicitly enables it.
+P18_CATASTROPHE_MIN_HOLD_SECS: float = _env_float(
+    "P18_CATASTROPHE_MIN_HOLD_SECS", 0.0
+)
+# ── [/PHASE14 P18 constants] ───────────────────────────────────────────────────
+
+# ── [P39] Phase 39 — Ghost Oracle (Coinbase → OKX Lead-Lag Snipe) ─────────────
+# Uses the empirical 5–15 ms lead that Coinbase trade velocity has over the OKX
+# public ticker.  When Coinbase TPS surges in a directionally consistent way, the
+# bot pre-positions a limit order on OKX before OKX's own price feed catches up.
+#
+# Safety gates (ALL must pass before a snipe fires):
+#   0. P39_GHOST_ENABLE master switch
+#   1. Coinbase oracle online and WS connected
+#   2. TPS ≥ P39_GHOST_MIN_TPS (sufficient velocity signal)
+#   3. Coinbase price leads OKX by ≥ 0.5 bps in the signal direction
+#   4. P42 macro gate: SPY 5-min drop < P39_GHOST_SPY_BLOCK_PCT (fail-open on stale data)
+#   5. P37 co-veto: flow toxicity < P39_GHOST_TOXICITY_CEIL
+#   6. Per-symbol cooldown ≥ P39_GHOST_COOLDOWN_SECS
+#
+# [P39-ENABLE] Master switch.
+P39_GHOST_ENABLE         = os.environ.get("P39_GHOST_ENABLE", "1").strip().strip("'\"") == "1"
+# [P39-TPS] Minimum Coinbase trades/second to consider the signal valid.
+P39_GHOST_MIN_TPS        = _env_float("P39_GHOST_MIN_TPS",        8.0)
+# [P39-BURST] TPS at which size_boost reaches its maximum.
+P39_GHOST_BURST_TPS      = _env_float("P39_GHOST_BURST_TPS",     25.0)
+# [P39-COOLDOWN] Minimum seconds between ghost snipe triggers per symbol.
+P39_GHOST_COOLDOWN_SECS  = _env_float("P39_GHOST_COOLDOWN_SECS", 45.0)
+# [P39-CONF] Subtract this from min_conf when ghost snipe is active.
+# Lowers the OKX confidence gate so the snipe fires while the lead-lag window
+# is still open.
+P39_GHOST_CONF_BYPASS    = _env_float("P39_GHOST_CONF_BYPASS",    0.08)
+# [P39-SIZE] Maximum Kelly multiplier boost from a ghost snipe.
+# Scales linearly from 1.0× at MIN_TPS to this value at BURST_TPS.
+P39_GHOST_SIZE_BOOST_MAX = _env_float("P39_GHOST_SIZE_BOOST_MAX", 1.25)
+# [P39-SPY] SPY 5-min drop threshold (negative %) below which LONG ghost snipes
+# are suppressed.  Uses P42 macro status; if data is stale (>300 s), this gate
+# is skipped (fail-open) to avoid deadlocks — consistent with P42 operational rules.
+P39_GHOST_SPY_BLOCK_PCT  = _env_float("P39_GHOST_SPY_BLOCK_PCT",  -0.8)
+# [P39-TOXICITY] Flow toxicity ceiling (P37 co-veto). If VPIN > this, do not
+# snipe — informed selling / institutional unloading is active.
+P39_GHOST_TOXICITY_CEIL  = _env_float("P39_GHOST_TOXICITY_CEIL",   0.65)
+# ── [/P39] ────────────────────────────────────────────────────────────────────
+
+# ── [P41] Phase 41 — Adversarial Mimicry (Liquidity Baiting) ──────────────────
+# Places a minimum-size POST_ONLY bait order at the best bid/ask edge.
+# If a competing HFT bot outbids by ≥ 1 tick within P41_BAIT_REACTION_MS,
+# hidden institutional buy-side liquidity is confirmed.  The result boosts the
+# entry size for the pending trade — we're joining an invisible buyer.
+#
+# Critically different from P36 (Passive Spoof Detection):
+#   P36 detects fake WALLS already in the book (passive, runs during TWAP).
+#   P41 actively PROBES the spread edge to reveal hidden bots (pre-entry only).
+#
+# Safety design:
+#   • POST_ONLY order type — 0 fee if unfilled, maker rebate if filled.
+#   • Always cancelled in a finally block — order cannot leak.
+#   • Per-symbol asyncio.Lock — prevents concurrent bait tests per symbol.
+#   • P41_BAIT_MAX_OPEN hard cap — system-wide simultaneous bait limit.
+#   • Accidental fills are tracked and logged (P41 leakage audit).
+#   • Never blocks an entry — only boosts size when hidden buyer confirmed.
+#
+# [P41-ENABLE] Master switch.
+P41_BAIT_ENABLE        = os.environ.get("P41_BAIT_ENABLE", "1").strip().strip("'\"") == "1"
+# [P41-REACTION] Milliseconds to wait after placing the bait order.
+# 80ms is tight enough to catch HFT bots (which react in < 10ms) while
+# avoiding false positives from organic market participants.
+P41_BAIT_REACTION_MS   = _env_float("P41_BAIT_REACTION_MS",   80.0)
+# [P41-TIMEOUT] Hard timeout (ms) for the entire bait test (place + wait + cancel).
+# If exceeded the bait cancel is still guaranteed via finally block.
+P41_BAIT_TIMEOUT_MS    = _env_float("P41_BAIT_TIMEOUT_MS",   500.0)
+# [P41-MAX-OPEN] Maximum simultaneous bait orders system-wide.
+# Prevents runaway bait placement during high-frequency cycle overlap.
+P41_BAIT_MAX_OPEN      = _env_int       ("P41_BAIT_MAX_OPEN",        2)
+# [P41-SIZE-BOOST] Kelly multiplier applied to usd_amount when a hidden buyer
+# is confirmed.  Linear scale: 1.0 = no boost, 1.30 = 30% larger entry.
+P41_BAIT_SIZE_BOOST    = _env_float("P41_BAIT_SIZE_BOOST",    1.20)
+# [P41-COOLDOWN] Minimum seconds between bait tests per symbol.
+P41_BAIT_COOLDOWN_SECS = _env_float("P41_BAIT_COOLDOWN_SECS", 60.0)
+# [P41-MIN-CONF] Only run bait test when signal confidence is above this floor.
+# Prevents wasting bait orders on low-quality marginal signals.
+P41_BAIT_MIN_CONF      = _env_float("P41_BAIT_MIN_CONF",       0.55)
+# ── [/P41] ────────────────────────────────────────────────────────────────────
+
+# ── [P45] Phase 45 — Zero-Knowledge Privacy Layer (Anti-Slippage) ─────────────
+# Replaces the P32 TWAP uniform ±50% jitter with a statistically undetectable
+# Poisson inter-arrival schedule and Dirichlet-distributed slice sizes.
+#
+# [P45-ENABLE]   Master switch. When 0, _p32_stealth_twap falls back to the
+#                legacy uniform-jitter schedule unchanged.
+P45_ENABLE           = os.environ.get("P45_ENABLE", "1").strip().strip("'\"") == "1"
+# [P45-THRESHOLD] Minimum USD order value to trigger the P45 privacy layer.
+#                 Below this threshold the order goes through the standard
+#                 single-shot path and does not need slicing.
+P45_THRESHOLD_USD    = _env_float("P45_THRESHOLD_USD",    500.0)
+# [P45-SLICES]   Poisson λ parameter for slice count sampling.
+#                Actual count is clamped to [P45_MIN_SLICES, P45_MAX_SLICES].
+#                Mean = λ, so a λ=7 gives an average of 7 slices with
+#                natural ±2–3 variance per execution cycle.
+P45_LAMBDA_SLICES    = _env_float("P45_LAMBDA_SLICES",    7.0)
+P45_MIN_SLICES       = _env_int      ("P45_MIN_SLICES",        4)
+P45_MAX_SLICES       = _env_int      ("P45_MAX_SLICES",        14)
+# [P45-DELAY]    Exponential distribution scale parameter (mean seconds) for
+#                inter-slice delay sampling.  The exponential distribution is
+#                the inter-arrival time of a Poisson process — statistically
+#                indistinguishable from organic order flow.
+#                Each gap is clamped to [P45_MIN_DELAY_SECS, P45_MAX_DELAY_SECS].
+P45_MEAN_DELAY_SECS  = _env_float("P45_MEAN_DELAY_SECS",  18.0)
+P45_MIN_DELAY_SECS   = _env_float("P45_MIN_DELAY_SECS",   0.08)
+P45_MAX_DELAY_SECS   = _env_float("P45_MAX_DELAY_SECS",   55.0)
+# [P45-DIRICHLET] Concentration parameter α for slice size sampling.
+#                α < 1.0 → heavy-tailed (a few large slices dominate).
+#                α = 1.0 → perfectly uniform Dirichlet (maximum entropy).
+#                α > 1.0 → slices cluster toward equal size (less stealth).
+#                Default 0.75 gives organic variance without extreme micro-slices.
+P45_DIRICHLET_ALPHA  = _env_float("P45_DIRICHLET_ALPHA",  0.75)
+# [P45-MIN-SLICE-USD] Hard floor per slice. Any Dirichlet-generated slice
+#                that falls below this value is merged into the next slice to
+#                prevent sub-minimum fills from polluting SlippagePerSymbolTracker.
+P45_MIN_SLICE_USD    = _env_float("P45_MIN_SLICE_USD",    8.0)
+# [P45-SLIP-ADAPT] When the symbol is in LIMIT_ONLY mode (P32 slip tracker
+#                tripped), P45 automatically reduces slice aggression:
+#                  • slice count is halved (floored at P45_MIN_SLICES)
+#                  • mean delay is doubled
+#                to reduce market impact during already-elevated slippage regimes.
+P45_SLIP_ADAPT_ENABLE = os.environ.get("P45_SLIP_ADAPT_ENABLE", "1").strip().strip("'\"") == "1"
 
 ICEBERG_MIN_USD      = _env_float("P9_ICEBERG_MIN_USD", 500.0)
 ICEBERG_FILL_TIMEOUT = _env_float("P9_ICEBERG_FILL_TIMEOUT", 45.0)
 
 # ── [P9-ICEBERG-DISPLAY] Fraction of total order shown per iceberg slice ────────
-# _safe_float_env is defined at module top (Sanitizer section) so this is safe.
 # ICEBERG_DISPLAY_PCT is a module-level constant; NameError on line 3712 is fixed.
-ICEBERG_DISPLAY_PCT  = _safe_float_env("P9_ICEBERG_DISPLAY_PCT",  0.10)
+ICEBERG_DISPLAY_PCT  = _env_float("P9_ICEBERG_DISPLAY_PCT",  0.10)
 
 # ── [STRICT-ENV-LATCH] ────────────────────────────────────────────────────────
 # OKX_BRIDGE_ENABLED=1 permanently latches the legacy WS equity path OFF.
@@ -385,10 +710,263 @@ _SHADOW_AUDIT_HEADER = [
     "real_usd", "baseline_usd", "conviction_multiplier",
     "regime", "narrative_verdict", "narrative_score",
     "fill_px", "fill_sz",
+    # ── [P46] Execution Quality Telemetry ────────────────────────────────────
+    # signal_ts      — Unix epoch (s) when the Signal dataclass was created.
+    # theoretical_px — (bid+ask)/2 mid-price at _maybe_enter decision time.
+    # p39_active     — 1 if Ghost Oracle snipe was armed for this fill.
+    # p41_active     — 1 if Liquidity Baiting confirmed a hidden counterpart.
+    # These four fields are blank for express-lane (P16) fills which bypass
+    # _maybe_enter and therefore have no pending telemetry context.
+    "signal_ts", "theoretical_px", "p39_active", "p41_active",
 ]
+
+# ── [P46] Phase 46 — Execution Quality Telemetry ──────────────────────────────
+# Captures the full signal → order → fill latency chain plus P39/P41 phase
+# flags for every confirmed entry.  Written to a separate CSV so shadow_audit
+# remains unchanged.  Append-only, atomic header init, row-count rotation.
+#
+# Fields:
+#   fill_ts            — Unix ts when fill was confirmed (ms precision)
+#   signal_ts          — Unix ts when Signal was generated (signal.ts)
+#   order_ts           — Unix ts when _open_long/_open_short was entered
+#   signal_to_order_ms — processing latency (order_ts − signal_ts)
+#   order_to_fill_ms   — exchange latency  (fill_ts  − order_ts)
+#   total_latency_ms   — end-to-end       (fill_ts  − signal_ts)
+#   symbol / direction / regime / tag / confidence / kelly_f / usd_amount
+#   theoretical_px     — (bid+ask)/2 at _maybe_enter entry (mid-price)
+#   fill_px / fill_sz
+#   slippage_bps       — signed: positive = worse than theoretical (cost us)
+#   p39_active         — 1 if Ghost Oracle snipe was armed for this entry
+#   p39_cb_tps         — Coinbase TPS reading at signal time
+#   p39_size_boost     — Kelly multiplier P39 applied (1.0 = none)
+#   p41_confirmed      — 1 if Liquidity Baiting confirmed hidden buyer
+#   p41_bait_boost     — size multiplier P41 applied (1.0 = none)
+P46_TELEM_ENABLE  = os.environ.get("P46_TELEM_ENABLE", "1").strip().strip("'\"") == "1"
+P46_TELEM_PATH    = os.environ.get(
+    "P46_TELEM_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "execution_telemetry.csv"),
+)
+# Rotate (archive + restart) the telemetry file after this many data rows.
+P46_TELEM_MAX_ROWS = int(os.environ.get("P46_TELEM_MAX_ROWS", "10000"))
+
+_P46_TELEM_HEADER = [
+    "fill_ts", "signal_ts", "order_ts",
+    "signal_to_order_ms", "order_to_fill_ms", "total_latency_ms",
+    "symbol", "direction", "regime", "tag",
+    "confidence", "kelly_f", "usd_amount",
+    "theoretical_px", "fill_px", "fill_sz", "slippage_bps",
+    "p39_active", "p39_cb_tps", "p39_size_boost",
+    "p41_confirmed", "p41_bait_boost",
+]
+# ── [/P46] ────────────────────────────────────────────────────────────────────
+
+# ── [P48] Autonomous Floating — executor-side constants ───────────────────────
+# Mirror of bridge_interface.P48_ENABLE / phase7_execution.P48_TTL_SECS.
+# Defined here so executor.py can gate the hot-path without an import cycle.
+_P48_ENABLE  = os.environ.get("P48_ENABLE",  "1").strip().strip("'\"") == "1"
+_P48_TTL_SECS = _env_float("P48_TTL_SECS", 30.0)
+# ── [/P48] ────────────────────────────────────────────────────────────────────
+
+# ── [P51] Institutional Execution Suite — executor-side constants ──────────────
+# _P51_ENABLE      : Master switch — mirror of bridge_interface.P51_ENABLE.
+#                    Both must be True for P51 native routing to fire.
+# _P51_SHADOW_MODE : When True Python still runs P32/P9 but also fires the Rust
+#                    algo for benchmarking (same shadow/native pattern as P50).
+# _P51_FORCE       : Bypass "twap_vwap" capability gate (dev/staging use only).
+# _P51_WAIT_SECS   : Executor-side timeout awaiting algo_complete from Rust.
+#                    Must be > the longest expected TWAP window.
+# _P51_TWAP_DUR    : Default TWAP duration passed to Rust (seconds).
+# _P51_TWAP_SLICES : Default TWAP slice count passed to Rust.
+# _P51_ICE_TTL     : Default Iceberg TTL passed to Rust (seconds).
+_P51_ENABLE      = (
+    os.environ.get("P51_ENABLE", "1").strip().strip("'\"") == "1"
+    and _P51_ENABLE_BRIDGE
+)
+_P51_SHADOW_MODE = os.environ.get("P51_SHADOW_MODE", "1").strip().strip("'\"") == "1"
+_P51_FORCE       = os.environ.get("P51_FORCE",       "0").strip().strip("'\"") == "1"
+_P51_WAIT_SECS   = _env_float("P51_WAIT_TIMEOUT_SECS",          600.0)
+_P51_TWAP_DUR    = _env_float("P51_TWAP_DEFAULT_DURATION_SECS", 300.0)
+_P51_TWAP_SLICES = max(2, int(os.environ.get("P51_TWAP_DEFAULT_SLICES", "10")))
+_P51_ICE_TTL     = _env_float("P51_ICEBERG_DEFAULT_TTL_SECS",   120.0)
+# ── [/P51] ────────────────────────────────────────────────────────────────────
 
 # ── [P20-1] Global Drawdown / Zombie Mode config ───────────────────────────────
 P20_DRAWDOWN_ZOMBIE_PCT = _env_float("P20_DRAWDOWN_ZOMBIE_PCT", 10.0)
+# [PHASE1] Number of consecutive update() cycles that must sustain drawdown ≥
+# P20_DRAWDOWN_ZOMBIE_PCT before zombie mode activates.  Guards against a
+# single transient equity dip (ghost read, WS lag) triggering a full liquidation.
+_P20_ZOMBIE_CONSECUTIVE_REQUIRED: int = max(1, _env_int("P20_ZOMBIE_CONSECUTIVE_REQUIRED", 2))
+
+# ── [PHASE2-GATE] Trade Admission Gate config ──────────────────────────────────
+# ADMISSION_BRIDGE_STALE_SECS — how long (seconds) since the last valid, non-ghost
+#   equity push from the bridge before a new entry is blocked.  Default 60 s.
+#   Set 0 to disable staleness check.
+ADMISSION_BRIDGE_STALE_SECS: float = _env_float("ADMISSION_BRIDGE_STALE_SECS", 60.0)
+
+# ADMISSION_MIN_EDGE_PCT — minimum required kelly_f (as a proxy for expected edge)
+#   before an entry is admitted.  Default 0.0 = DISABLED.
+#
+#   IMPORTANT: signal.kelly_f is used only as a PROXY for expected net edge.
+#   kelly_f is the Kelly fraction from the strategy signal and does NOT account
+#   for actual OKX maker/taker fees or realised slippage.  This gate is an
+#   approximate guard, not a true net-edge model.  A proper fee-and-slippage-
+#   adjusted edge gate is deferred to a future phase.
+#
+#   The gate is deliberately OFF (0.0) by default so existing live behaviour
+#   is fully preserved unless the operator explicitly enables it.
+ADMISSION_MIN_EDGE_PCT: float = _env_float("ADMISSION_MIN_EDGE_PCT", 0.0)
+
+# ADMISSION_MIN_CONFIDENCE — minimum required signal.confidence before an entry
+#   is admitted.  Default 0.0 = DISABLED.
+#
+#   When enabled (> 0.0), this check runs inside _admission_gate() as gate
+#   "CONF" and applies to ALL entry paths including the express path.  This is
+#   unlike the soft min_conf floor in _maybe_enter() which can be reduced by
+#   P39/P10 bypasses; this gate cannot be lowered by any in-flight modifier.
+#
+#   The gate is deliberately OFF (0.0) by default so existing live behaviour
+#   is fully preserved unless the operator explicitly enables it using evidence
+#   from the Phase 6 entry-quality diagnostics.
+ADMISSION_MIN_CONFIDENCE: float = _env_float("ADMISSION_MIN_CONFIDENCE", 0.0)
+
+# ADMISSION_FLUSH_LOOKBACK — how many consecutive short RISK/ANOMALY exits for
+#   a symbol must be observed before the EARLY_FLUSH gate considers blocking.
+#   Default: 3 (require 3 recent flushes before suppressing re-entry).
+ADMISSION_FLUSH_LOOKBACK: int = _env_int("ADMISSION_FLUSH_LOOKBACK", 3)
+
+# ADMISSION_FLUSH_MAX_HOLD_SECS — a close is counted as an "early flush" only
+#   when hold_time_secs < this value AND exit category is RISK or ANOMALY.
+#   Default: 120 s.
+ADMISSION_FLUSH_MAX_HOLD_SECS: float = _env_float("ADMISSION_FLUSH_MAX_HOLD_SECS", 120.0)
+
+# ADMISSION_FLUSH_COOLDOWN_SECS — how long (seconds) after the most recent
+#   early flush to suppress new entries for that symbol.  Default 0.0 = DISABLED.
+#
+#   When > 0, the EARLY_FLUSH gate fires when:
+#     • the per-symbol flush deque has ≥ ADMISSION_FLUSH_LOOKBACK entries AND
+#     • the most recent entry is within ADMISSION_FLUSH_COOLDOWN_SECS of now.
+#   All entries in the deque are short RISK/ANOMALY exits (hold < FLUSH_MAX_HOLD_SECS).
+#
+#   The flush deque is in-memory only (not restart-persistent), matching the
+#   existing _entry_in_flight design.  On restart the deque resets to empty
+#   and the gate is inert until enough new flushes are recorded.
+#
+#   The gate is deliberately OFF (0.0) by default so existing live behaviour
+#   is fully preserved unless the operator explicitly enables it.
+ADMISSION_FLUSH_COOLDOWN_SECS: float = _env_float("ADMISSION_FLUSH_COOLDOWN_SECS", 0.0)
+
+# ADMISSION_SUPPRESS_SYMBOLS — comma-separated list of base symbols (e.g. "BTC,ETH")
+#   that are unconditionally blocked at the admission layer regardless of signal
+#   quality, confidence, or any other gate.  Default: "" = DISABLED (empty set).
+#
+#   This is a hard operator-specified block intended for symbols that diagnostics
+#   (Phase 5/6 BY-SYMBOL panels) show are chronic losers.  The check is an O(1)
+#   frozenset lookup — no DB query, no async I/O.  Fails closed: if the symbol is
+#   in the set the entry is blocked unconditionally; there is no bypass mechanism.
+#
+#   Symbols are uppercased on parse so "btc" and "BTC" are equivalent.
+#   Whitespace around commas is stripped.  An empty or whitespace-only env var
+#   produces an empty frozenset and the gate is completely inert.
+#
+#   Example: ADMISSION_SUPPRESS_SYMBOLS=XRP,DOGE,PEPE
+ADMISSION_SUPPRESS_SYMBOLS: frozenset = frozenset(
+    s.strip().upper()
+    for s in os.environ.get("ADMISSION_SUPPRESS_SYMBOLS", "").split(",")
+    if s.strip()
+)
+
+# ADMISSION_SUPPRESS_REGIMES — comma-separated list of signal.regime values
+#   (e.g. "chop,bear") that are unconditionally blocked at the admission layer.
+#   Default: "" = DISABLED (empty set).
+#
+#   This is a hard operator-specified block intended for regime buckets that
+#   diagnostics show are persistently associated with bad outcomes.  The check is
+#   an O(1) frozenset lookup — no DB query, no async I/O.  Fails closed.
+#
+#   Regime values are lowercased on parse so "Chop" and "chop" are equivalent.
+#   Whitespace around commas is stripped.  An empty env var leaves the gate inert.
+#
+#   Express-path consequence: the express path passes regime="express".  If the
+#   operator includes "express" in ADMISSION_SUPPRESS_REGIMES, all express-path
+#   trades will be blocked.  This is intentional and under operator control.
+#
+#   Example: ADMISSION_SUPPRESS_REGIMES=chop,bear
+ADMISSION_SUPPRESS_REGIMES: frozenset = frozenset(
+    s.strip().lower()
+    for s in os.environ.get("ADMISSION_SUPPRESS_REGIMES", "").split(",")
+    if s.strip()
+)
+
+# [TRACK14-GC1] ADMISSION_MAX_OPEN_POSITIONS — maximum number of simultaneously
+#   open positions the bot may hold before a new entry is blocked.
+#   Default: 0 = DISABLED (no concurrent-position cap).
+#
+#   When > 0, the CONCURRENT_CAP gate fires inside _admission_gate() when
+#   len(self.positions) >= this threshold.  The check is a single O(1) dict-len
+#   call against the already-current in-memory positions dict — no async I/O.
+#
+#   The gate applies uniformly to ALL entry paths (normal, express, shadow-fire).
+#   It does NOT distinguish by symbol or direction; every entry attempt for any
+#   symbol is blocked until a position closes and len(self.positions) drops below
+#   the threshold.
+#
+#   The gate is deliberately OFF (0) by default so pre-Track-14 live behaviour
+#   is fully preserved unless the operator explicitly enables it.
+#
+#   Recommended starting value: 3–5 (highly dependent on account size and
+#   the operator's risk tolerance).
+#
+#   Example: ADMISSION_MAX_OPEN_POSITIONS=3
+ADMISSION_MAX_OPEN_POSITIONS: int = _env_int("ADMISSION_MAX_OPEN_POSITIONS", 0)
+
+# [TRACK14-GC2] ADMISSION_MAX_DEPLOYED_PCT — maximum fraction of total equity
+#   that may be deployed in open positions before a new entry is blocked.
+#   Expressed as a decimal fraction: 0.80 = 80%.  Default: 0.0 = DISABLED.
+#
+#   When > 0.0, the DEPLOYED_CAP gate fires inside _admission_gate() when
+#   sum(p.usd_cost for p in self.positions.values()) / self._equity >= threshold.
+#   usd_cost for each position is the cost-basis notional (set at entry and updated
+#   on DCA) — it is NOT marked-to-market.  Any position whose usd_cost is missing
+#   or malformed is treated as 0.0 (fail-open per position, never fail-closed).
+#
+#   The gate fails OPEN (never blocks) when self._equity <= 0 (ghost-equity state).
+#   This ensures a bad equity read never falsely suppresses valid entries.
+#
+#   The gate is deliberately OFF (0.0) by default so pre-Track-14 live behaviour
+#   is fully preserved unless the operator explicitly enables it.
+#
+#   Recommended starting value: 0.80–0.90 (leave headroom for DCA / P39 boosts).
+#
+#   Example: ADMISSION_MAX_DEPLOYED_PCT=0.80
+ADMISSION_MAX_DEPLOYED_PCT: float = _env_float("ADMISSION_MAX_DEPLOYED_PCT", 0.0)
+
+# [TRACK27-PSC1] ADMISSION_MAX_PER_SYMBOL_USD — maximum cost-basis (USD notional)
+#   that may be accumulated in a single symbol's open position before new entries
+#   for that symbol are blocked.
+#
+#   When > 0.0, the PER_SYMBOL_CAP gate fires inside _admission_gate() when
+#   self.positions[symbol].usd_cost >= this threshold.  The check applies only
+#   when the symbol already has an open position; a first entry is always allowed
+#   (no position means no accumulated cost-basis to cap).
+#
+#   usd_cost is the cost-basis notional set at entry and updated on DCA — it is
+#   NOT marked-to-market.  Any position whose usd_cost is missing or malformed is
+#   treated as 0.0 (fail-open per position, never fail-closed).
+#
+#   The gate fails OPEN (never blocks) if any arithmetic or attribute error occurs.
+#   This ensures a corrupt position record never falsely suppresses a valid entry.
+#
+#   The gate is deliberately OFF (0.0) by default so existing live behaviour is
+#   fully preserved unless the operator explicitly enables it.
+#
+#   Recommended starting value: size to 20–40% of account equity, e.g. for a
+#   $10,000 account: ADMISSION_MAX_PER_SYMBOL_USD=3000 caps any single symbol at
+#   $3,000 cost-basis before further entries (including DCA) are blocked.
+#
+#   Example: ADMISSION_MAX_PER_SYMBOL_USD=3000
+ADMISSION_MAX_PER_SYMBOL_USD: float = _env_float("ADMISSION_MAX_PER_SYMBOL_USD", 0.0)
+
+# ── [/PHASE2-GATE] ─────────────────────────────────────────────────────────────
 
 # ── [P23] Phase 23 config ──────────────────────────────────────────────────────
 P23_CB_SUPPRESS_WITH_LKG    = os.environ.get("P23_CB_SUPPRESS_WITH_LKG", "1").strip() == "1"
@@ -419,6 +997,17 @@ P24_CONTROL_QUEUE_PATH = os.environ.get(
 # ── [FIX-HWM-RACE] Minimum valid equity floor ─────────────────────────────────
 _EXECUTOR_MIN_VALID_EQUITY = _env_float("P7_CB_MIN_VALID_EQUITY", 10.0)
 
+# ── [P40.2-PLAUSIBILITY] Bridge equity plausibility shield ─────────────────────
+# An incoming bridge equity that is less than this fraction of the most recent
+# confirmed valid equity is treated as a transient bogus frame and rejected
+# without poisoning drawdown trackers, HWM, or the circuit breaker.
+# Default 5 % — calibrated to catch near-zero glitches (eq≈1.01 vs valid≈4980,
+# ratio ≈ 0.02 %) while allowing genuine large intra-day account swings.
+# Set via env-var BRIDGE_EQUITY_PLAUSIBILITY_RATIO (float, 0.0 = disabled).
+_BRIDGE_EQUITY_PLAUSIBILITY_RATIO: float = _env_float(
+    "BRIDGE_EQUITY_PLAUSIBILITY_RATIO", 0.05
+)
+
 # ── [P25] Phase 25 — Tactical Listener & Liquidation Oracle config ─────────────
 import threading as _threading
 
@@ -439,6 +1028,33 @@ P25_SNIPER_ONLY_WHALE_MULT     = _env_float("P25_SNIPER_ONLY_WHALE_MULT", 20.0)
 _P25_TACTICAL_DEFAULTS: dict = {"risk_off": False, "sniper_only": False, "hedge_active": False}
 # Module-level lock for veto_audit writes from executor context
 _p25_veto_audit_lock = _threading.Lock()
+
+# ── [TRACK09-DT] Decision-trace: bounded per-session artifact ─────────────────
+# Stored adjacent to trader_status.json in hub_data/ (same pattern as
+# p32_limit_only.json and veto_audit.json).  Written atomically via
+# atomic_write_json.  Fixed maxlen prevents unbounded memory growth.
+# No import-time file creation — first write happens on the first decision event.
+_DECISION_TRACE_PATH: str = os.path.join(
+    os.path.dirname(os.path.abspath(
+        os.environ.get(
+            "TRADER_STATUS_PATH",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "hub_data", "trader_status.json"),
+        )
+    )),
+    "decision_trace.json",
+)
+_DECISION_TRACE_MAXLEN: int = 200
+_decision_trace_lock: "_threading.Lock" = _threading.Lock()
+_decision_trace_buf:  "deque[dict]"     = deque(maxlen=_DECISION_TRACE_MAXLEN)
+# [WIN-THROTTLE] Minimum seconds between decision_trace flushes to disk.
+# In-memory deque always receives every record immediately; only the file
+# write is throttled.  10 s is fast enough for dashboard observability while
+# reducing write pressure by ~10-50x under active multi-symbol admission flow.
+_DECISION_TRACE_MIN_FLUSH_SECS: float = 10.0
+_decision_trace_last_flush_ts:  float = 0.0
+_decision_trace_flush_pending:  int   = 0   # records appended since last flush
+# ── [/TRACK09-DT] ─────────────────────────────────────────────────────────────
 
 # [LLMFB-3] LLM Empty-Response Fallback Helper
 
@@ -503,10 +1119,10 @@ def _append_veto_audit_executor(symbol: str, reason: str, details: str = "") -> 
         "reason":    reason,
         "details":   details,
     }
-    tmp_path = P25_VETO_AUDIT_PATH + ".tmp"
+    _veto_dir = os.path.dirname(os.path.abspath(P25_VETO_AUDIT_PATH))
     with _p25_veto_audit_lock:
         try:
-            os.makedirs(os.path.dirname(P25_VETO_AUDIT_PATH), exist_ok=True)
+            os.makedirs(_veto_dir, exist_ok=True)
             existing: list = []
             if os.path.exists(P25_VETO_AUDIT_PATH):
                 try:
@@ -521,17 +1137,73 @@ def _append_veto_audit_executor(symbol: str, reason: str, details: str = "") -> 
             existing.append(row)
             if len(existing) > 10_000:
                 existing = existing[-10_000:]
-            payload = json.dumps(existing, indent=None, separators=(",", ":"))
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(payload)
-            os.replace(tmp_path, P25_VETO_AUDIT_PATH)
+            # [P0-UTIL] Use canonical atomic_write_json — no inline NamedTemporaryFile.
+            atomic_write_json(P25_VETO_AUDIT_PATH, existing)
         except Exception as exc:
             log.warning("[P25] _append_veto_audit_executor failed: %s", exc)
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+
+# [TRACK09-DT] Decision-trace append helper
+
+def _append_decision_trace(record: dict) -> None:
+    """
+    [TRACK09-DT] Append one decision-trace record to the bounded in-memory deque
+    and conditionally flush to hub_data/decision_trace.json atomically.
+
+    Called from _maybe_enter at every admission outcome.
+    [TRACK16-DT] Also called from trigger_atomic_express_trade.
+    Failures are silently logged at DEBUG — this must never block admission logic.
+
+    [WIN-THROTTLE] The in-memory deque receives every record immediately so no
+    data is ever lost.  The file flush is throttled to at most once per
+    _DECISION_TRACE_MIN_FLUSH_SECS (default 10 s) to reduce hot-file write
+    pressure on the hub_data directory, which competes with trader_status.json
+    writes under Windows handle contention.  Callers should not rely on every
+    record being on disk instantly — the dashboard reads the last-known-good
+    snapshot and the in-memory deque is always authoritative for the session.
+
+    Schema keys (all callers must supply):
+        ts             — float, time.time() captured at function entry
+        symbol         — str
+        direction      — str (long / short / neutral)
+        regime         — str
+        confidence     — float, captured BEFORE any signal mutation
+        z_score        — float
+        kelly_f        — float
+        mtf_aligned    — bool
+        sniper_boost   — bool
+        oracle_boosted — bool
+        whale_mult     — float
+        outcome        — str: "ADMITTED" | "BLOCKED" | "SHADOW"
+        gate_name      — str: gate that blocked, or "PASS" / "SHADOW" if admitted
+        reason         — str: brief human-readable detail (max ~120 chars)
+        llm_verdict    — str: LLM verdict if consulted, else ""
+        p32_p_success  — float | None: VetoArb p_success if computed, else None
+        sizing_usd     — float | None: final notional if admitted, else None
+        modifiers      — dict: compact sizing-modifier flags for admitted entries
+        source_path    — str | None: "entry" (_maybe_enter) | "express"
+                         (trigger_atomic_express_trade) | None (legacy)
+    """
+    global _decision_trace_last_flush_ts, _decision_trace_flush_pending
+    try:
+        with _decision_trace_lock:
+            # Always buffer in memory — zero data loss regardless of flush outcome.
+            _decision_trace_buf.append(record)
+            _decision_trace_flush_pending += 1
+
+            now = time.time()
+            elapsed = now - _decision_trace_last_flush_ts
+            if elapsed >= _DECISION_TRACE_MIN_FLUSH_SECS or _decision_trace_flush_pending == 1:
+                # Flush: either enough time has passed, or this is the very first
+                # record (ensure the file exists promptly after boot).
+                snapshot = list(_decision_trace_buf)
+                ok = atomic_write_json(_DECISION_TRACE_PATH, snapshot)
+                if ok:
+                    _decision_trace_last_flush_ts = now
+                    _decision_trace_flush_pending = 0
+                # If the write failed, leave _flush_pending > 0 so the next
+                # eligible call will retry.
+    except Exception as _dt_exc:
+        log.debug("[TRACK09-DT] _append_decision_trace failed: %s", _dt_exc)
 
 # [QUANT-1] Size Quantization Layer
 
@@ -583,7 +1255,21 @@ def _fmt_sz(qty: float, decimals: int) -> str:
     return f"{qty:.{decimals}f}"
 
 def inst_id(symbol: str, swap: bool = False) -> str:
-    base = f"{symbol.upper()}-USDT"
+    """[FIX-P35] Build canonical OKX instrument ID.
+
+    Idempotent: callers may pass either the base symbol ("BTC") or the full
+    OKX instrument ID ("BTC-USDT-SWAP" / "BTC-USDT") — the result is always
+    correct.  Prevents the double-suffix bug: inst_id("BTC-USDT-SWAP", swap=True)
+    previously returned "BTC-USDT-SWAP-USDT-SWAP" causing P35 hedge layers to be
+    rejected by OKX with "Instrument ID doesn't exist".
+    """
+    base_sym = symbol.upper()
+    # Strip any existing OKX suffix so the function is idempotent
+    if base_sym.endswith("-USDT-SWAP"):
+        base_sym = base_sym[: -len("-USDT-SWAP")]
+    elif base_sym.endswith("-USDT"):
+        base_sym = base_sym[: -len("-USDT")]
+    base = f"{base_sym}-USDT"
     return f"{base}-SWAP" if swap else base
 
 # Keep the module-level alias used elsewhere in the file
@@ -656,9 +1342,13 @@ def _load_coin_configs(path: str) -> Dict[str, CoinConfig]:
 
 @dataclass
 class CoinPerf:
-    results:        Deque[bool]     = field(default_factory=lambda: deque(maxlen=AUTO_TUNE_WINDOW))
-    alloc_override: Optional[float] = None
-    conf_override:  Optional[float] = None
+    results:         Deque[bool]     = field(default_factory=lambda: deque(maxlen=AUTO_TUNE_WINDOW))
+    alloc_override:  Optional[float] = None
+    conf_override:   Optional[float] = None
+    # [TRACK15] Informational tag: "manual" when set via operator Score Feedback Controls,
+    # "auto" when set by the rolling autotune engine.  None when no override is active.
+    # Read-only to the dashboard — does not affect override behavior.
+    override_source: Optional[str]   = None
 
 class CoinPerformanceTracker:
     def __init__(self):
@@ -699,8 +1389,9 @@ class CoinPerformanceTracker:
                     symbol, win_rate * 100, AUTO_TUNE_WIN_RATE_FLOOR * 100,
                     base_alloc, new_alloc, base_conf, new_conf,
                 )
-                perf.alloc_override = new_alloc
-                perf.conf_override  = new_conf
+                perf.alloc_override  = new_alloc
+                perf.conf_override   = new_conf
+                perf.override_source = "auto"  # [TRACK15] autotune engine set this
 
     def alloc_for(self, symbol: str, default: float) -> float:
         p = self._perfs.get(symbol)
@@ -713,6 +1404,48 @@ class CoinPerformanceTracker:
     def overrides_active(self, symbol: str) -> bool:
         p = self._perfs.get(symbol)
         return bool(p and (p.alloc_override is not None or p.conf_override is not None))
+
+    # ── [TRACK07-WB1] Operator-explicit override setters ─────────────────────
+    # Called exclusively from the P24 control-queue dispatch path below.
+    # Neither method touches the rolling results deque — automatic record()
+    # behaviour continues unaffected alongside any manual override.
+
+    def set_override(self, symbol: str, conf_floor: float, alloc_cap: float) -> None:
+        """[TRACK07-WB1] Set operator-explicit conf/alloc overrides for a symbol.
+
+        Values are clamped to the same ranges enforced by the automatic path:
+          conf_floor  → [MIN_SIGNAL_CONF, MAX_CONF_OVERRIDE]
+          alloc_cap   → [MIN_ALLOC_FLOOR,  MAX_ALLOC_PCT]
+
+        The rolling results deque is intentionally preserved so that the
+        automatic autotune continues to work alongside the manual override.
+        """
+        cf = max(MIN_SIGNAL_CONF, min(float(conf_floor), MAX_CONF_OVERRIDE))
+        ac = max(MIN_ALLOC_FLOOR,  min(float(alloc_cap),  MAX_ALLOC_PCT))
+        perf = self._ensure(symbol)
+        perf.conf_override   = cf
+        perf.alloc_override  = ac
+        perf.override_source = "manual"  # [TRACK15] operator Score Feedback set this
+        log.info(
+            "[TRACK07-WB1] set_override %s: conf_floor=%.4f alloc_cap=%.4f",
+            symbol, cf, ac,
+        )
+
+    def reset_override(self, symbol: str) -> None:
+        """[TRACK07-WB2] Clear operator-explicit conf/alloc overrides for a symbol.
+
+        No-ops silently if the symbol has no CoinPerf entry.
+        The rolling results deque is preserved.
+        """
+        perf = self._perfs.get(symbol)
+        if perf is None:
+            log.info("[TRACK07-WB2] reset_override %s: symbol not tracked — no-op", symbol)
+            return
+        perf.conf_override   = None
+        perf.alloc_override  = None
+        perf.override_source = None  # [TRACK15] cleared with the override
+        log.info("[TRACK07-WB2] reset_override %s: overrides cleared", symbol)
+    # ── [/TRACK07-WB1] ───────────────────────────────────────────────────────
 
 @dataclass
 class Position:
@@ -737,6 +1470,240 @@ class Position:
     squeeze_delay_until: float     = 0.0
     entry_limit_px:   float        = 0.0
     p16_express:      bool         = False
+    # [PHASE1] Canonical round-trip identifier.  Generated at position creation
+    # (_open_long / _open_short) and written to both the open-leg and close-leg
+    # DB rows so they can be linked without relying on order_id.
+    trade_id:         str          = field(default_factory=lambda: str(uuid.uuid4()))
+
+# ── [P45] IcebergSlicer — Zero-Knowledge Privacy Layer ───────────────────────
+
+@dataclass
+class SlicePlan:
+    """
+    [P45] A single execution slice generated by IcebergSlicer.plan().
+
+    Attributes
+    ----------
+    usd_amount         : USD value to execute for this slice.
+    delay_before_secs  : Seconds to sleep BEFORE placing this slice.
+                         Always 0.0 for slice index 0 (no pre-delay on entry).
+    slice_index        : 0-based position in the plan (for logging).
+    total_slices       : Total slices in this plan (for logging).
+    """
+    usd_amount:        float
+    delay_before_secs: float
+    slice_index:       int
+    total_slices:      int
+
+
+class IcebergSlicer:
+    """
+    [P45] Zero-Knowledge Privacy Layer — Anti-Slippage Execution Planner.
+
+    Generates a randomized, statistically undetectable execution schedule for
+    large orders by replacing the P32 TWAP's uniform ±50% jitter with:
+
+      1. Poisson-distributed slice count
+         Drawn from Poisson(λ=P45_LAMBDA_SLICES), clamped to
+         [P45_MIN_SLICES, P45_MAX_SLICES].  The variable count prevents
+         competitor bots from fingerprinting a fixed-N execution signature.
+
+      2. Dirichlet-distributed slice sizes
+         Drawn from Dir([α] * n), α = P45_DIRICHLET_ALPHA (default 0.75).
+         α < 1.0 produces a heavy-tailed distribution — naturally mimicking
+         organic institutional order flow where a few large child orders
+         dominate.  Any slice below P45_MIN_SLICE_USD is merged forward
+         to prevent sub-minimum fills.
+
+      3. Exponential inter-arrival delays
+         Drawn from Exp(scale=P45_MEAN_DELAY_SECS) per gap.  The exponential
+         distribution IS the inter-arrival time of a Poisson process.  A
+         sequence of exponential delays is statistically indistinguishable
+         from random organic order arrival — a chi-squared test on 100+
+         samples cannot reject the null hypothesis that it is a Poisson
+         process.  Delays are clamped to [P45_MIN_DELAY_SECS,
+         P45_MAX_DELAY_SECS] to prevent both zero-delay bursts and
+         excessively wide gaps.
+
+      4. SlippagePerSymbolTracker integration (P45_SLIP_ADAPT)
+         When the symbol is in LIMIT_ONLY mode, slice count is halved and
+         mean delay is doubled to reduce market impact during already-elevated
+         slippage regimes.
+
+    Thread Safety
+    -------------
+    Uses a dedicated numpy.random.Generator instance (not the global numpy
+    random state) so concurrent calls from multiple Executor loops do not
+    interfere.  The Generator is seeded from os.urandom(8) at construction
+    for cryptographic-quality unpredictability.
+
+    Usage
+    -----
+    plan = slicer.plan(usd_amount=5000.0, symbol="BTC")
+    for sp in plan:
+        if sp.delay_before_secs > 0:
+            await asyncio.sleep(sp.delay_before_secs)
+        await place_order(sp.usd_amount)
+    """
+
+    def __init__(self) -> None:
+        # Cryptographic seed — not time-based, not predictable.
+        _seed = int.from_bytes(os.urandom(8), "little")
+        self._rng: np.random.Generator = np.random.default_rng(_seed)
+        self._log = logging.getLogger("executor.p45")
+
+    def plan(
+        self,
+        usd_amount:    float,
+        symbol:        str = "",
+        limit_only:    bool = False,
+    ) -> List[SlicePlan]:
+        """
+        Generate a randomized execution plan.
+
+        Parameters
+        ----------
+        usd_amount  : Total USD to execute.
+        symbol      : Symbol string (used in log messages only).
+        limit_only  : True when the P32 SlippagePerSymbolTracker has this
+                      symbol in LIMIT_ONLY mode.  Triggers P45_SLIP_ADAPT
+                      behaviour if P45_SLIP_ADAPT_ENABLE is set.
+
+        Returns
+        -------
+        List[SlicePlan] — always at least one slice with usd_amount equal to
+        the full order size (safety fallback if usd_amount < P45_MIN_SLICE_USD).
+        """
+        # Safety floor — order too small to support P45_MIN_SLICES slices each
+        # >= P45_MIN_SLICE_USD.  Fall back to single-shot to avoid generating
+        # sub-minimum fills.  2.5× headroom gives the Dirichlet room to vary
+        # without the merge logic collapsing below P45_MIN_SLICES.
+        # Default: 4 × $8 × 2.5 = $80.  P32 TWAP threshold is $2000+, so this
+        # floor is never hit in normal production.
+        if usd_amount < P45_MIN_SLICES * P45_MIN_SLICE_USD * 2.5:
+            return [SlicePlan(
+                usd_amount=usd_amount,
+                delay_before_secs=0.0,
+                slice_index=0,
+                total_slices=1,
+            )]
+
+        # ── Adaptive parameters under elevated slippage ──────────────────────
+        _lambda     = P45_LAMBDA_SLICES
+        _mean_delay = P45_MEAN_DELAY_SECS
+        if limit_only and P45_SLIP_ADAPT_ENABLE:
+            # Halve the slice rate and double delays to reduce market impact.
+            _lambda     = max(float(P45_MIN_SLICES), _lambda / 2.0)
+            _mean_delay = min(P45_MAX_DELAY_SECS,    _mean_delay * 2.0)
+            self._log.info(
+                "[P45-SLIP-ADAPT] %s: LIMIT_ONLY active — "
+                "λ=%.1f→%.1f  mean_delay=%.1f→%.1fs",
+                symbol, P45_LAMBDA_SLICES, _lambda,
+                P45_MEAN_DELAY_SECS, _mean_delay,
+            )
+
+        # ── 1. Sample slice count from Poisson(λ) ────────────────────────────
+        raw_n = int(self._rng.poisson(lam=_lambda))
+        n     = int(np.clip(raw_n, P45_MIN_SLICES, P45_MAX_SLICES))
+
+        # ── 2. Sample slice proportions from Dirichlet([α]*n) ────────────────
+        alpha_vec   = np.full(n, P45_DIRICHLET_ALPHA, dtype=np.float64)
+        proportions = self._rng.dirichlet(alpha_vec)           # sums to 1.0
+        raw_sizes   = (proportions * usd_amount).tolist()
+
+        # ── 3. Merge sub-minimum slices (two-pass) ───────────────────────────
+        # Pass 1 (forward): carry any slice < P45_MIN_SLICE_USD into the next.
+        # The last slice always receives any leftover carry.
+        merged: List[float] = []
+        carry = 0.0
+        for idx_s, sz in enumerate(raw_sizes):
+            candidate = sz + carry
+            is_last   = (idx_s == len(raw_sizes) - 1)
+            if candidate < P45_MIN_SLICE_USD and not is_last:
+                carry = candidate          # roll forward into next slice
+            else:
+                merged.append(candidate)
+                carry = 0.0
+        # Defensive: if carry survived (shouldn't happen, but float edge cases)
+        if carry > 0.0:
+            if merged:
+                merged[-1] += carry
+            else:
+                merged.append(carry)
+
+        # Pass 2 (backward cleanup): the forward pass guarantees all slices
+        # except possibly the last are >= P45_MIN_SLICE_USD.  Sweep backward to
+        # merge any residual sub-minimum tail slices into their left neighbor.
+        j = len(merged) - 1
+        while j >= 0 and len(merged) > 1:
+            if merged[j] < P45_MIN_SLICE_USD:
+                # Merge into left neighbor (safe: j > 0 guaranteed by len > 1 guard)
+                merged[j - 1] += merged[j]
+                merged.pop(j)
+            j -= 1
+        # ── [/merge] ─────────────────────────────────────────────────────────
+
+        actual_n = len(merged)
+
+        # ── Post-merge re-splitter ────────────────────────────────────────────
+        # The forward-merge pass can reduce actual_n below P45_MIN_SLICES when
+        # the Dirichlet generates a cluster of tiny proportions.  If the order
+        # is large enough to support additional splits, restore slices by
+        # halving the largest slice until P45_MIN_SLICES is reached or no
+        # splittable slice remains (both halves >= P45_MIN_SLICE_USD).
+        _max_replit_attempts = P45_MAX_SLICES  # safety ceiling on the loop
+        _attempt = 0
+        while actual_n < P45_MIN_SLICES and _attempt < _max_replit_attempts:
+            _largest_idx = int(np.argmax(merged))
+            _half = merged[_largest_idx] / 2.0
+            if _half < P45_MIN_SLICE_USD:
+                break  # Cannot split further without producing sub-minimum slices
+            merged[_largest_idx] = _half
+            merged.insert(_largest_idx + 1, _half)
+            actual_n = len(merged)
+            _attempt += 1
+        # ── [/post-merge re-splitter] ─────────────────────────────────────────
+
+        # Sanity: proportions must still sum to usd_amount within float epsilon.
+        _sum_check = sum(merged)
+        if abs(_sum_check - usd_amount) > 0.01:
+            # Distribute rounding error into the largest slice.
+            _delta = usd_amount - _sum_check
+            _idx   = int(np.argmax(merged))
+            merged[_idx] += _delta
+
+        # ── 4. Sample inter-arrival delays from Exp(scale=_mean_delay) ───────
+        # n-1 gaps between n slices; first slice has no pre-delay.
+        raw_delays  = self._rng.exponential(scale=_mean_delay, size=actual_n - 1)
+        clamped_delays = np.clip(raw_delays, P45_MIN_DELAY_SECS, P45_MAX_DELAY_SECS)
+
+        # ── 5. Assemble SlicePlan list ────────────────────────────────────────
+        plan: List[SlicePlan] = []
+        for i, sz in enumerate(merged):
+            plan.append(SlicePlan(
+                usd_amount        = float(sz),
+                delay_before_secs = 0.0 if i == 0 else float(clamped_delays[i - 1]),
+                slice_index       = i,
+                total_slices      = actual_n,
+            ))
+
+        total_window = sum(sp.delay_before_secs for sp in plan)
+        self._log.info(
+            "[P45] %s plan: n=%d (Poisson λ=%.1f) | "
+            "sizes=[%s] | delays=[%s] | "
+            "total_usd=%.2f | est_window=%.1fs",
+            symbol or "?", actual_n, _lambda,
+            ", ".join(f"${sp.usd_amount:.2f}" for sp in plan),
+            ", ".join(
+                f"{sp.delay_before_secs:.1f}s" for sp in plan if sp.slice_index > 0
+            ),
+            sum(sp.usd_amount for sp in plan),
+            total_window,
+        )
+        return plan
+
+# ── [/P45] IcebergSlicer ──────────────────────────────────────────────────────
+
 
 class DrawdownTracker:
     def __init__(self, pct_limit: float = MAX_DRAWDOWN_PCT,
@@ -787,6 +1754,11 @@ class GlobalRiskManager:
         self._zombie_active = False
         self._zombie_ts:    float = 0.0
         self._last_equity:  float = 0.0
+        # [PHASE1] Require N consecutive readings above the drawdown threshold
+        # before activating zombie mode.  A single transient equity dip (ghost
+        # read, brief WS lag) cannot trigger a full liquidation by itself.
+        # The counter resets to 0 whenever equity recovers above the threshold.
+        self._zombie_consecutive: int = 0
         log.info(
             "[P20-1] GlobalRiskManager init: zombie_pct=%.1f%% hwm=%.2f",
             zombie_pct, brain.peak_equity,
@@ -818,6 +1790,42 @@ class GlobalRiskManager:
             )
             return
 
+        # [P40.2-PLAUSIBILITY] Secondary plausibility shield — catches implausibly
+        # tiny positive equity that slips past the hard floor (e.g. eq≈1.011 when
+        # _last_valid_equity≈4980, ratio ≈ 0.02 %) while an active position or
+        # in-flight P37 exit exists.  A legitimate sustained account collapse would
+        # already have dragged _last_valid_equity downward across multiple cycles,
+        # so a single frame this extreme is definitionally transient/bogus.
+        # Neither HWM nor the zombie consecutive counter is touched on rejection.
+        try:
+            _exec = self._executor
+            _lve  = float(getattr(_exec, "_last_valid_equity", 0.0) or 0.0)
+            if (
+                _BRIDGE_EQUITY_PLAUSIBILITY_RATIO > 0.0
+                and _lve >= _EXECUTOR_MIN_VALID_EQUITY
+                and equity < _lve * _BRIDGE_EQUITY_PLAUSIBILITY_RATIO
+            ):
+                _has_ctx = bool(getattr(_exec, "positions", None)) or bool(
+                    any(getattr(_exec, "_p37_exit_in_flight", {}).values())
+                    if getattr(_exec, "_p37_exit_in_flight", {}) else False
+                )
+                if _has_ctx:
+                    _logger.warning(
+                        "[P20-1][PLAUSIBILITY-SHIELD] GlobalRiskManager.update: "
+                        "equity=%.6f is %.4f%% of _last_valid_equity=%.6f "
+                        "(threshold %.1f%%) with active context — "
+                        "implausible transient frame; HWM/zombie NOT updated.",
+                        equity,
+                        (equity / _lve * 100.0),
+                        _lve,
+                        _BRIDGE_EQUITY_PLAUSIBILITY_RATIO * 100.0,
+                    )
+                    return
+        except Exception as _plaus_exc:
+            _logger.debug(
+                "[P20-1][PLAUSIBILITY-SHIELD] check error (non-fatal): %s", _plaus_exc
+            )
+
         self._last_equity = equity
 
         if self._zombie_active:
@@ -847,7 +1855,26 @@ class GlobalRiskManager:
             except (TypeError, ZeroDivisionError):
                 return
             if drawdown_pct >= self._zombie_pct:
-                await self._trigger_zombie(equity, drawdown_pct)
+                # [PHASE1] Require _P20_ZOMBIE_CONSECUTIVE_REQUIRED sustained
+                # readings before triggering zombie mode. Resets on recovery.
+                self._zombie_consecutive += 1
+                _logger.warning(
+                    "[P20-1] Drawdown %.2f%% >= %.1f%% "
+                    "(consecutive reading %d / %d required)",
+                    drawdown_pct, self._zombie_pct,
+                    self._zombie_consecutive, _P20_ZOMBIE_CONSECUTIVE_REQUIRED,
+                )
+                if self._zombie_consecutive >= _P20_ZOMBIE_CONSECUTIVE_REQUIRED:
+                    await self._trigger_zombie(equity, drawdown_pct)
+            else:
+                # Equity recovered — reset the consecutive counter.
+                if self._zombie_consecutive > 0:
+                    _logger.info(
+                        "[P20-1] Equity recovered (drawdown=%.2f%% < %.1f%%) — "
+                        "zombie consecutive counter reset.",
+                        drawdown_pct, self._zombie_pct,
+                    )
+                self._zombie_consecutive = 0
 
         if _equity_lock is not None:
             async with _equity_lock:
@@ -1128,7 +2155,12 @@ class Executor:
 
         self._coin_cfgs:  Dict[str, CoinConfig] = _load_coin_configs(GUI_SETTINGS_PATH)
         self._cfgs_mtime: float = 0.0
-        self._last_hedge_ts: float = 0.0
+        # [PHASE14] Initialized to time.time() so the HEDGE_COOLDOWN_SECS guard
+        # is active from the very first cycle.  The previous value of 0.0 allowed
+        # a hedge trim to fire in the very first cycle if correlation was already
+        # high at startup.  Changing to time.time() closes that cold-start gap while
+        # preserving the full 300 s cooldown for all subsequent trims.
+        self._last_hedge_ts: float = time.time()
 
         self._p7_cb:         object = None
         self._p7_sizer:      object = None
@@ -1164,6 +2196,7 @@ class Executor:
 
         self._shadow_audit_path = SHADOW_AUDIT_PATH
         self._p19_ensure_shadow_csv()
+        self._p46_init_csv()          # [P46] Execution Quality Telemetry CSV
 
         self._init_db_pragmas()
 
@@ -1264,6 +2297,41 @@ class Executor:
         # blocked for that symbol and only limit orders are submitted.
         self._p32_limit_only_until: Dict[str, float] = {}
 
+        # [P32-RESTART / PHASE13] Reload any non-expired LIMIT_ONLY state from the
+        # sidecar written by previous sessions.  Entries whose expiry timestamp is
+        # already in the past are silently discarded.  If the file is absent, empty,
+        # or not valid JSON the dict stays empty and trading continues unaffected
+        # (fail-open).  This is a pure synchronous read — no DB query, no async I/O,
+        # no blocking network call.
+        try:
+            if os.path.exists(P32_LIMIT_ONLY_STATE_PATH):
+                with open(P32_LIMIT_ONLY_STATE_PATH, "r", encoding="utf-8") as _p32_f:
+                    _p32_raw: dict = json.load(_p32_f)
+                _now_boot = time.time()
+                _restored: List[str] = []
+                for _sym, _exp in _p32_raw.items():
+                    try:
+                        _exp_f = float(_exp)
+                    except (TypeError, ValueError):
+                        continue
+                    if _exp_f > _now_boot:
+                        self._p32_limit_only_until[_sym] = _exp_f
+                        _restored.append(
+                            f"{_sym}(expires in {(_exp_f - _now_boot) / 3600:.2f}h)"
+                        )
+                if _restored:
+                    log.info(
+                        "[P32-RESTART] Restored LIMIT_ONLY state for %d symbol(s) "
+                        "from previous session: %s",
+                        len(_restored), ", ".join(_restored),
+                    )
+        except Exception as _p32_load_exc:
+            log.warning(
+                "[P32-RESTART] Could not load %s — starting with empty LIMIT_ONLY "
+                "state (fail-open): %s",
+                P32_LIMIT_ONLY_STATE_PATH, _p32_load_exc,
+            )
+
         # [P32-VETO-ARB] Unified Veto Arbitrator — instantiated here so the
         # executor can inject fresh entropy/correlation/velocity data each cycle.
         self._p32_veto_arb: Optional[VetoArbitrator] = None
@@ -1337,7 +2405,73 @@ class Executor:
         # Per-symbol flag: True while an emergency exit task is in-flight.
         # Cleared by the exit task itself upon completion.
         self._p37_exit_in_flight: Dict[str, bool] = {}
+        # [PHASE9] Per-symbol consecutive-readings counter for the VPIN emergency
+        # exit guard.  Incremented when ToxicityScore > P37_EMERGENCY_EXIT_TOXICITY;
+        # reset to 0 when score drops back below threshold.  Exit fires only when
+        # this counter reaches P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED.
+        # In-memory only — resets to 0 on restart (fail-open: first spike after
+        # restart starts fresh, consistent with _p37_exit_in_flight design).
+        self._p37_tox_consecutive: Dict[str, int] = {}
         # ── [/P37-VPIN] ──────────────────────────────────────────────────────
+
+        # ── [PHASE14] P18 CATASTROPHE_VETO consecutive-guard state ────────────
+        # Per-symbol counter: how many consecutive CATASTROPHE_VETO verdicts have
+        # been received from the IntelligenceEngine for this symbol without a
+        # non-CATASTROPHE verdict in between.  Liquidation fires only when this
+        # counter reaches P18_CATASTROPHE_CONSECUTIVE_REQUIRED.
+        #
+        # The counter resets to 0 whenever the council returns any verdict other
+        # than CATASTROPHE_VETO for that symbol (VETO, ALLOW, BOOST, or neutral).
+        # In-memory only — resets to 0 on restart (fail-open, consistent with
+        # the P37 consecutive-counter design).
+        self._p18_catastrophe_consecutive: Dict[str, int] = {}
+        # ── [/PHASE14 P18 state] ──────────────────────────────────────────────
+
+        # ── [P39] Phase 39 — Ghost Oracle Lead-Lag Snipe state ───────────────
+        # Per-symbol timestamp of the last ghost snipe trigger (cooldown guard).
+        self._p39_last_snipe_ts: Dict[str, float] = {}
+        # Running count of ghost snipe fires; published in status for War Room.
+        self._p39_snipe_fires: int = 0
+        # Most recent Coinbase TPS measurement per symbol (cached for status).
+        self._p39_cb_tps_cache: Dict[str, float] = {}
+        # ── [/P39] ───────────────────────────────────────────────────────────
+
+        # ── [P41] Phase 41 — Adversarial Mimicry (Liquidity Baiting) state ───
+        # Per-symbol asyncio.Lock — only one bait test per symbol at a time.
+        self._p41_bait_locks:      Dict[str, asyncio.Lock] = {}
+        # Timestamp of last bait test per symbol (cooldown enforcement).
+        self._p41_last_bait_ts:    Dict[str, float] = {}
+        # System-wide count of currently open bait orders (P41_BAIT_MAX_OPEN guard).
+        self._p41_open_bait_count: int = 0
+        # Cumulative hidden-buyer confirmations (War Room telemetry).
+        self._p41_hidden_confirms: int = 0
+        # Cumulative accidental bait fills (leakage audit).
+        self._p41_accidental_fills: int = 0
+        # ── [/P41] ───────────────────────────────────────────────────────────
+
+        # ── [P46] Phase 46 — Execution Quality Telemetry state ───────────────
+        # Pending context dict populated in _maybe_enter() and consumed in
+        # _open_long() / _open_short() so fill_ts can be stamped accurately.
+        self._p46_pending_ctx:  Dict[str, dict] = {}
+        # Running count of telemetry rows written (triggers rotation check).
+        self._p46_row_count:    int = 0
+        # ── [/P46] ───────────────────────────────────────────────────────────
+
+        # ── [P45] Zero-Knowledge Privacy Layer — IcebergSlicer ───────────────
+        # Single instance per Executor.  Uses a dedicated numpy.random.Generator
+        # seeded from os.urandom(8) — not the global numpy state — so concurrent
+        # calls from any async loop do not share PRNG state.
+        # If P45_ENABLE=0, plan() is never invoked; the instance is idle.
+        self._p45_slicer: IcebergSlicer = IcebergSlicer()
+        # ── [/P45] ───────────────────────────────────────────────────────────
+
+        # ── [P44-DCB] Sentinel Rolling Drawdown Circuit Breaker state ─────────
+        # Written by Sentinel._tick() via RollingDrawdownCB.  Checked by
+        # _maybe_enter() to block new entries during a DCB freeze without
+        # touching open positions or the vol_guard.emergency_pause path.
+        self._dcb_frozen:       bool  = False
+        self._dcb_frozen_until: float = 0.0
+        # ── [/P44-DCB] ───────────────────────────────────────────────────────
 
         # ── [STAGE2-DEFECT1] OKX Position Reconciliation state ───────────────
         # Stores the latest OKX REST position snapshot keyed by base symbol.
@@ -1401,7 +2535,73 @@ class Executor:
             )
         # ── [/P40] ───────────────────────────────────────────────────────────
 
-    # ── [FIX-ISSUE-3] DB WAL initialisation ───────────────────────────────────
+        # ── [PHASE1] Per-symbol close-deduplication locks ─────────────────────
+        # Prevents two concurrent coroutines from both passing the
+        # `self.positions.get(symbol)` check and executing a double-close.
+        # _close_position acquires the per-symbol lock before proceeding;
+        # any concurrent call for the same symbol returns False immediately.
+        self._close_locks: Dict[str, asyncio.Lock] = {}
+
+        # ── [PHASE2/PHASE3] Per-symbol entry-in-flight guard ───────────────────
+        # Set True immediately before _open_long / _open_short / iceberg execution
+        # is awaited; cleared in the finally block after the call returns.
+        # Prevents a second concurrent _maybe_enter for the same symbol from
+        # passing the admission gate during the window between gate-pass and
+        # self.positions[symbol] being populated.
+        # Phase 3 extends coverage to trigger_atomic_express_trade (I1/D4)
+        # and _shadow_watcher (I2) so all entry paths share consistent dedup.
+        #
+        # [PHASE3-D5] NOT restart-persistent by design.  On process restart
+        # this dict is initialised empty regardless of any orders that were
+        # in-flight at the time of the crash/restart.  Practical duplicate-entry
+        # protection on restart is provided by self.positions: the exchange-side
+        # position reconciliation path re-populates self.positions before the
+        # first _maybe_enter cycle, so any symbol with an open position is
+        # skipped by the "if symbol in self.positions" guard in _maybe_enter.
+        # The narrow residual risk — an order placed but not yet filled at
+        # restart — remains open (D5).  A durable in-flight order journal is
+        # deferred post-roadmap.
+        self._entry_in_flight: Dict[str, bool] = {}
+
+        # ── [PHASE7] Per-symbol early-flush tracker for EARLY_FLUSH admission gate ──
+        # Keyed by base symbol.  Each value is a deque(maxlen=ADMISSION_FLUSH_LOOKBACK)
+        # of (ts: float, hold_time_secs: float) tuples representing recent short-hold
+        # RISK/ANOMALY exits.  Populated by _record_close().  Consulted by
+        # _admission_gate() to suppress re-entry after repeated early flushes.
+        #
+        # NOT restart-persistent by design — matches _entry_in_flight semantics.
+        # On restart the dict is empty and the gate is inert until new flushes
+        # are recorded in the current session.
+        self._flush_tracker: Dict[str, deque] = {}
+        # ── [/PHASE7] ─────────────────────────────────────────────────────────
+
+        # ── [PHASE11] Per-gate admission rejection counters ───────────────────
+        # Dict[gate_name: str → int].  Keyed by AdmissionResult.gate_name values
+        # (e.g. "SPREAD", "CONF", "EARLY_FLUSH", "SYMBOL_BLOCKED", etc.).
+        # Incremented at every call site where _admission_gate returns passed=False.
+        # In-memory only — resets on restart, consistent with _flush_tracker.
+        # Fail-open: increment errors are caught at call sites and never block
+        # any execution path.  Published to self._status["admission_policy"].
+        self._gate_rejection_counters: Dict[str, int] = {}
+        # ── [/PHASE11] ────────────────────────────────────────────────────────
+
+        # ── [PHASE1] Executor log file handler ───────────────────────────────
+        # Moved from module-level to __init__ so there are zero import-time
+        # filesystem side effects (acceptance test E.15).
+        try:
+            _log_file_handler = logging.FileHandler(
+                "executor.log", mode="a", encoding="utf-8"
+            )
+            _log_file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+                )
+            )
+            log.addHandler(_log_file_handler)
+        except Exception as _lf_exc:
+            log.warning(
+                "[PHASE1] Could not attach executor.log file handler: %s", _lf_exc
+            )
 
     def _init_db_pragmas(self) -> None:
         db_path: Optional[str] = None
@@ -1472,17 +2672,18 @@ class Executor:
             log.warning("[QUANT-1][%s] instrument_cache lookup failed: %s", tag, exc)
 
         if meta is None:
-            log.warning(
+            log.error(
                 "[QUANT-1][%s] No instrument metadata for %s swap=%s — "
-                "using raw_sz=%.10f as fallback (sCode 51000 risk).",
-                tag, symbol, swap, raw_sz,
+                "order ABORTED.  Admission gate should have blocked this; "
+                "this is a defence-in-depth fail-close.",
+                tag, symbol, swap,
             )
             return QuantizedSize(
-                sz_str=f"{raw_sz:.8f}",
-                sz_float=raw_sz,
+                sz_str="0",
+                sz_float=0.0,
                 lot_sz=_FALLBACK_LOT,
                 min_sz=_FALLBACK_MIN,
-                valid=raw_sz > 0,
+                valid=False,
             )
 
         lot_sz = float(getattr(meta, "sz_inst", 0.0) or 0.0)
@@ -1537,6 +2738,373 @@ class Executor:
             valid=valid,
         )
 
+    # ── [PHASE2] Trade Admission Gate ────────────────────────────────────────────
+    # Single canonical go/no-go check that every entry path must pass before any
+    # order reaches _place_order.  Called by _maybe_enter,
+    # trigger_atomic_express_trade, and the shadow watcher.
+    #
+    # Gate checks (in order — first failure returns immediately):
+    #   1. IN_FLIGHT       — no duplicate active entry attempt for this symbol
+    #   2. SYMBOL_BLOCKED  — symbol in ADMISSION_SUPPRESS_SYMBOLS (off by default)
+    #   3. REGIME_BLOCKED  — regime in ADMISSION_SUPPRESS_REGIMES (off by default)
+    #   4. METADATA        — instrument metadata must exist in InstrumentCache
+    #   5. SPREAD          — tick must be valid; bid/ask spread ≤ P23_SPREAD_GUARD_PCT
+    #   6. BRIDGE_*        — bridge connected, not ghost equity, not stale
+    #   7. CONF            — signal.confidence ≥ ADMISSION_MIN_CONFIDENCE (off by default)
+    #   8. EARLY_FLUSH     — symbol not in cooldown after repeated short RISK/ANOMALY exits (off by default)
+    #   9. EDGE            — kelly_f proxy ≥ ADMISSION_MIN_EDGE_PCT (off by default)
+    #
+    # Returns AdmissionResult(passed=True, reason="ok", gate_name="PASS") on success.
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    async def _admission_gate(
+        self,
+        symbol:     str,
+        use_swap:   bool,
+        kelly_f:    float = 0.0,
+        confidence: float = 0.0,
+        regime:     str   = "",
+    ) -> AdmissionResult:
+        """
+        [PHASE2/PHASE7/PHASE8] Hard go/no-go gate before any order submission.
+
+        Parameters
+        ----------
+        symbol     : canonical base symbol (e.g. "BTC"); normalisation is the
+                     caller's responsibility (already done by _maybe_enter).
+        use_swap   : True for SWAP instrument, False for SPOT.  Used to look up
+                     the correct InstrumentMeta entry.
+        kelly_f    : Kelly fraction from the strategy signal, used as a PROXY
+                     for expected edge when ADMISSION_MIN_EDGE_PCT > 0.
+                     NOTE: kelly_f is NOT a true net-edge model.  It does not
+                     account for OKX fees or slippage.  The edge gate is OFF by
+                     default (ADMISSION_MIN_EDGE_PCT = 0.0).
+        confidence : Signal confidence value, used by the CONF gate when
+                     ADMISSION_MIN_CONFIDENCE > 0.  This is a first-class
+                     admission parameter — unlike the soft min_conf floor in
+                     _maybe_enter(), this gate cannot be lowered by P39/P10
+                     bypasses and applies to all entry paths including express.
+                     The gate is OFF by default (ADMISSION_MIN_CONFIDENCE = 0.0).
+        regime     : Signal regime string (e.g. "bull", "bear", "chop").
+                     Used by the REGIME_BLOCKED gate when
+                     ADMISSION_SUPPRESS_REGIMES is non-empty.  Express-path
+                     callers pass regime="express".  The gate is OFF by default
+                     (ADMISSION_SUPPRESS_REGIMES = empty set).
+
+        Returns
+        -------
+        AdmissionResult — callers must check .passed.  gate_name identifies
+        which check produced the result; reason gives a loggable detail string.
+        """
+
+        # ── Check 1: in-flight dedup ──────────────────────────────────────────
+        # Blocks a second concurrent _maybe_enter for the same symbol that slips
+        # through between gate-pass and self.positions[symbol] being populated.
+        if self._entry_in_flight.get(symbol):
+            return AdmissionResult(
+                passed=False,
+                reason=f"entry already in flight for {symbol}",
+                gate_name="IN_FLIGHT",
+            )
+
+        # ── Check 1a: concurrent-position cap (off by default) ───────────────
+        # [TRACK14-GC1] CONCURRENT_CAP gate — hard maximum open-position count.
+        # When ADMISSION_MAX_OPEN_POSITIONS > 0, blocks if the number of currently
+        # open positions is already at or above the limit.  Single O(1) dict-len
+        # check against the in-memory self.positions dict.  No async I/O.
+        # Gate is DISABLED by default (ADMISSION_MAX_OPEN_POSITIONS = 0).
+        if ADMISSION_MAX_OPEN_POSITIONS > 0:
+            _n_open = len(self.positions)
+            if _n_open >= ADMISSION_MAX_OPEN_POSITIONS:
+                return AdmissionResult(
+                    passed=False,
+                    reason=(
+                        f"open_positions={_n_open} >= "
+                        f"ADMISSION_MAX_OPEN_POSITIONS={ADMISSION_MAX_OPEN_POSITIONS}"
+                    ),
+                    gate_name="CONCURRENT_CAP",
+                )
+
+        # ── Check 1b: deployed-capital cap (off by default) ──────────────────
+        # [TRACK14-GC2] DEPLOYED_CAP gate — hard maximum portfolio deployment %.
+        # When ADMISSION_MAX_DEPLOYED_PCT > 0.0, blocks if the sum of open
+        # position cost-bases (usd_cost) divided by current equity is at or above
+        # the threshold.  Fails OPEN (never blocks) when equity <= 0 to avoid
+        # false suppression during ghost-equity states.  Any individual position
+        # with a missing or non-numeric usd_cost is treated as 0.0 — the gate
+        # never raises or blocks due to partial position data.
+        # Gate is DISABLED by default (ADMISSION_MAX_DEPLOYED_PCT = 0.0).
+        if ADMISSION_MAX_DEPLOYED_PCT > 0.0 and self._equity > 0.0 and self.positions:
+            try:
+                _deployed_usd = sum(
+                    float(p.usd_cost) if p.usd_cost and p.usd_cost == p.usd_cost  # NaN guard
+                    else 0.0
+                    for p in self.positions.values()
+                )
+                _deployed_pct = _deployed_usd / self._equity
+                if _deployed_pct >= ADMISSION_MAX_DEPLOYED_PCT:
+                    return AdmissionResult(
+                        passed=False,
+                        reason=(
+                            f"deployed_pct={_deployed_pct:.4f} "
+                            f">= ADMISSION_MAX_DEPLOYED_PCT={ADMISSION_MAX_DEPLOYED_PCT:.4f} "
+                            f"(deployed_usd={round(_deployed_usd, 2)} "
+                            f"equity={round(self._equity, 2)})"
+                        ),
+                        gate_name="DEPLOYED_CAP",
+                    )
+            except Exception as _dc_exc:
+                # Fail-open: any arithmetic error must never silently block a trade.
+                log.debug(
+                    "[TRACK14-GC2] DEPLOYED_CAP gate arithmetic error (fail-open): %s",
+                    _dc_exc,
+                )
+
+        # ── Check 1c: per-symbol cost-basis cap (off by default) ─────────────
+        # [TRACK27-PSC1] PER_SYMBOL_CAP gate — hard maximum cost-basis for a
+        # single symbol.  When ADMISSION_MAX_PER_SYMBOL_USD > 0.0, blocks if the
+        # existing open position for this symbol has a cost-basis (usd_cost) that
+        # is already at or above the threshold.  Gate is a no-op when the symbol
+        # has no open position — a fresh first entry is always allowed.
+        # Any attribute or arithmetic error fails OPEN; corrupt position records
+        # must never silently suppress valid entries.
+        # Gate is DISABLED by default (ADMISSION_MAX_PER_SYMBOL_USD = 0.0).
+        if ADMISSION_MAX_PER_SYMBOL_USD > 0.0 and symbol in self.positions:
+            try:
+                _pos_usd = self.positions[symbol].usd_cost
+                _pos_usd_f = (
+                    float(_pos_usd)
+                    if (_pos_usd is not None and _pos_usd == _pos_usd)  # NaN guard
+                    else 0.0
+                )
+                if _pos_usd_f >= ADMISSION_MAX_PER_SYMBOL_USD:
+                    return AdmissionResult(
+                        passed=False,
+                        reason=(
+                            f"{symbol} usd_cost={round(_pos_usd_f, 2)} >= "
+                            f"ADMISSION_MAX_PER_SYMBOL_USD="
+                            f"{round(ADMISSION_MAX_PER_SYMBOL_USD, 2)}"
+                        ),
+                        gate_name="PER_SYMBOL_CAP",
+                    )
+            except Exception as _psc_exc:
+                # Fail-open: any error must never silently block a trade.
+                log.debug(
+                    "[TRACK27-PSC1] PER_SYMBOL_CAP gate error for %s (fail-open): %s",
+                    symbol, _psc_exc,
+                )
+
+        # ── Check 2: symbol suppression (off by default) ─────────────────────
+        # [PHASE8] SYMBOL_BLOCKED gate — hard operator-specified symbol block.
+        # When ADMISSION_SUPPRESS_SYMBOLS is non-empty, any symbol in the set is
+        # unconditionally blocked before any async I/O (metadata/spread/bridge).
+        # This is a fail-closed O(1) frozenset lookup.  There is no bypass
+        # mechanism; the operator controls inclusion via the env var.
+        # Gate is DISABLED by default (empty frozenset).
+        if ADMISSION_SUPPRESS_SYMBOLS and symbol in ADMISSION_SUPPRESS_SYMBOLS:
+            return AdmissionResult(
+                passed=False,
+                reason=f"{symbol} is in ADMISSION_SUPPRESS_SYMBOLS — operator-suppressed",
+                gate_name="SYMBOL_BLOCKED",
+            )
+
+        # ── Check 3: regime suppression (off by default) ─────────────────────
+        # [PHASE8] REGIME_BLOCKED gate — hard operator-specified regime block.
+        # When ADMISSION_SUPPRESS_REGIMES is non-empty, any entry whose signal
+        # regime (lowercased) is in the set is unconditionally blocked.
+        # This is a fail-closed O(1) frozenset lookup against the lowercased
+        # regime string.  Express-path callers pass regime="express"; including
+        # "express" in the set will block all express-path trades — intentional.
+        # Gate is DISABLED by default (empty frozenset).
+        if ADMISSION_SUPPRESS_REGIMES and regime.lower() in ADMISSION_SUPPRESS_REGIMES:
+            return AdmissionResult(
+                passed=False,
+                reason=(
+                    f"regime='{regime}' is in ADMISSION_SUPPRESS_REGIMES "
+                    f"— operator-suppressed"
+                ),
+                gate_name="REGIME_BLOCKED",
+            )
+
+        # ── Check 4: instrument metadata must exist ───────────────────────────
+        # A missing metadata entry means either the symbol is unknown to OKX or
+        # the instrument cache has not yet populated.  In either case submitting
+        # an order would produce sCode 51000 / "Instrument ID doesn't exist".
+        # Fail-closed: no metadata → no order.
+        try:
+            _meta = await self._icache.get_instrument_info(symbol, swap=use_swap)
+        except Exception as _meta_exc:
+            return AdmissionResult(
+                passed=False,
+                reason=f"metadata lookup raised: {_meta_exc}",
+                gate_name="METADATA",
+            )
+        if _meta is None:
+            return AdmissionResult(
+                passed=False,
+                reason=f"no instrument metadata for {symbol} swap={use_swap}",
+                gate_name="METADATA",
+            )
+
+        # ── Check 5: tick validity + spread guard ─────────────────────────────
+        # Fetch a fresh tick here.  The result is NOT passed downstream to
+        # avoid a stale-tick race; _execute_order / _open_long fetch their own.
+        # Spread guard applies to ALL execution paths (TWAP, iceberg, P16, normal).
+        try:
+            _tick = await self.hub.get_tick(symbol)
+        except Exception as _tick_exc:
+            return AdmissionResult(
+                passed=False,
+                reason=f"tick fetch raised: {_tick_exc}",
+                gate_name="SPREAD",
+            )
+        if not _tick or _tick.ask <= 0 or _tick.bid <= 0:
+            return AdmissionResult(
+                passed=False,
+                reason=f"no valid tick for {symbol} (ask={getattr(_tick,'ask',None)} bid={getattr(_tick,'bid',None)})",
+                gate_name="SPREAD",
+            )
+        _spread_pct = (_tick.ask - _tick.bid) / _tick.bid * 100.0
+        if _spread_pct > P23_SPREAD_GUARD_PCT:
+            return AdmissionResult(
+                passed=False,
+                reason=(
+                    f"spread={_spread_pct:.5f}% > threshold={P23_SPREAD_GUARD_PCT:.3f}% "
+                    f"for {symbol}"
+                ),
+                gate_name="SPREAD",
+            )
+
+        # ── Check 6: bridge health ────────────────────────────────────────────
+        # The _p40_ready_gate is a startup-only event.  This check provides
+        # runtime bridge health gating on every entry attempt.
+        if self.bridge is not None:
+            # 4a: transport connectivity
+            if not getattr(self.bridge, "connected", True):
+                return AdmissionResult(
+                    passed=False,
+                    reason="bridge transport disconnected",
+                    gate_name="BRIDGE_DISCONNECTED",
+                )
+            # 4b: ghost equity — bridge is connected but equity value is suspect
+            if getattr(self.bridge, "equity_is_ghost", False):
+                return AdmissionResult(
+                    passed=False,
+                    reason="bridge equity is in ghost state (WS=0, REST unverified)",
+                    gate_name="BRIDGE_GHOST_EQUITY",
+                )
+            # 4c: stale equity — bridge connected but no valid equity push recently
+            if ADMISSION_BRIDGE_STALE_SECS > 0:
+                _last_eq_ts = getattr(self.bridge, "last_equity_ts", 0.0)
+                if _last_eq_ts > 0:
+                    _age = time.time() - _last_eq_ts
+                    if _age > ADMISSION_BRIDGE_STALE_SECS:
+                        return AdmissionResult(
+                            passed=False,
+                            reason=(
+                                f"bridge equity stale: last valid push "
+                                f"{_age:.0f}s ago > threshold {ADMISSION_BRIDGE_STALE_SECS:.0f}s"
+                            ),
+                            gate_name="BRIDGE_STALE",
+                        )
+
+        # ── Check 7: minimum confidence (off by default) ──────────────────────
+        # [PHASE7] CONF gate — hard confidence floor enforced at the admission
+        # layer.  Unlike the soft min_conf floor in _maybe_enter(), this check
+        # cannot be lowered by P39 ghost-snipe or P10 priority-deploy bypasses,
+        # and applies to ALL entry paths including trigger_atomic_express_trade.
+        #
+        # The gate is DISABLED by default (ADMISSION_MIN_CONFIDENCE = 0.0) and
+        # must be explicitly enabled by the operator via the env var, ideally
+        # after reviewing the Phase 6 entry-quality (winner vs loser) diagnostics.
+        #
+        # [FIX-EXPRESS-CONF] Express-path callers pass confidence=0.0 and
+        # regime="express" because there is no Signal object in the express
+        # whale path — the entry is justified by the oracle whale multiplier
+        # alone, not by a brain signal.  Applying the brain-signal confidence
+        # floor to express entries is a category error: it compares a missing
+        # value (0.0) against a threshold calibrated for brain signals, and
+        # systematically blocks every express trade when the gate is enabled.
+        # Express entries are already gated by: (a) the oracle whale multiplier
+        # threshold in trigger_atomic_express_trade, (b) the P32 VetoArbitrator
+        # p_success check, and (c) the P37/P38/P42 hard-veto gates inside
+        # compute_p_success().  The CONF floor is redundant and harmful here.
+        # Exemption applies ONLY when regime="express" — normal signal-path
+        # entries are unaffected.
+        if (
+            ADMISSION_MIN_CONFIDENCE > 0.0
+            and confidence < ADMISSION_MIN_CONFIDENCE
+            and regime != "express"
+        ):
+            return AdmissionResult(
+                passed=False,
+                reason=(
+                    f"confidence={confidence:.6f} < ADMISSION_MIN_CONFIDENCE="
+                    f"{ADMISSION_MIN_CONFIDENCE:.6f}"
+                ),
+                gate_name="CONF",
+            )
+
+        # ── Check 8: early-flush cooldown (off by default) ───────────────────
+        # [PHASE7] EARLY_FLUSH gate — suppresses re-entry for a symbol that has
+        # had ADMISSION_FLUSH_LOOKBACK consecutive short-hold RISK/ANOMALY exits
+        # recently.  "Short-hold" means hold_time_secs < ADMISSION_FLUSH_MAX_HOLD_SECS.
+        #
+        # The flush deque for each symbol is populated in _record_close() and is
+        # in-memory only (not restart-persistent).
+        #
+        # The gate is DISABLED by default (ADMISSION_FLUSH_COOLDOWN_SECS = 0.0)
+        # and must be explicitly enabled by the operator via the env var, ideally
+        # after reviewing the Phase 6 hold-time and exit-category diagnostics.
+        if ADMISSION_FLUSH_COOLDOWN_SECS > 0.0:
+            try:
+                _flush_deque = self._flush_tracker.get(symbol)
+                if (
+                    _flush_deque is not None
+                    and len(_flush_deque) >= ADMISSION_FLUSH_LOOKBACK
+                ):
+                    _most_recent_ts = _flush_deque[-1][0]
+                    _age_since_flush = time.time() - _most_recent_ts
+                    if _age_since_flush < ADMISSION_FLUSH_COOLDOWN_SECS:
+                        return AdmissionResult(
+                            passed=False,
+                            reason=(
+                                f"{symbol}: {len(_flush_deque)} consecutive short "
+                                f"RISK/ANOMALY exits (last {_age_since_flush:.0f}s ago); "
+                                f"cooldown={ADMISSION_FLUSH_COOLDOWN_SECS:.0f}s — "
+                                f"EARLY_FLUSH gate active"
+                            ),
+                            gate_name="EARLY_FLUSH",
+                        )
+            except Exception as _flush_exc:
+                # Fail-open: tracker errors must never silently block a trade.
+                # Log at debug so the issue is visible without polluting INFO.
+                log.debug(
+                    "[PHASE7-GATE] EARLY_FLUSH tracker error for %s: %s (fail-open)",
+                    symbol, _flush_exc,
+                )
+
+        # ── Check 9: expected-edge proxy (off by default) ─────────────────────
+        # PROXY NOTE: kelly_f is the Kelly fraction from the strategy signal.
+        # It is used here only as a rough expected-edge proxy.  It does NOT
+        # account for OKX maker/taker fees or realised slippage.  A true
+        # fee-and-slippage-adjusted edge gate is deferred to a future phase.
+        # This gate is DISABLED by default (ADMISSION_MIN_EDGE_PCT = 0.0) and
+        # must be explicitly enabled by the operator via the env var.
+        if ADMISSION_MIN_EDGE_PCT > 0.0 and kelly_f < ADMISSION_MIN_EDGE_PCT:
+            return AdmissionResult(
+                passed=False,
+                reason=(
+                    f"kelly_f={kelly_f:.6f} < ADMISSION_MIN_EDGE_PCT={ADMISSION_MIN_EDGE_PCT:.6f} "
+                    f"(proxy-only gate; does not include fees/slippage)"
+                ),
+                gate_name="EDGE",
+            )
+
+        return AdmissionResult(passed=True, reason="ok", gate_name="PASS")
+
+    # ── [/PHASE2-GATE] ────────────────────────────────────────────────────────
+
     # ── [P19-2] Shadow Auditor helpers ────────────────────────────────────────
 
     def _p19_ensure_shadow_csv(self) -> None:
@@ -1563,6 +3131,11 @@ class Executor:
         narrative_score:      Optional[float],
         fill_px:              float,
         fill_sz:              float,
+        # ── [P46] Precision telemetry ─────────────────────────────────────────
+        signal_ts:            float = 0.0,
+        theoretical_px:       float = 0.0,
+        p39_active:           int   = 0,
+        p41_active:           int   = 0,
     ) -> None:
         row = [
             int(time.time()), symbol, direction, tag,
@@ -1573,9 +3146,20 @@ class Executor:
             round(narrative_score, 4) if narrative_score is not None else "",
             round(fill_px, 6),
             round(fill_sz, 6),
+            # ── [P46] ─────────────────────────────────────────────────────────
+            round(signal_ts,       3) if signal_ts      > 0 else "",
+            round(theoretical_px,  6) if theoretical_px > 0 else "",
+            p39_active,
+            p41_active,
         ]
         try:
-            tmp_path = self._shadow_audit_path + ".tmp"
+            import tempfile as _tf19
+            _sa_dir = os.path.dirname(os.path.abspath(self._shadow_audit_path))
+            _tmp_sa = None
+            try:
+                os.makedirs(_sa_dir, exist_ok=True)
+            except Exception:
+                pass
             existing_rows: List[list] = []
             if os.path.exists(self._shadow_audit_path):
                 with open(self._shadow_audit_path, "r", newline="", encoding="utf-8") as f:
@@ -1583,10 +3167,30 @@ class Executor:
             if not existing_rows or existing_rows[0] != _SHADOW_AUDIT_HEADER:
                 existing_rows.insert(0, _SHADOW_AUDIT_HEADER)
             existing_rows.append(row)
-            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerows(existing_rows)
-            os.replace(tmp_path, self._shadow_audit_path)
+            with _tf19.NamedTemporaryFile(
+                mode="w", newline="", encoding="utf-8", suffix=".tmp",
+                dir=_sa_dir, delete=False
+            ) as _f:
+                _tmp_sa = _f.name
+                csv.writer(_f).writerows(existing_rows)
+                # [D1-A / PHASE13] fsync before close so the rename survives a
+                # power-loss between write and os.replace.  The NamedTemporaryFile
+                # context manager closes the file immediately after this block exits,
+                # so fsync must be called here while the fd is still open.
+                _f.flush()
+                os.fsync(_f.fileno())
+            try:
+                os.replace(_tmp_sa, self._shadow_audit_path)
+                _tmp_sa = None  # ownership transferred — do not clean up
+            except Exception:
+                # [D1-A / PHASE13] Explicit temp cleanup when os.replace fails so
+                # no orphaned .tmp file is left on disk.
+                if _tmp_sa:
+                    try:
+                        os.unlink(_tmp_sa)
+                    except Exception:
+                        pass
+                raise
             log.info(
                 "[P19-2] Shadow log: %s %s real=$%.2f baseline=$%.2f "
                 "mult=%.3fx verdict=%s fill_px=%.4f fill_sz=%.6f",
@@ -1600,6 +3204,139 @@ class Executor:
                     csv.writer(f).writerow(row)
             except Exception as exc2:
                 log.error("[P19-2] Shadow log completely failed: %s", exc2)
+
+    # ── [P46] Phase 46 — Execution Quality Telemetry ──────────────────────────
+
+    def _p46_init_csv(self) -> None:
+        """
+        [P46] Create execution_telemetry.csv with header if it does not exist.
+        Called once at bot startup and after each rotation.
+        """
+        if not P46_TELEM_ENABLE:
+            return
+        if os.path.exists(P46_TELEM_PATH):
+            # Count existing data rows for rotation tracking.
+            try:
+                with open(P46_TELEM_PATH, "r", newline="", encoding="utf-8") as f:
+                    # subtract 1 for header row
+                    self._p46_row_count = max(0, sum(1 for _ in f) - 1)
+            except Exception:
+                self._p46_row_count = 0
+            return
+        try:
+            os.makedirs(os.path.dirname(P46_TELEM_PATH) or ".", exist_ok=True)
+            with open(P46_TELEM_PATH, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(_P46_TELEM_HEADER)
+            log.info("[P46-TELEM] Telemetry CSV created: %s", P46_TELEM_PATH)
+            self._p46_row_count = 0
+        except Exception as exc:
+            log.warning("[P46-TELEM] Could not create telemetry CSV: %s", exc)
+
+    def _p46_record_entry(
+        self,
+        symbol:     str,
+        direction:  str,
+        signal,
+        fill_px:    float,
+        fill_sz:    float,
+        usd_amount: float,
+        tag:        str,
+        fill_ts:    float,
+    ) -> None:
+        """
+        [P46] Write one telemetry row for a confirmed entry fill.
+
+        Consumes self._p46_pending_ctx[symbol] (set by _maybe_enter) to
+        recover signal_ts, order_ts, theoretical_px, and phase flags.
+        All latency values are in milliseconds, slippage_bps is signed
+        (positive = paid more than theoretical = cost us money).
+
+        File rotation: when _p46_row_count reaches P46_TELEM_MAX_ROWS the
+        current file is archived with a UTC timestamp suffix and a fresh
+        file with header is started.
+        """
+        if not P46_TELEM_ENABLE:
+            return
+        try:
+            ctx = self._p46_pending_ctx.pop(symbol, {})
+
+            signal_ts = ctx.get("signal_ts", 0.0)
+            order_ts  = ctx.get("order_ts",  fill_ts)   # fallback = fill_ts
+            theo_px   = ctx.get("theoretical_px", 0.0)
+
+            sig_to_ord_ms = round((order_ts  - signal_ts) * 1000.0, 2) if signal_ts > 0 else ""
+            ord_to_fill_ms = round((fill_ts  - order_ts)  * 1000.0, 2) if order_ts  > 0 else ""
+            total_lat_ms   = round((fill_ts  - signal_ts) * 1000.0, 2) if signal_ts > 0 else ""
+
+            # Slippage: positive = fill_px above theoretical (bad for longs,
+            # good for shorts).  Sign-adjusted so positive always means we
+            # paid more than expected (adverse slippage).
+            if theo_px > 0 and fill_px > 0:
+                raw_slip = (fill_px - theo_px) / theo_px * 10_000.0
+                slippage_bps = round(raw_slip if direction == "long" else -raw_slip, 3)
+            else:
+                slippage_bps = ""
+
+            row = [
+                round(fill_ts,   3),
+                round(signal_ts, 3) if signal_ts else "",
+                round(order_ts,  3) if order_ts  else "",
+                sig_to_ord_ms,
+                ord_to_fill_ms,
+                total_lat_ms,
+                symbol,
+                direction,
+                getattr(signal, "regime",     ""),
+                tag,
+                round(getattr(signal, "confidence", 0.0), 4),
+                round(getattr(signal, "kelly_f",    0.0), 6),
+                round(usd_amount, 2),
+                round(theo_px,   6) if theo_px else "",
+                round(fill_px,   6),
+                round(fill_sz,   6),
+                slippage_bps,
+                ctx.get("p39_active",     0),
+                round(ctx.get("p39_cb_tps",    0.0), 2),
+                round(ctx.get("p39_size_boost", 1.0), 4),
+                ctx.get("p41_confirmed",  0),
+                round(ctx.get("p41_bait_boost", 1.0), 4),
+            ]
+
+            # ── Rotation check ─────────────────────────────────────────────
+            if self._p46_row_count >= P46_TELEM_MAX_ROWS:
+                try:
+                    import datetime
+                    _stamp   = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    _archive = P46_TELEM_PATH.replace(".csv", f"_{_stamp}.csv")
+                    os.rename(P46_TELEM_PATH, _archive)
+                    log.info(
+                        "[P46-TELEM] Rotated after %d rows → %s",
+                        self._p46_row_count, _archive,
+                    )
+                except Exception as _rot_exc:
+                    log.debug("[P46-TELEM] Rotation error (non-critical): %s", _rot_exc)
+                # Write fresh file with header regardless of rotation success.
+                with open(P46_TELEM_PATH, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(_P46_TELEM_HEADER)
+                self._p46_row_count = 0
+
+            # ── Append row ─────────────────────────────────────────────────
+            with open(P46_TELEM_PATH, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
+            self._p46_row_count += 1
+
+            log.debug(
+                "[P46-TELEM] %s %s fill_px=%.6f slippage=%sbps "
+                "total_lat=%sms p39=%s p41=%s row=%d",
+                symbol, direction, fill_px, slippage_bps,
+                total_lat_ms,
+                ctx.get("p39_active", 0), ctx.get("p41_confirmed", 0),
+                self._p46_row_count,
+            )
+        except Exception as exc:
+            log.debug("[P46-TELEM] record_entry error (non-critical): %s", exc)
+
+    # ── [/P46] ────────────────────────────────────────────────────────────────
 
     # ── Per-coin config ────────────────────────────────────────────────────────
     def _coin_cfg(self, symbol: str) -> CoinConfig:
@@ -2076,6 +3813,16 @@ class Executor:
                     _accepted_avail  = baseline_avail
                     self._equity = _accepted_equity
                     self._avail  = _accepted_avail
+                    # [FIX-KELLY-ZERO] Seed _last_valid_equity from avail so
+                    # Kelly sizing does not collapse to $0 on cold start.
+                    # This is only set if _last_valid_equity is still 0 (never seeded).
+                    if not self._last_valid_equity or self._last_valid_equity <= 0.0:
+                        self._last_valid_equity = _accepted_equity
+                        log.info(
+                            "[FIX-KELLY-ZERO] _last_valid_equity seeded from avail=%.2f "
+                            "(was 0 — Kelly sizing now has a valid baseline).",
+                            _accepted_equity,
+                        )
                     self._consecutive_ghost_reads = 0
                     self._equity_is_ghost = False
                     _dd_equity = _accepted_equity
@@ -2230,6 +3977,9 @@ class Executor:
                     "order_id":     ord_id,
                     "inst_type":    inst_type,
                 })
+                if hasattr(self.db, 'commit'):
+                    await self.db.commit()
+                log.info("[DB-SYNC] Trade committed for %s | Side: %s", base_sym, str(fill.get("side") or ""))
         except Exception as _fill_db_exc:
             log.error(
                 "[STAGE2-DEFECT2] _on_fill_event: DB insert failed — "
@@ -2244,13 +3994,16 @@ class Executor:
 
     async def _touch_hub_timestamp(self, *, force: bool = False) -> None:
         """
-        [P40.1-HB] Atomically update ONLY the ``timestamp`` field in the hub
-        status file so the Watchdog never declares STALE on a healthy bot
-        whose 2-second _gui_bridge write cycle hasn't fired yet.
+        [P40.1-HB] Update the ``timestamp`` field in the in-memory status dict
+        so the Watchdog never declares STALE on a healthy bot between cycle-end
+        writes.
 
-        Throttled: writes at most once per _hb_min_interval seconds unless
-        ``force=True`` (used for ghost-heal and fill events where freshness
-        matters).
+        [FIX-SINGLE-WRITER] File read/write removed.  ``timestamp`` is now
+        patched directly into self._status; the cycle-end _write_status_json()
+        carries it to disk (≤ 1 s latency).  The throttle gate is preserved.
+
+        Throttled: updates at most once per _hb_min_interval seconds unless
+        ``force=True`` (used for ghost-heal and fill events).
 
         Silently swallows all exceptions — must never crash a bridge handler.
         """
@@ -2261,16 +4014,8 @@ class Executor:
                 return
             async with self._status_lock:
                 self._hb_last_write_ts = now
-                try:
-                    with open(TRADER_STATUS_PATH, "r", encoding="utf-8") as _f:
-                        _doc = json.load(_f)
-                except (FileNotFoundError, json.JSONDecodeError):
-                    _doc = {}
-                _doc["timestamp"] = now
-                tmp = TRADER_STATUS_PATH + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as _f:
-                    json.dump(_doc, _f)
-                os.replace(tmp, TRADER_STATUS_PATH)
+                if self._status:
+                    self._status["timestamp"] = now
         except Exception as _exc:
             log.debug("[P40.1-HB] _touch_hub_timestamp error (non-fatal): %s", _exc)
 
@@ -2324,20 +4069,79 @@ class Executor:
         except Exception as _rg_exc:
             log.debug("[P40.1-RG] Ready-Gate set error (non-fatal): %s", _rg_exc)
 
-        # ── [P40.1-SHIELD] Binary Truth Shield (Position-Aware) ────────────────
-        # If positions are open, any equity <= 1.0 is treated as a Ghost Read,
-        # even if the bridge forgot to set is_ghost. Never overwrite
-        # _last_valid_equity in this state.
+        # ── [P40.1-SHIELD] Binary Truth Shield (Position-Aware + Plausibility) ──
+        # Rejects two categories of bogus bridge equity frames:
+        #
+        #   A) Hard-floor reject  — eq <= 1.0 with open context (original guard).
+        #
+        #   B) Plausibility-ratio reject — eq is a tiny fraction of the last
+        #      confirmed valid equity (e.g. eq≈1.011 vs _last_valid_equity≈4980,
+        #      ratio ≈ 0.02 %) while positions are open or a P37 exit is in-flight.
+        #      This is the defect fix for the false global-drawdown / false
+        #      circuit-breaker trip caused by transient near-zero bridge frames
+        #      during an in-flight emergency toxicity close.
+        #
+        # Rejected frames do NOT update _equity, _last_valid_equity, drawdown
+        # trackers, HWM, or circuit-breaker inputs.  Legitimate equity updates
+        # (sustained real collapses) still propagate normally because they cannot
+        # arrive as a single tiny spike while LKG remains healthy.
         try:
-            if self.has_open_positions() and eq <= 1.0:
-                _ret = getattr(self, "_last_valid_equity", 0.0) or getattr(self, "_equity", 0.0) or eq
-                log.warning(
-                    "[SHIELD-REJECT] Bridge account_update rejected: eq=%.6f ≤ 1.0 "
-                    "with open positions — retaining _last_valid_equity=%.6f",
-                    eq, _ret,
-                )
+            _lve = (
+                getattr(self, "_last_valid_equity", 0.0) or
+                getattr(self, "_equity",            0.0) or
+                0.0
+            )
+            _has_pos     = self.has_open_positions()
+            _any_p37_out = any(self._p37_exit_in_flight.values()) \
+                           if self._p37_exit_in_flight else False
+            _context_active = _has_pos or _any_p37_out
+
+            # A) Hard-floor: always reject eq <= 1.0 when context is active.
+            _hard_floor_reject = _context_active and eq <= 1.0
+
+            # B) Plausibility-ratio: reject implausibly tiny positive eq.
+            #    Only evaluated when the hard-floor would not already catch it,
+            #    we have a credible LKG reference, and the ratio guard is enabled.
+            _plausibility_reject = False
+            _ratio = None
+            if (
+                not _hard_floor_reject
+                and _context_active
+                and _lve >= _EXECUTOR_MIN_VALID_EQUITY
+                and eq > 0.0
+                and _BRIDGE_EQUITY_PLAUSIBILITY_RATIO > 0.0
+            ):
+                _ratio = eq / _lve
+                if _ratio < _BRIDGE_EQUITY_PLAUSIBILITY_RATIO:
+                    _plausibility_reject = True
+
+            if _hard_floor_reject or _plausibility_reject:
+                _ret = _lve or eq
+                if _hard_floor_reject:
+                    log.warning(
+                        "[SHIELD-REJECT] Bridge account_update rejected: eq=%.6f ≤ 1.0 "
+                        "with open positions — retaining _last_valid_equity=%.6f",
+                        eq, _ret,
+                    )
+                else:
+                    log.warning(
+                        "[SHIELD-REJECT][PLAUSIBILITY] Bridge account_update rejected "
+                        "as implausible transient frame: eq=%.6f is %.4f%% of "
+                        "_last_valid_equity=%.6f (threshold %.1f%%) — "
+                        "context: has_pos=%s p37_exit=%s — "
+                        "_equity/_last_valid_equity/drawdown/CB NOT updated. "
+                        "Retaining _last_valid_equity=%.6f.",
+                        eq,
+                        (_ratio * 100.0) if _ratio is not None else 0.0,
+                        _lve,
+                        _BRIDGE_EQUITY_PLAUSIBILITY_RATIO * 100.0,
+                        _has_pos, _any_p37_out,
+                        _ret,
+                    )
                 self._equity_is_ghost = True
-                self._consecutive_ghost_reads = int(getattr(self, "_consecutive_ghost_reads", 0) or 0) + 1
+                self._consecutive_ghost_reads = (
+                    int(getattr(self, "_consecutive_ghost_reads", 0) or 0) + 1
+                )
                 return
         except Exception as _shield_exc:
             # Never allow shield logic to crash the bridge handler.
@@ -2466,49 +4270,39 @@ class Executor:
                 self._equity_is_ghost         = False
                 self._ghost_poll_in_flight    = False
 
-        # [ATOMIC-MIRROR-SYNC] Immediate atomic status patch — bypass 2-second
-        # GUI cycle so Dashboard shows Binary Truth immediately.
+        # [FIX-SINGLE-WRITER] Immediate in-memory status patch — no file write.
+        # The cycle-end _write_status_json() carries these mutations to disk
+        # within ≤ 1 s.  The _status_lock guards the multi-key mutation so
+        # _cycle() cannot read a half-updated dict.
         _retained = healed_eq if healed_eq > 0.0 else (self._equity or 0.0)
         try:
+            _now = time.time()
             async with self._status_lock:
-                try:
-                    with open(TRADER_STATUS_PATH, "r", encoding="utf-8") as _f:
-                        _doc = json.load(_f)
-                except (FileNotFoundError, json.JSONDecodeError):
-                    _doc = {}
-                _now = time.time()
-                _doc["timestamp"]               = _now
-                _doc["equity_is_ghost"]         = False
-                _doc["consecutive_ghost_reads"] = 0
-                _doc["p40_ghost_heal_source"]   = source
-                _doc["p40_ghost_heal_count"]    = ghost_count
-                _doc["p40_last_heal_ts"]        = _now
-                _doc["zombie_mode"]             = False
-                _doc["p20_zombie_mode"]         = False
-                if "account" not in _doc or not isinstance(_doc["account"], dict):
-                    _doc["account"] = {}
-                _doc["account"]["total_equity"]    = _retained
-                _doc["account"]["retained_equity"] = _retained
-                if isinstance(_doc.get("p20_global_risk"), dict):
-                    _doc["p20_global_risk"]["zombie_mode_status"] = False
-                    _doc["p20_global_risk"]["current_equity"]     = round(_retained, 2)
-                _tmp = TRADER_STATUS_PATH + ".tmp"
-                with open(_tmp, "w", encoding="utf-8") as _f:
-                    json.dump(_doc, _f, default=str)
-                os.replace(_tmp, TRADER_STATUS_PATH)
+                if self._status:
+                    self._status["timestamp"]               = _now
+                    self._status["equity_is_ghost"]         = False
+                    self._status["consecutive_ghost_reads"] = 0
+                    self._status["p40_ghost_heal_source"]   = source
+                    self._status["p40_ghost_heal_count"]    = ghost_count
+                    self._status["p40_last_heal_ts"]        = _now
+                    self._status["zombie_mode"]             = False
+                    self._status["p20_zombie_mode"]         = False
+                    if isinstance(self._status.get("account"), dict):
+                        self._status["account"]["total_equity"]    = _retained
+                        self._status["account"]["retained_equity"] = _retained
+                    if isinstance(self._status.get("p20_global_risk"), dict):
+                        self._status["p20_global_risk"]["zombie_mode_status"] = False
+                        self._status["p20_global_risk"]["current_equity"]     = round(_retained, 2)
             log.info(
-                "[ATOMIC-MIRROR-SYNC] trader_status.json patched → "
+                "[ATOMIC-MIRROR-SYNC] executor._status patched in-memory -> "
                 "retained_equity=%.4f  ghost=False  zombie=False  source=%s",
                 _retained, source,
             )
         except Exception as _sync_exc:
             log.error(
-                "[ATOMIC-MIRROR-SYNC] ghost_healed patch failed: %s",
+                "[ATOMIC-MIRROR-SYNC] ghost_healed in-memory patch failed: %s",
                 _sync_exc, exc_info=True,
             )
-
-        # Heartbeat — force=True because ghost-heal is high-priority.
-        asyncio.create_task(self._touch_hub_timestamp(force=True))
 
     async def _on_bridge_fill(self, msg: dict) -> None:
         """
@@ -2554,6 +4348,30 @@ class Executor:
             _px_valid = _fill_px > 0.0 and _math.isfinite(_fill_px)
             _sz_valid = _fill_sz > 0.0 and _math.isfinite(_fill_sz)
             if _ord_id and _base_sym and _px_valid and _sz_valid:
+                # [P40-PNL] Compute realized PnL for closing (SELL/SHORT) fills.
+                # Entry fills always record pnl=0; exit fills look up cost_basis
+                # from the live position so the trade history shows real numbers.
+                _pnl_pct    = 0.0
+                _realized   = 0.0
+                _is_closing = _side.lower() in ("sell", "short")
+                if _is_closing:
+                    try:
+                        _pos_key = f"{_base_sym}-USDT-SWAP"
+                        _pos = self.positions.get(_pos_key)
+                        if _pos is None:
+                            # Try bare symbol as fallback (spot fill)
+                            _pos = self.positions.get(_base_sym)
+                        if _pos is not None and getattr(_pos, "cost_basis", 0.0) > 0.0:
+                            _cb  = float(_pos.cost_basis)
+                            _dir = getattr(_pos, "direction", "long")
+                            if _dir == "long":
+                                _pnl_pct  = (_fill_px - _cb) / _cb * 100.0
+                                _realized = (_fill_px - _cb) * _fill_sz
+                            else:
+                                _pnl_pct  = (_cb - _fill_px) / _cb * 100.0
+                                _realized = (_cb - _fill_px) * _fill_sz
+                    except Exception:
+                        pass  # fall back to 0 — never crash the fill handler
                 await self.db.insert_trade({
                     "ts":           int(time.time()),
                     "symbol":       _base_sym,
@@ -2561,12 +4379,15 @@ class Executor:
                     "qty":          _fill_sz,
                     "price":        _fill_px,
                     "cost_basis":   _fill_px,
-                    "pnl_pct":      0.0,
-                    "realized_usd": 0.0,
+                    "pnl_pct":      round(_pnl_pct,    4),
+                    "realized_usd": round(_realized,   4),
                     "tag":          "bridge_fill",
                     "order_id":     _ord_id,
                     "inst_type":    _inst_type,
                 })
+                if hasattr(self.db, 'commit'):
+                    await self.db.commit()
+                log.info("[DB-SYNC] Trade committed for %s | Side: %s", _base_sym, _side)
                 log.info(
                     "[STAGE2-DEFECT2] Bridge fill persisted to DB: "                    "ordId=%s %s %s sz=%.6f px=%.6f",
                     _ord_id, _base_sym, _side, _fill_sz, _fill_px,
@@ -2967,6 +4788,32 @@ class Executor:
         if self.bridge is not None and self.bridge.connected:
             try:
                 await self.bridge.cancel_order(inst_id=inst_id, ord_id=ord_id)
+                # ── [P48] Kill-switch: stop Rust floating for this instrument ──
+                # Cancelling the OKX order means the Rust tactical predator must
+                # stop adjusting it immediately.  cancel_strategic_intent is safe
+                # to call even when no active intent exists for this symbol.
+                if getattr(self.bridge, "_p48_enabled", False):
+                    try:
+                        await self.bridge.cancel_strategic_intent(inst_id)
+                    except Exception as _ks_exc:
+                        log.debug("[P48] kill-switch on cancel error: %s", _ks_exc)
+                # ── [/P48] ────────────────────────────────────────────────────
+                # ── [P51] Kill-switch: abort any in-flight TWAP/Iceberg algo ──
+                # Find active P51 algos for this instrument and cancel them.
+                # Rust must halt all child-order placement for this symbol.
+                if _P51_ENABLE and getattr(self.bridge, "_p51_active_algos", None):
+                    _p51_inst_norm = str(inst_id).upper().strip()
+                    _active51 = getattr(self.bridge, "_p51_active_algos", {})
+                    _cancel_ids = [
+                        _rid for _rid, _entry in _active51.items()
+                        if _entry.get("symbol", "").upper() == _p51_inst_norm
+                    ]
+                    for _cid in _cancel_ids:
+                        try:
+                            await self.bridge.cancel_algo(_cid, "order_cancelled")
+                        except Exception as _p51_ks_exc:
+                            log.debug("[P51] kill-switch on cancel error: %s", _p51_ks_exc)
+                # ── [/P51] ────────────────────────────────────────────────────
                 return
             except Exception as exc:
                 log.warning(
@@ -2976,6 +4823,18 @@ class Executor:
         # Legacy REST fallback
         await self.rest.post("/api/v5/trade/cancel-order",
                              {"instId": inst_id, "ordId": ord_id})
+        # ── [P48] REST-fallback path: evict Python-side intent cache ──────────
+        # Bridge was not connected (or cancel failed), so we can't call
+        # cancel_strategic_intent() on the wire.  Rust's TTL will expire
+        # naturally, but we must clear the local cache to avoid the dashboard
+        # showing a stale FLOATING badge after a REST-path cancellation.
+        _p48_b = self.bridge
+        if _p48_b is not None and getattr(_p48_b, "_p48_enabled", False):
+            _sym_norm = str(inst_id).upper().strip()
+            getattr(_p48_b, "_p48_active_intents", {}).pop(_sym_norm, None)
+            getattr(_p48_b, "_p48_floating_cache", {}).pop(_sym_norm, None)
+            log.debug("[P48] REST-fallback: intent cache evicted for %s", inst_id)
+        # ── [/P48] ────────────────────────────────────────────────────────────
 
     async def _get_order(self, inst_id: str, ord_id: str) -> dict:
         d = await self.rest.get("/api/v5/trade/order",
@@ -3061,6 +4920,23 @@ class Executor:
         else:
             sz_str = q.sz_str
 
+        # [PHASE15] Fetch tick BEFORE placing the market order so the pre-order
+        # bid/ask can serve as the expected-price reference for friction computation.
+        # This mirrors the market-fallback path in _close_position_inner exactly.
+        # Fail-open: if hub returns None (stale feed, timeout), the friction fields
+        # remain None and the liquidation proceeds unaffected.
+        _liq_tick: Optional[object] = None
+        _liq_expected_px: Optional[float] = None
+        try:
+            _liq_tick = await self.hub.get_tick(symbol)
+            if _liq_tick:
+                _liq_expected_px = (
+                    _liq_tick.bid if close_side == "sell" else _liq_tick.ask
+                )
+        except Exception as _tick_exc:
+            log.debug("[PHASE15] liquidate_all_positions tick fetch error %s: %s",
+                      symbol, _tick_exc)
+
         mkt_body = self._sor.build_market_body(
             inst, close_side, sz_str, td_mode, use_swap, pos_side_close,
             f"{reason}_LIQ",
@@ -3086,11 +4962,41 @@ class Executor:
             fill_px = float(order.get("avgPx") or order.get("px") or 0)
             log.warning("[P18-4] Liquidation CONFIRMED %s fill_px=%.4f", symbol, fill_px)
 
-        tick = await self.hub.get_tick(symbol)
+        # [PHASE15] Derive actual_px and compute close-side friction.
+        # expected_px is the pre-order bid (sell) / ask (buy) — the canonical
+        # market-order reference, matching _close_position_inner market-fallback.
+        # Positive slippage = adverse (received less than expected on sell, or
+        # paid more than expected on buy).
         actual_px = fill_px if fill_px > 0 else (
-            (tick.bid if close_side == "sell" else tick.ask) if tick else pos.cost_basis
+            _liq_expected_px if _liq_expected_px else pos.cost_basis
         )
-        await self._record_close(pos, actual_px, reason)
+        _liq_slip: Optional[float] = None
+        _liq_spread: Optional[float] = None
+        try:
+            if _liq_expected_px and _liq_expected_px > 0 and fill_px > 0:
+                if close_side == "sell":
+                    _liq_slip = round(
+                        (_liq_expected_px - fill_px) / _liq_expected_px * 10_000, 4
+                    )
+                else:
+                    _liq_slip = round(
+                        (fill_px - _liq_expected_px) / _liq_expected_px * 10_000, 4
+                    )
+            if _liq_tick and _liq_tick.bid > 0:
+                _liq_spread = round(
+                    (_liq_tick.ask - _liq_tick.bid) / _liq_tick.bid * 10_000, 4
+                )
+        except Exception as _fric_exc:
+            log.debug("[PHASE15] liquidate_all_positions friction compute error %s: %s",
+                      symbol, _fric_exc)
+
+        await self._record_close(
+            pos, actual_px, reason, tag_to_exit_reason(reason),
+            close_order_id=ord_id,
+            close_slippage_bps=_liq_slip,
+            spread_at_close_bps=_liq_spread,
+            expected_close_px=_liq_expected_px,
+        )
         return True
 
     # ── [P5-1] Order-Book Wall Detection ──────────────────────────────────────
@@ -3319,6 +5225,336 @@ class Executor:
             log.debug("[P12-1] OBI filter error %s: %s", symbol, e)
         return False
 
+    # ── [P51] Institutional Execution Suite — Bridge TWAP/Iceberg helpers ────────
+
+    async def _p51_compute_qty_and_envelope(
+        self,
+        symbol:    str,
+        side:      str,
+        usd_amount: float,
+        swap:      bool,
+        coin_cfg,
+    ) -> Optional[tuple]:
+        """[P51] Compute (total_qty, price_floor, price_ceil, ref_px, ct_val).
+
+        Shared by _p51_twap_via_bridge and _p51_iceberg_via_bridge.
+        Returns None if price data is unavailable.
+        """
+        tick = await self.hub.get_tick(symbol)
+        if not tick or tick.ask <= 0:
+            return None
+        ref_px = tick.ask if side == "buy" else tick.bid
+        if ref_px <= 0:
+            return None
+
+        meta   = await self._icache.get_instrument_info(symbol, swap=swap)
+        ct_val = (meta.ct_val if meta and meta.ct_val > 0 else OKX_CT_VAL) if swap else 1.0
+        total_qty = (usd_amount / ref_px) / ct_val if swap else usd_amount / ref_px
+
+        # Build price envelope using AdaptiveSpread when available
+        spread_mgr = self._p7_spread_mgr
+        book       = await self.hub.get_order_book(symbol)
+        if spread_mgr is not None:
+            try:
+                raw_px = spread_mgr.adjusted_limit_price(
+                    side, tick, symbol, order_book=book if book else None,
+                )
+                _fl, _cl, _tgt, _sp = spread_mgr.compute_strategic_intent(
+                    side, tick, symbol,
+                    order_book=book if book else None,
+                    target_px=raw_px,
+                )
+                price_floor = _fl
+                price_ceil  = _cl
+            except Exception:
+                # Fallback to simple bps envelope
+                from bridge_interface import P48_FLOOR_BPS, P48_CEIL_BPS, P48_SLACK_BPS
+                bps_floor = (P48_FLOOR_BPS if side == "buy" else P48_SLACK_BPS) / 10_000.0
+                bps_ceil  = (P48_CEIL_BPS  if side == "sell" else P48_SLACK_BPS) / 10_000.0
+                price_floor = ref_px * (1.0 - bps_floor)
+                price_ceil  = ref_px * (1.0 + bps_ceil)
+        else:
+            price_floor = ref_px * 0.9995   # ±5bps default envelope
+            price_ceil  = ref_px * 1.0005
+
+        return total_qty, price_floor, price_ceil, ref_px, ct_val
+
+    def _p51_get_enrichment(self, symbol: str, bridge) -> tuple:
+        """[P51] Pull P47 microstructure + P49 regime for enrichment. Non-fatal."""
+        regime   = None
+        toxicity = None
+        try:
+            _bs = getattr(bridge, "_p49_last_brain_state", {})
+            _rm = (_bs.get("regime_map") or {})
+            regime = _rm.get(symbol) or _rm.get(symbol.split("-")[0])
+        except Exception:
+            pass
+        try:
+            ms = bridge.get_p47_microstructure(symbol)
+            if ms[4]:   # is_fresh
+                toxicity = ms[0]
+        except Exception:
+            pass
+        return regime, toxicity
+
+    async def _p51_twap_via_bridge(
+        self,
+        symbol:    str,
+        side:      str,
+        usd_amount: float,
+        swap:      bool,
+        pos_side:  str,
+        tag:       str,
+        coin_cfg,
+    ) -> Optional[dict]:
+        """[P51] Native mode: delegate TWAP to Rust and await algo_complete.
+
+        Returns a synthetic fill dict on success (same shape as _execute_iceberg),
+        or None on timeout/error so the caller falls through to P32.
+        """
+        bridge = self.bridge
+        if bridge is None:
+            return None
+
+        _qty_env = await self._p51_compute_qty_and_envelope(
+            symbol, side, usd_amount, swap, coin_cfg,
+        )
+        if _qty_env is None:
+            return None
+        total_qty, price_floor, price_ceil, ref_px, ct_val = _qty_env
+        regime, toxicity = self._p51_get_enrichment(symbol, bridge)
+
+        try:
+            req_id = await bridge.request_twap(
+                symbol        = _inst_id(symbol, swap=swap),
+                side          = side,
+                total_qty     = total_qty,
+                algo          = "twap",
+                duration_secs = _P51_TWAP_DUR,
+                slices        = _P51_TWAP_SLICES,
+                price_floor   = price_floor,
+                price_ceil    = price_ceil,
+                equity        = getattr(self, "_equity", 0.0),
+                regime        = regime,
+                toxicity      = toxicity,
+            )
+        except Exception as _req_exc:
+            log.debug("[P51] _p51_twap_via_bridge request_twap error: %s", _req_exc)
+            return None
+
+        if req_id is None:
+            return None
+
+        # Await completion — long timeout covers the full TWAP window
+        try:
+            completion = await bridge.wait_algo_complete(req_id, _P51_WAIT_SECS)
+        except asyncio.CancelledError:
+            return None
+        except Exception as _wait_exc:
+            log.debug("[P51] _p51_twap_via_bridge wait_algo_complete error: %s", _wait_exc)
+            return None
+
+        if completion is None or float(completion.get("total_filled", 0)) <= 0:
+            return None
+
+        total_filled = float(completion.get("total_filled", 0))
+        avg_px       = float(completion.get("avg_px",        0))
+        reason       = completion.get("reason", "unknown")
+        slip_bps     = float(completion.get("slippage_bps",  0))
+        fill_usd     = total_filled * avg_px * ct_val
+
+        log.info(
+            "[P51] TWAP complete (native) %s %s: filled=%.8f avg_px=%.8f "
+            "slip=%.2fbps reason=%s tag=%s",
+            side.upper(), symbol, total_filled, avg_px, slip_bps, reason, tag,
+        )
+        return {
+            "avgPx":           str(avg_px),
+            "accFillSz":       str(total_filled),
+            "sz":              str(total_filled),
+            "px":              str(avg_px),
+            "p51_filled":      True,
+            "p51_algo":        "twap",
+            "p51_slippage_bps": slip_bps,
+            "p51_reason":      reason,
+            "p51_fill_usd":    round(fill_usd, 4),
+            "p51_request_id":  req_id,
+        }
+
+    async def _p51_iceberg_via_bridge(
+        self,
+        symbol:    str,
+        side:      str,
+        usd_amount: float,
+        swap:      bool,
+        pos_side:  str,
+        tag:       str,
+        coin_cfg,
+    ) -> Optional[dict]:
+        """[P51] Native mode: delegate Iceberg to Rust and await algo_complete.
+
+        Returns a synthetic fill dict on success or None (falls through to P9).
+        """
+        bridge = self.bridge
+        if bridge is None:
+            return None
+
+        _qty_env = await self._p51_compute_qty_and_envelope(
+            symbol, side, usd_amount, swap, coin_cfg,
+        )
+        if _qty_env is None:
+            return None
+        total_qty, price_floor, price_ceil, ref_px, ct_val = _qty_env
+
+        # Display qty = ICEBERG_DISPLAY_PCT fraction of total
+        display_qty = max(total_qty * ICEBERG_DISPLAY_PCT, total_qty / 100.0)
+
+        try:
+            req_id = await bridge.request_iceberg(
+                symbol      = _inst_id(symbol, swap=swap),
+                side        = side,
+                total_qty   = total_qty,
+                display_qty = display_qty,
+                price_floor = price_floor,
+                price_ceil  = price_ceil,
+                ttl_secs    = _P51_ICE_TTL,
+            )
+        except Exception as _req_exc:
+            log.debug("[P51] _p51_iceberg_via_bridge request_iceberg error: %s", _req_exc)
+            return None
+
+        if req_id is None:
+            return None
+
+        try:
+            completion = await bridge.wait_algo_complete(req_id, _P51_WAIT_SECS)
+        except asyncio.CancelledError:
+            return None
+        except Exception as _wait_exc:
+            log.debug("[P51] _p51_iceberg_via_bridge wait error: %s", _wait_exc)
+            return None
+
+        if completion is None or float(completion.get("total_filled", 0)) <= 0:
+            return None
+
+        total_filled = float(completion.get("total_filled", 0))
+        avg_px       = float(completion.get("avg_px",        0))
+        reason       = completion.get("reason", "unknown")
+        slip_bps     = float(completion.get("slippage_bps",  0))
+        fill_usd     = total_filled * avg_px * ct_val
+
+        log.info(
+            "[P51] Iceberg complete (native) %s %s: filled=%.8f avg_px=%.8f "
+            "slip=%.2fbps reason=%s tag=%s",
+            side.upper(), symbol, total_filled, avg_px, slip_bps, reason, tag,
+        )
+        return {
+            "avgPx":           str(avg_px),
+            "accFillSz":       str(total_filled),
+            "sz":              str(total_filled),
+            "px":              str(avg_px),
+            "p51_filled":      True,
+            "p51_algo":        "iceberg",
+            "p51_slippage_bps": slip_bps,
+            "p51_reason":      reason,
+            "p51_fill_usd":    round(fill_usd, 4),
+            "p51_request_id":  req_id,
+        }
+
+    async def _p51_fire_shadow_twap(
+        self,
+        symbol:    str,
+        side:      str,
+        usd_amount: float,
+        swap:      bool,
+        coin_cfg,
+        tag:       str,
+    ) -> None:
+        """[P51] Shadow mode: fire TWAP to Rust asynchronously for benchmarking.
+
+        Python has already routed to P32 — this coroutine runs concurrently
+        and logs Rust's result for shadow agreement comparison when both finish.
+        Non-fatal: any error is logged at debug level only.
+        """
+        bridge = self.bridge
+        if bridge is None:
+            return
+        try:
+            _qty_env = await self._p51_compute_qty_and_envelope(
+                symbol, side, usd_amount, swap, coin_cfg,
+            )
+            if _qty_env is None:
+                return
+            total_qty, price_floor, price_ceil, ref_px, ct_val = _qty_env
+            regime, toxicity = self._p51_get_enrichment(symbol, bridge)
+
+            req_id = await bridge.request_twap(
+                symbol        = _inst_id(symbol, swap=swap),
+                side          = side,
+                total_qty     = total_qty,
+                algo          = "twap",
+                duration_secs = _P51_TWAP_DUR,
+                slices        = _P51_TWAP_SLICES,
+                price_floor   = price_floor,
+                price_ceil    = price_ceil,
+                equity        = getattr(self, "_equity", 0.0),
+                regime        = regime,
+                toxicity      = toxicity,
+            )
+            if req_id is None:
+                return
+
+            # Record request_id in bridge for post-hoc shadow comparison
+            # (comparison happens when P32 finishes and algo_complete arrives)
+            log.debug(
+                "[P51-SHADOW] twap_request fired: req_id=%s %s %s qty=%.8f",
+                req_id, side.upper(), symbol, total_qty,
+            )
+        except Exception as exc:
+            log.debug("[P51-SHADOW] _p51_fire_shadow_twap non-fatal: %s", exc)
+
+    async def _p51_fire_shadow_iceberg(
+        self,
+        symbol:    str,
+        side:      str,
+        usd_amount: float,
+        swap:      bool,
+        coin_cfg,
+        tag:       str,
+    ) -> None:
+        """[P51] Shadow mode: fire Iceberg to Rust asynchronously for benchmarking."""
+        bridge = self.bridge
+        if bridge is None:
+            return
+        try:
+            _qty_env = await self._p51_compute_qty_and_envelope(
+                symbol, side, usd_amount, swap, coin_cfg,
+            )
+            if _qty_env is None:
+                return
+            total_qty, price_floor, price_ceil, ref_px, ct_val = _qty_env
+            display_qty = max(total_qty * ICEBERG_DISPLAY_PCT, total_qty / 100.0)
+
+            req_id = await bridge.request_iceberg(
+                symbol      = _inst_id(symbol, swap=swap),
+                side        = side,
+                total_qty   = total_qty,
+                display_qty = display_qty,
+                price_floor = price_floor,
+                price_ceil  = price_ceil,
+                ttl_secs    = _P51_ICE_TTL,
+            )
+            if req_id is None:
+                return
+            log.debug(
+                "[P51-SHADOW] iceberg_request fired: req_id=%s %s %s qty=%.8f",
+                req_id, side.upper(), symbol, total_qty,
+            )
+        except Exception as exc:
+            log.debug("[P51-SHADOW] _p51_fire_shadow_iceberg non-fatal: %s", exc)
+
+    # ── [/P51] ────────────────────────────────────────────────────────────────
+
     # ── [P32-STEALTH-TWAP] Stealth TWAP Engine ────────────────────────────────
     async def _p32_stealth_twap(
         self,
@@ -3383,9 +5619,57 @@ class Executor:
         Returns a synthetic fill dict (same shape as _execute_iceberg) or None
         if all slices fail to fill.
         """
-        import random as _random
-        slice_usd  = usd_amount / P32_TWAP_SLICES
-        base_gap   = P32_TWAP_WINDOW_SECS / P32_TWAP_SLICES
+        # ── [P45] Zero-Knowledge Privacy Layer — Execution Planning ──────────
+        # When P45_ENABLE=1 (default), delegate the slice schedule to
+        # IcebergSlicer.plan() which uses Poisson inter-arrival delays and
+        # Dirichlet-distributed sizes.  When P45 is disabled, fall back to
+        # the legacy equal-slice uniform-jitter schedule (P32 original).
+        #
+        # P45 SLIP-ADAPT: query the P32 per-symbol slippage tracker to determine
+        # whether this symbol is currently in LIMIT_ONLY mode.  If it is,
+        # IcebergSlicer halves the slice count and doubles the mean delay to
+        # reduce market impact during already-elevated slippage regimes.
+        _p45_limit_only = False
+        try:
+            _p45_limit_only = (
+                P45_SLIP_ADAPT_ENABLE
+                and hasattr(self, "p32_slip_tracker")
+                and self.p32_slip_tracker.is_limit_only(symbol)
+            )
+        except Exception:
+            pass
+
+        if P45_ENABLE:
+            _p45_plan = self._p45_slicer.plan(
+                usd_amount=usd_amount,
+                symbol=symbol,
+                limit_only=_p45_limit_only,
+            )
+            _p45_n       = len(_p45_plan)
+            _p45_active  = True
+            log.info(
+                "[P45] %s %s privacy plan: %d slices "
+                "(Poisson λ=%.1f | Dirichlet α=%.2f | "
+                "mean_delay=%.1fs | limit_only=%s)",
+                side.upper(), symbol, _p45_n,
+                P45_LAMBDA_SLICES, P45_DIRICHLET_ALPHA,
+                P45_MEAN_DELAY_SECS, _p45_limit_only,
+            )
+        else:
+            # Legacy P32 fallback: equal slices, uniform ±50% jitter.
+            import random as _random
+            _p45_active = False
+            _p45_plan   = []          # unused in legacy path
+            _p45_n      = P32_TWAP_SLICES
+            slice_usd   = usd_amount / P32_TWAP_SLICES
+            base_gap    = P32_TWAP_WINDOW_SECS / P32_TWAP_SLICES
+            log.info(
+                "[P32-STEALTH-TWAP] %s %s $%.2f → %d slices × $%.2f "
+                "over %.0fs (P45 disabled — legacy uniform jitter)",
+                side.upper(), symbol, usd_amount, P32_TWAP_SLICES,
+                slice_usd, P32_TWAP_WINDOW_SECS,
+            )
+        # ── [/P45] ───────────────────────────────────────────────────────────
 
         # ── [P36-MIMIC] Passive Spoof Test — run BEFORE first slice ──────────
         # Run a mimic order test against the dominant passive wall to determine
@@ -3429,17 +5713,25 @@ class Executor:
             )
         # ── [/P33.2-REBATE log] ───────────────────────────────────────────
 
-        log.info(
-            "[P32-STEALTH-TWAP] %s %s $%.2f → %d slices × $%.2f "
-            "over %.0fs (randomized intervals)",
-            side.upper(), symbol, usd_amount, P32_TWAP_SLICES, slice_usd, P32_TWAP_WINDOW_SECS,
-        )
-
         total_qty  = 0.0
         total_cost = 0.0
         slices_ok  = 0
+        _active_n  = _p45_n   # total slices in this execution (P45 or legacy)
 
-        for i in range(P32_TWAP_SLICES):
+        for i in range(_active_n):
+            # ── [P45] Apply pre-slice delay from IcebergSlicer plan ───────────
+            if _p45_active:
+                _sp = _p45_plan[i]
+                slice_usd = _sp.usd_amount
+                if _sp.delay_before_secs > 0.0:
+                    log.debug(
+                        "[P45] %s %s: slice %d/%d — waiting %.2fs "
+                        "(Poisson inter-arrival)",
+                        side.upper(), symbol, i + 1, _active_n,
+                        _sp.delay_before_secs,
+                    )
+                    await asyncio.sleep(_sp.delay_before_secs)
+            # ── [/P45] ───────────────────────────────────────────────────────
             # ── [P36-MIMIC] Per-slice spoof re-evaluation ──────────────────
             # Re-run the mimic test every other slice (slices 0, 2, 4…) to
             # refresh the spoof probability as market conditions evolve mid-TWAP.
@@ -3452,7 +5744,7 @@ class Executor:
                     log.info(
                         "[P36.1-DETECT] Slice %d/%d %s %s: "
                         "mimic refresh spoof_prob=%.4f → spoof_active=%s",
-                        i + 1, P32_TWAP_SLICES, side.upper(), symbol,
+                        i + 1, _active_n, side.upper(), symbol,
                         _p36_spoof_prob, _p36_spoof_active,
                     )
                 else:
@@ -3466,7 +5758,7 @@ class Executor:
                         "[P36.1-DETECT] 🚨 SPOOF ACTIVE %s %s slice %d/%d: "
                         "spoof_prob=%.4f > threshold=%.2f — "
                         "OVERRIDING to IOC (Aggressive Taker) to capture real liquidity.",
-                        symbol, side.upper(), i + 1, P32_TWAP_SLICES,
+                        symbol, side.upper(), i + 1, _active_n,
                         _p36_spoof_prob, P36_SPOOF_THRESHOLD,
                     )
                     _use_ioc = True   # Force IOC — this OVERRIDES P33 toxicity gate
@@ -3484,7 +5776,7 @@ class Executor:
                 _use_ioc        = _slice_toxicity > P33_TOXICITY_THRESHOLD
                 log.info(
                     "[P33-SNIFFER] Slice %d/%d %s %s: toxicity=%.3f → %s",
-                    i + 1, P32_TWAP_SLICES, side.upper(), symbol,
+                    i + 1, _active_n, side.upper(), symbol,
                     _slice_toxicity, "IOC" if _use_ioc else "POST_ONLY",
                 )
             except Exception as _tox_exc:
@@ -3494,38 +5786,31 @@ class Executor:
 
             try:
                 if _use_ioc:
-                    # [P33-SNIFFER] IOC path: place a limit-IOC slice directly
-                    # without going through _execute_order (which would impose
-                    # POST_ONLY retry logic on an IOC order type).
                     order = await self._p33_place_ioc_slice(
                         symbol=symbol, side=side, usd_amount=slice_usd,
                         swap=swap, pos_side=pos_side, coin_cfg=coin_cfg,
-                        tag=f"{tag}_IOC{i+1}of{P32_TWAP_SLICES}",
+                        tag=f"{tag}_IOC{i+1}of{_active_n}",
                     )
 
                 elif P33_MAKER_PRIORITY:
-                    # ── [P33.2-REBATE] Maker-priority path ────────────────
-                    # Use the BBO+0.1-tick maker slice engine with optional
-                    # whale-multiplier-gated price chasing.
                     order = await self._p332_place_maker_slice(
                         symbol=symbol, side=side, usd_amount=slice_usd,
                         swap=swap, pos_side=pos_side, coin_cfg=coin_cfg,
-                        tag=f"{tag}_MKR{i+1}of{P32_TWAP_SLICES}",
+                        tag=f"{tag}_MKR{i+1}of{_active_n}",
                         whale_mult=whale_mult,
                     )
                     log.info(
                         "[P33.2-REBATE] TWAP slice %d/%d %s %s: "
                         "maker path returned %s",
-                        i + 1, P32_TWAP_SLICES, side.upper(), symbol,
+                        i + 1, _active_n, side.upper(), symbol,
                         "fill" if order else "None",
                     )
-                    # ── [/P33.2-REBATE] ───────────────────────────────────
 
                 else:
                     order = await self._execute_order(
                         symbol, side, slice_usd,
                         swap=swap, pos_side=pos_side,
-                        tag=f"{tag}_TWAP{i+1}of{P32_TWAP_SLICES}",
+                        tag=f"{tag}_TWAP{i+1}of{_active_n}",
                         coin_cfg=coin_cfg,
                     )
 
@@ -3549,11 +5834,13 @@ class Executor:
 
             except Exception as _slice_exc:
                 log.warning("[P32-STEALTH-TWAP] Slice %d/%d error %s: %s",
-                            i + 1, P32_TWAP_SLICES, symbol, _slice_exc)
+                            i + 1, _active_n, symbol, _slice_exc)
                 self._p33_record_order_event("cancel")
 
-            if i < P32_TWAP_SLICES - 1:
-                # Randomize the interval ±50% of the base gap to evade pattern detection
+            # ── [P45] Inter-slice delay is pre-pended to the NEXT slice above.
+            # The legacy P32 path (P45_ENABLE=0) keeps the original end-of-loop
+            # uniform jitter to preserve backward compatibility exactly.
+            if not _p45_active and i < _active_n - 1:
                 jitter = base_gap * (_random.uniform(0.5, 1.5))
                 await asyncio.sleep(jitter)
 
@@ -3562,17 +5849,18 @@ class Executor:
             return None
 
         avg_px = total_cost / total_qty
+        _plan_tag = "P45" if _p45_active else "P32"
         log.info(
-            "[P32-STEALTH-TWAP] %s %s complete: %d/%d slices filled "
+            "[P32-STEALTH-TWAP][%s] %s %s complete: %d/%d slices filled "
             "avg_px=%.6f total_qty=%.6f",
-            side.upper(), symbol, slices_ok, P32_TWAP_SLICES, avg_px, total_qty,
+            _plan_tag, side.upper(), symbol, slices_ok, _active_n, avg_px, total_qty,
         )
         return {
             "avgPx":      str(avg_px),
             "accFillSz":  str(total_qty),
             "state":      "filled",
-            "ordId":      f"P32TWAP_{symbol}_{int(time.time())}",
-            "_twap_slices_sent":   P32_TWAP_SLICES,
+            "ordId":      f"{_plan_tag}TWAP_{symbol}_{int(time.time())}",
+            "_twap_slices_sent":   _active_n,
             "_twap_slices_filled": slices_ok,
         }
 
@@ -3704,10 +5992,21 @@ class Executor:
                 self._p32_limit_only_until[symbol] = expiry
                 log.warning(
                     "[P32-SLIP-ADAPT] %s: avg slippage=%.2f bps > %.1f bps "
-                    "→ LIMIT_ONLY enforced for %.1f hours (until %s)",
+                    "-> LIMIT_ONLY enforced for %.1f hours (until %s)",
                     symbol, avg_slip, P32_SLIP_LIMIT_BPS, P32_SLIP_LIMIT_HOURS,
                     time.strftime("%H:%M:%S", time.localtime(expiry)),
                 )
+                # [P32-RESTART / PHASE13] Persist the updated LIMIT_ONLY dict so
+                # the restriction survives a process restart within the window.
+                # atomic_write_json is synchronous and fail-open (returns False
+                # on failure; never raises) so the trade cycle is never blocked.
+                try:
+                    atomic_write_json(
+                        P32_LIMIT_ONLY_STATE_PATH,
+                        dict(self._p32_limit_only_until),
+                    )
+                except Exception as _p32_w_exc:
+                    log.debug("[P32-RESTART] sidecar write failed: %s", _p32_w_exc)
 
     def _p32_is_limit_only(self, symbol: str) -> bool:
         """
@@ -3717,9 +6016,18 @@ class Executor:
         expiry = self._p32_limit_only_until.get(symbol, 0.0)
         if expiry > time.time():
             return True
-        # Expired — clean up
+        # Expired — clean up and persist the removal so the sidecar stays accurate.
         if symbol in self._p32_limit_only_until:
             del self._p32_limit_only_until[symbol]
+            # [P32-RESTART / PHASE13] Write the updated dict after expiry cleanup so
+            # a subsequent restart does not re-load a stale expired entry.  Fail-open.
+            try:
+                atomic_write_json(
+                    P32_LIMIT_ONLY_STATE_PATH,
+                    dict(self._p32_limit_only_until),
+                )
+            except Exception as _p32_exp_exc:
+                log.debug("[P32-RESTART] sidecar write (expiry) failed: %s", _p32_exp_exc)
         return False
 
     # ── [v32.1-CLAMP] Price Clamping Helper ───────────────────────────────────
@@ -5181,20 +7489,96 @@ class Executor:
                             if self._p32_veto_arb is not None:
                                 self._p32_veto_arb.set_flow_toxicity(sym, _tox)
 
-                            # Emergency exit threshold check.
+                            # ── [PHASE9] VPIN emergency exit guards ───────────
+                            # The emergency exit is now protected by two optional
+                            # operator-controlled guards (both disabled by default):
+                            #
+                            #   Guard A — consecutive-reading requirement:
+                            #     P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED (default 1).
+                            #     The ToxicityScore must exceed the threshold for this
+                            #     many consecutive tape-monitor ticks before the exit
+                            #     fires.  Mirrors the zombie-mode consecutive counter
+                            #     (_P20_ZOMBIE_CONSECUTIVE_REQUIRED).  The counter
+                            #     resets to 0 the moment toxicity drops back below the
+                            #     threshold, so a sustained spike is required.
+                            #
+                            #   Guard B — minimum position age:
+                            #     P37_EMERGENCY_EXIT_MIN_HOLD_SECS (default 0.0).
+                            #     A position younger than this many seconds is immune
+                            #     to P37 emergency exits.  Guards against a new entry
+                            #     being immediately liquidated by a pre-existing spike.
+                            #
+                            # At both defaults (1 and 0.0) behaviour is byte-for-byte
+                            # identical to the Phase 8 baseline.
                             if _tox > P37_EMERGENCY_EXIT_TOXICITY:
+                                # Increment the per-symbol consecutive counter.
+                                _consec = self._p37_tox_consecutive.get(sym, 0) + 1
+                                self._p37_tox_consecutive[sym] = _consec
+
                                 _in_flight = self._p37_exit_in_flight.get(sym, False)
                                 if not _in_flight:
-                                    log.warning(
-                                        "[P37-VPIN] EMERGENCY EXIT triggered for %s: "
-                                        "toxicity=%.4f > emergency_threshold=%.2f — "
-                                        "launching IOC exit task (GOLDEN COUNTER PRESERVED).",
+                                    if _consec < P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED:
+                                        # Threshold exceeded but not enough consecutive
+                                        # readings yet — log at WARNING and wait.
+                                        log.warning(
+                                            "[P37-VPIN][PHASE9] %s toxicity=%.4f > "
+                                            "threshold=%.2f — consecutive=%d/%d "
+                                            "(waiting for sustained spike before exit).",
+                                            sym, _tox, P37_EMERGENCY_EXIT_TOXICITY,
+                                            _consec,
+                                            P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED,
+                                        )
+                                    else:
+                                        # Consecutive requirement met — check hold guard.
+                                        _pos_for_hold = self.positions.get(sym)
+                                        _hold_secs = (
+                                            time.time() - _pos_for_hold.entry_ts
+                                            if _pos_for_hold is not None else 9999.0
+                                        )
+                                        if (
+                                            P37_EMERGENCY_EXIT_MIN_HOLD_SECS > 0.0
+                                            and _hold_secs < P37_EMERGENCY_EXIT_MIN_HOLD_SECS
+                                        ):
+                                            # Position too young — skip this tick.
+                                            log.warning(
+                                                "[P37-VPIN][PHASE9] %s toxicity=%.4f "
+                                                "consecutive=%d/%d — HOLD GUARD: "
+                                                "position age=%.1fs < min_hold=%.1fs; "
+                                                "suppressing exit this tick.",
+                                                sym, _tox,
+                                                _consec,
+                                                P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED,
+                                                _hold_secs,
+                                                P37_EMERGENCY_EXIT_MIN_HOLD_SECS,
+                                            )
+                                        else:
+                                            # All guards passed — fire emergency exit.
+                                            log.warning(
+                                                "[P37-VPIN] EMERGENCY EXIT triggered for %s: "
+                                                "toxicity=%.4f > emergency_threshold=%.2f "
+                                                "consecutive=%d/%d hold=%.1fs — "
+                                                "launching IOC exit task "
+                                                "(GOLDEN COUNTER PRESERVED).",
+                                                sym, _tox, P37_EMERGENCY_EXIT_TOXICITY,
+                                                _consec,
+                                                P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED,
+                                                _hold_secs,
+                                            )
+                                            self._p37_exit_in_flight[sym] = True
+                                            asyncio.ensure_future(
+                                                self._p37_emergency_toxicity_exit(sym, _tox)
+                                            )
+                            else:
+                                # Toxicity is below threshold — reset the consecutive
+                                # counter so a future spike must restart from 0.
+                                if self._p37_tox_consecutive.get(sym, 0) > 0:
+                                    log.debug(
+                                        "[P37-VPIN][PHASE9] %s toxicity=%.4f dropped "
+                                        "below threshold=%.2f — consecutive counter reset.",
                                         sym, _tox, P37_EMERGENCY_EXIT_TOXICITY,
                                     )
-                                    self._p37_exit_in_flight[sym] = True
-                                    asyncio.ensure_future(
-                                        self._p37_emergency_toxicity_exit(sym, _tox)
-                                    )
+                                self._p37_tox_consecutive[sym] = 0
+                            # ── [/PHASE9 VPIN guards] ─────────────────────────
                         else:
                             # No open position — still inject toxicity for entry veto.
                             _tox = await self.hub.get_flow_toxicity(sym)
@@ -5364,6 +7748,376 @@ class Executor:
 
     # ── [/P37-VPIN] Emergency Exit ────────────────────────────────────────────
 
+    # ── [P39] Phase 39 — Ghost Oracle Lead-Lag Snipe ──────────────────────────
+
+    def _p39_check_ghost_snipe(
+        self,
+        symbol:    str,
+        direction: str,
+        toxicity:  float = 0.0,
+    ) -> dict:
+        """
+        [P39] Ghost Oracle snipe eligibility — 6-gate decision engine.
+
+        Reads live Coinbase TPS via DataHub.oracle and determines whether a
+        lead-lag snipe should fire on OKX for the given symbol and direction.
+
+        All gates are designed to be fail-safe:
+          • Oracle offline  → vetoed (gate 1)
+          • TPS too low     → vetoed (gate 2)
+          • CB not leading  → vetoed (gate 3)
+          • SPY crashing    → vetoed for longs (gate 4, fail-open on stale data)
+          • Toxic flow      → vetoed (gate 5)
+          • Cooldown active → vetoed (gate 6)
+
+        Returns
+        -------
+        dict:
+          fire         : bool  — True only when ALL gates pass
+          cb_tps       : float — measured Coinbase TPS
+          size_boost   : float — Kelly multiplier (1.0 = no boost)
+          conf_bypass  : float — amount to subtract from min_conf
+          reason       : str   — human-readable log string when fire=True
+          veto_reason  : str   — populated when fire=False
+        """
+        _out = dict(
+            fire=False, cb_tps=0.0, size_boost=1.0,
+            conf_bypass=0.0, reason="", veto_reason="",
+        )
+
+        # Gate 0 — master switch
+        if not P39_GHOST_ENABLE:
+            _out["veto_reason"] = "P39_GHOST_ENABLE=0"
+            return _out
+
+        # Gate 1 — oracle availability
+        oracle = getattr(self.hub, "oracle", None)
+        if oracle is None or not getattr(oracle, "_ws_connected", False):
+            _out["veto_reason"] = "Coinbase oracle offline or WS disconnected"
+            return _out
+
+        # Gate 2 — TPS threshold
+        try:
+            cb_tps = float(oracle.tps(symbol))
+        except Exception as _e:
+            log.debug("[P39] oracle.tps() error %s: %s", symbol, _e)
+            cb_tps = 0.0
+        _out["cb_tps"] = cb_tps
+        self._p39_cb_tps_cache[symbol] = cb_tps  # cache regardless of outcome
+        if cb_tps < P39_GHOST_MIN_TPS:
+            _out["veto_reason"] = (
+                f"cb_tps={cb_tps:.2f} < min={P39_GHOST_MIN_TPS:.1f}"
+            )
+            return _out
+
+        # Gate 3 — Coinbase directional lead vs OKX
+        try:
+            px_entry = oracle.latest_price(symbol)
+            if px_entry is not None:
+                cb_px, cb_ts = px_entry
+                if time.time() - cb_ts > 5.0:
+                    _out["veto_reason"] = (
+                        f"Coinbase price stale ({time.time() - cb_ts:.1f}s > 5s)"
+                    )
+                    return _out
+                # Compare CB price to cached OKX tick for directional confirmation.
+                _okx_tick = getattr(self.hub, "_tick_cache", {}).get(symbol.upper())
+                if _okx_tick is not None and _okx_tick.bid > 0 and _okx_tick.ask > 0:
+                    okx_mid     = (_okx_tick.bid + _okx_tick.ask) / 2.0
+                    cb_lead_bps = (cb_px - okx_mid) / okx_mid * 10_000.0
+                    if direction == "long"  and cb_lead_bps < 0.5:
+                        _out["veto_reason"] = (
+                            f"CB lead={cb_lead_bps:+.2f} bps — not bullish for long"
+                        )
+                        return _out
+                    if direction == "short" and cb_lead_bps > -0.5:
+                        _out["veto_reason"] = (
+                            f"CB lead={cb_lead_bps:+.2f} bps — not bearish for short"
+                        )
+                        return _out
+        except Exception as _dir_exc:
+            # Non-fatal — proceed without directional confirmation if data absent.
+            log.debug("[P39] direction alignment error %s: %s", symbol, _dir_exc)
+
+        # Gate 4 — P42 macro safety (fail-open on stale data per P42 operational rules)
+        if direction == "long":
+            try:
+                _p42 = self.hub.get_global_market_status()
+                if _p42.get("data_age_secs", 9999.0) <= 300.0:
+                    _spy_5m = _p42.get("spy_5m_pct", 0.0)
+                    if _spy_5m < P39_GHOST_SPY_BLOCK_PCT:
+                        _out["veto_reason"] = (
+                            f"P42 macro: spy_5m={_spy_5m:+.3f}% < "
+                            f"{P39_GHOST_SPY_BLOCK_PCT:+.1f}% "
+                            "(long ghost snipe suppressed during SPY crash)"
+                        )
+                        return _out
+            except Exception as _p42e:
+                log.debug("[P39] P42 macro gate fail-open: %s", _p42e)
+
+        # Gate 5 — P37 flow toxicity co-veto
+        if toxicity > P39_GHOST_TOXICITY_CEIL:
+            _out["veto_reason"] = (
+                f"P37 toxicity={toxicity:.4f} > ceil={P39_GHOST_TOXICITY_CEIL:.2f} "
+                "(informed flow — snipe suppressed)"
+            )
+            return _out
+
+        # Gate 6 — per-symbol cooldown
+        _elapsed = time.time() - self._p39_last_snipe_ts.get(symbol, 0.0)
+        if _elapsed < P39_GHOST_COOLDOWN_SECS:
+            _out["veto_reason"] = (
+                f"cooldown: {_elapsed:.1f}s < {P39_GHOST_COOLDOWN_SECS:.0f}s"
+            )
+            return _out
+
+        # All gates passed — compute boost factors (linear interpolation on TPS)
+        _tps_range  = max(P39_GHOST_BURST_TPS - P39_GHOST_MIN_TPS, 1.0)
+        _tps_frac   = min((cb_tps - P39_GHOST_MIN_TPS) / _tps_range, 1.0)
+        size_boost  = round(
+            1.0 + _tps_frac * (P39_GHOST_SIZE_BOOST_MAX - 1.0),
+            4,
+        )
+
+        _out.update(
+            fire=True,
+            size_boost=size_boost,
+            conf_bypass=P39_GHOST_CONF_BYPASS,
+            reason=(
+                f"{symbol} {direction} | cb_tps={cb_tps:.2f} "
+                f"size_boost={size_boost:.3f}x "
+                f"conf_bypass=-{P39_GHOST_CONF_BYPASS:.3f}"
+            ),
+        )
+        return _out
+
+    # ── [/P39] ────────────────────────────────────────────────────────────────
+
+    # ── [P41] Phase 41 — Adversarial Mimicry (Liquidity Baiting) ──────────────
+
+    def _p41_bait_lock_for(self, symbol: str) -> asyncio.Lock:
+        """[P41] Per-symbol lock factory (lazy init, identical pattern to P36)."""
+        if symbol not in self._p41_bait_locks:
+            self._p41_bait_locks[symbol] = asyncio.Lock()
+        return self._p41_bait_locks[symbol]
+
+    async def _p41_run_bait_test(
+        self,
+        symbol:    str,
+        direction: str,
+        swap:      bool = False,
+    ) -> dict:
+        """
+        [P41] Adversarial Mimicry — Active Liquidity Baiting engine.
+
+        Places a single minimum-size POST_ONLY bait order at the best bid
+        (long signal) or best ask (short signal), waits P41_BAIT_REACTION_MS,
+        then checks whether the best bid/ask advanced by ≥ 1 tick.  A tick
+        advance within that window confirms an adversarial HFT bot is tracking
+        the spread — meaning hidden institutional buy-side liquidity exists.
+
+        This is architecturally distinct from P36 (passive spoof detection):
+          P36 probes a WALL that already exists and watches it evaporate.
+          P41 probes the SPREAD EDGE and watches for a bot to follow.
+
+        Workflow
+        --------
+        1. Pre-flight: master switch, cooldown, global cap, signal confidence.
+        2. Fetch live tick for bait price.
+        3. Fetch instrument meta for minSz (identical to P36 pattern).
+        4. Place POST_ONLY bait at best_bid (long) or best_ask (short).
+        5. Wait P41_BAIT_REACTION_MS.
+        6. Re-fetch tick.  If best_bid ≥ bait_px + tick_sz → outbid detected.
+        7. Cancel bait in finally block (always, even on exception).
+        8. If bait was filled: log leakage, increment _p41_accidental_fills.
+        9. Return result dict.
+
+        Returns
+        -------
+        dict:
+          hidden_buyer  : bool  — True when an outbid was detected
+          size_boost    : float — P41_BAIT_SIZE_BOOST when confirmed, else 1.0
+          bait_px       : float — price at which bait was placed
+          reaction_ms   : float — measured reaction time (ms)
+          skip_reason   : str   — non-empty when test was skipped
+        """
+        _result = dict(
+            hidden_buyer=False, size_boost=1.0,
+            bait_px=0.0, reaction_ms=0.0, skip_reason="",
+        )
+
+        # ── Pre-flight guards (synchronous, no awaits) ────────────────────────
+        if not P41_BAIT_ENABLE:
+            _result["skip_reason"] = "P41_BAIT_ENABLE=0"
+            return _result
+
+        if self._p41_open_bait_count >= P41_BAIT_MAX_OPEN:
+            _result["skip_reason"] = (
+                f"global cap reached ({self._p41_open_bait_count}/{P41_BAIT_MAX_OPEN})"
+            )
+            return _result
+
+        _elapsed = time.time() - self._p41_last_bait_ts.get(symbol, 0.0)
+        if _elapsed < P41_BAIT_COOLDOWN_SECS:
+            _result["skip_reason"] = (
+                f"cooldown: {_elapsed:.1f}s < {P41_BAIT_COOLDOWN_SECS:.0f}s"
+            )
+            return _result
+
+        # Per-symbol lock: skip if another bait test is already running.
+        _lock = self._p41_bait_lock_for(symbol)
+        if _lock.locked():
+            _result["skip_reason"] = "per-symbol lock busy"
+            return _result
+
+        async with _lock:
+            inst    = _inst_id(symbol, swap=swap)
+            td_mode = "cross" if swap else OKX_TD_MODE_SPOT
+            bait_ord_id: Optional[str] = None
+            _t_start = time.monotonic()
+
+            try:
+                # ── Step 1: Fetch live tick for bait price ────────────────────
+                tick = await self.hub.get_tick(symbol)
+                if tick is None or tick.bid <= 0 or tick.ask <= 0:
+                    _result["skip_reason"] = "tick unavailable"
+                    return _result
+
+                # Bait side: bid level for long (we join the buyer stack),
+                # ask level for short (we join the seller stack).
+                bait_px_raw = tick.bid if direction == "long" else tick.ask
+
+                # ── Step 2: Instrument metadata for minSz + tickSz ───────────
+                meta   = await self._icache.get_instrument_info(symbol, swap=swap)
+                min_sz = float(getattr(meta, "min_sz",   0.0) or 0.0) if meta else 0.0
+                lot_sz = float(getattr(meta, "sz_inst",  0.0) or 0.0) if meta else 1e-8
+                tick_sz = float(getattr(meta, "tick_sz", 0.0) or 0.0) if meta else 0.0
+                if lot_sz <= 0:
+                    lot_sz = 1e-8
+
+                raw_qty = min_sz if min_sz > 0 else lot_sz
+                q_bait  = await self._quantize_sz(symbol, raw_qty, swap, tag="P41_BAIT")
+                if not q_bait.valid:
+                    _result["skip_reason"] = "bait size below minSz"
+                    return _result
+
+                bait_px = InstrumentCache.round_price(bait_px_raw, meta) if meta else bait_px_raw
+                if bait_px <= 0:
+                    _result["skip_reason"] = "invalid bait price after rounding"
+                    return _result
+
+                _result["bait_px"] = bait_px
+
+                # ── Step 3: Place the bait order ─────────────────────────────
+                uid     = uuid.uuid4().hex[:12]
+                bait_side = "buy" if direction == "long" else "sell"
+                body = {
+                    "instId":  inst,
+                    "tdMode":  td_mode,
+                    "side":    bait_side,
+                    "ordType": "post_only",
+                    "sz":      q_bait.sz_str,
+                    "px":      f"{bait_px:.8f}",
+                    "clOrdId": f"P41B{uid}",
+                }
+                if swap:
+                    body["posSide"] = "long" if bait_side == "buy" else "short"
+
+                # Increment cap before placing so a concurrent cycle sees it.
+                self._p41_open_bait_count += 1
+                self._p41_last_bait_ts[symbol] = time.time()
+
+                resp = await self._place_order(body)
+                if resp and resp.get("code") == "0":
+                    bait_ord_id = resp["data"][0]["ordId"]
+                    log.info(
+                        "[P41-BAIT] 🪝 Bait placed %s %s px=%.8f sz=%s ord_id=%s",
+                        symbol, bait_side.upper(), bait_px, q_bait.sz_str, bait_ord_id,
+                    )
+                else:
+                    _sc = (resp.get("data") or [{}])[0].get("sCode", "?") if resp else "?"
+                    _result["skip_reason"] = f"bait order rejected sCode={_sc}"
+                    log.debug("[P41-BAIT] %s bait rejected: sCode=%s", symbol, _sc)
+                    return _result
+
+                # ── Step 4: Wait for bot reaction window ──────────────────────
+                await asyncio.sleep(P41_BAIT_REACTION_MS / 1000.0)
+
+                # ── Step 5: Re-fetch tick and measure outbid ──────────────────
+                tick_after = await self.hub.get_tick(symbol)
+                _result["reaction_ms"] = (time.monotonic() - _t_start) * 1000.0
+
+                if tick_after and tick_sz > 0:
+                    # For a long bait: hidden buyer confirmed if best_bid advanced
+                    # by ≥ 1 tick above our bait price (a bot outbid us).
+                    # For a short bait: hidden seller confirmed if best_ask fell
+                    # by ≥ 1 tick below our bait price (a bot undercut us).
+                    if direction == "long":
+                        outbid = tick_after.bid >= (bait_px + tick_sz)
+                    else:
+                        outbid = tick_after.ask <= (bait_px - tick_sz)
+
+                    if outbid:
+                        self._p41_hidden_confirms += 1
+                        _result["hidden_buyer"] = True
+                        _result["size_boost"]   = P41_BAIT_SIZE_BOOST
+                        log.info(
+                            "[P41-BAIT] 🎯 HIDDEN LIQUIDITY CONFIRMED %s %s: "
+                            "bait_px=%.8f → new_%s=%.8f (Δ=+%.1f ticks) "
+                            "reaction=%.1fms confirms=%d",
+                            symbol, direction.upper(), bait_px,
+                            "bid" if direction == "long" else "ask",
+                            tick_after.bid if direction == "long" else tick_after.ask,
+                            abs((tick_after.bid if direction == "long" else tick_after.ask) - bait_px) / tick_sz,
+                            _result["reaction_ms"], self._p41_hidden_confirms,
+                        )
+                    else:
+                        log.debug(
+                            "[P41-BAIT] No outbid %s %s: bait=%.8f after_%s=%.8f "
+                            "tick_sz=%.8f — no hidden liquidity signal.",
+                            symbol, direction, bait_px,
+                            "bid" if direction == "long" else "ask",
+                            tick_after.bid if direction == "long" else tick_after.ask,
+                            tick_sz,
+                        )
+                else:
+                    log.debug(
+                        "[P41-BAIT] %s tick unavailable after wait or tick_sz=0 "
+                        "— outbid check skipped.", symbol,
+                    )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as _exc:
+                log.warning(
+                    "[P41-BAIT] _p41_run_bait_test unhandled error %s: %s",
+                    symbol, _exc, exc_info=False,
+                )
+            finally:
+                # ── Step 6: Always cancel the bait order ─────────────────────
+                # Decrement global cap first so other symbols are not blocked.
+                self._p41_open_bait_count = max(0, self._p41_open_bait_count - 1)
+
+                if bait_ord_id:
+                    try:
+                        await self._cancel_order(inst, bait_ord_id)
+                        log.debug(
+                            "[P41-BAIT] Bait %s cancelled ord_id=%s", symbol, bait_ord_id,
+                        )
+                    except Exception as _cancel_exc:
+                        # Cancel failure is non-fatal — OKX will expire the order
+                        # if it goes unfilled. Log for leakage audit.
+                        log.warning(
+                            "[P41-BAIT] ⚠ Cancel failed %s ord_id=%s: %s "
+                            "(order may have been filled — check leakage audit)",
+                            symbol, bait_ord_id, _cancel_exc,
+                        )
+                        self._p41_accidental_fills += 1
+
+        return _result
+
+    # ── [/P41] ────────────────────────────────────────────────────────────────
+
     async def _check_liquidity_sweep(self, symbol: str, direction: str,
                                       cur_price: float) -> bool:
         now     = time.time()
@@ -5452,6 +8206,41 @@ class Executor:
         self, symbol: str, side: str, usd_amount: float,
         swap: bool, pos_side: str, tag: str, coin_cfg: CoinConfig,
     ) -> Optional[dict]:
+        # ── [P51] Delegate iceberg to Rust native engine when available ────────
+        # Rust handles child-order replenishment, display-qty management, and
+        # venue-level hidden order support.  Shadow mode: P9 still executes,
+        # Rust result cached for comparison.  Native mode: await Rust result.
+        # Fail-closed: any error → fall through to P9 engine below.
+        if _P51_ENABLE:
+            _p51b = self.bridge
+            _p51_ice_ok = (
+                _p51b is not None
+                and getattr(_p51b, "_connected", False)
+                and (
+                    "twap_vwap" in getattr(_p51b, "_p49_caps", frozenset())
+                    or _P51_FORCE
+                )
+            )
+            if _p51_ice_ok:
+                if _P51_SHADOW_MODE:
+                    asyncio.ensure_future(
+                        self._p51_fire_shadow_iceberg(
+                            symbol, side, usd_amount, swap, coin_cfg, tag,
+                        )
+                    )
+                    # Falls through to P9 immediately
+                else:
+                    _p51_ice_result = await self._p51_iceberg_via_bridge(
+                        symbol, side, usd_amount, swap, pos_side, tag, coin_cfg,
+                    )
+                    if _p51_ice_result is not None:
+                        return _p51_ice_result
+                    log.info(
+                        "[P51] Iceberg native fallback → P9 engine for %s %s $%.2f",
+                        side.upper(), symbol, usd_amount,
+                    )
+        # ── [/P51-ICEBERG] ────────────────────────────────────────────────────
+
         n_slices  = max(1, round(1.0 / ICEBERG_DISPLAY_PCT))
         slice_usd = usd_amount / n_slices
         inst      = _inst_id(symbol, swap=swap)
@@ -5563,7 +8352,37 @@ class Executor:
                     sentinel = self._p11_sentinel
                     if sentinel is not None and sentinel.shadow_tracker is not None:
                         sentinel.shadow_tracker.record_hit(sym)
+                    # [PHASE3-I2] Re-run admission gate before firing the shadow order.
+                    # Conditions (metadata, spread, bridge health) may have changed since
+                    # the shadow watch was registered.  On gate failure the watch is
+                    # cancelled without retry; shadow watches are single-fire.
+                    _shadow_gate = await self._admission_gate(
+                        symbol=sym,
+                        use_swap=watch.swap,
+                        kelly_f=getattr(watch.signal, "kelly_f", 0.0),
+                        confidence=getattr(watch.signal, "confidence", 0.0),
+                        regime=getattr(watch.signal, "regime", ""),
+                    )
+                    if not _shadow_gate.passed:
+                        log.info(
+                            "[PHASE3][P9-SHADOW] %s fire BLOCKED [%s]: %s"
+                            " — cancelling watch.",
+                            sym, _shadow_gate.gate_name, _shadow_gate.reason,
+                        )
+                        # [PHASE11] Count per-gate rejections for policy dashboard.
+                        try:
+                            _gn = _shadow_gate.gate_name
+                            self._gate_rejection_counters[_gn] = (
+                                self._gate_rejection_counters.get(_gn, 0) + 1
+                            )
+                        except Exception as _ctr_exc:
+                            log.debug("[PHASE11] gate counter shadow error: %s", _ctr_exc)
+                        self._cancel_shadow(sym)
+                        continue
                     self._cancel_shadow(sym)
+                    # [PHASE3-I2] Mark in-flight so cross-path dedup sees this shadow
+                    # execution.  Cleared in finally on every exit path.
+                    self._entry_in_flight[sym] = True
                     try:
                         if watch.side == "buy":
                             await self._open_long(sym, watch.usd_amount, watch.signal)
@@ -5571,6 +8390,8 @@ class Executor:
                             await self._open_short(sym, watch.usd_amount, watch.signal)
                     except Exception as e:
                         log.error("[P9] Shadow fire error %s: %s", sym, e, exc_info=True)
+                    finally:
+                        self._entry_in_flight[sym] = False
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -5606,6 +8427,62 @@ class Executor:
     ) -> Optional[dict]:
         if coin_cfg is None:
             coin_cfg = self._coin_cfg(symbol)
+
+        # ── [P51] Delegate large orders to Rust native TWAP/VWAP engine ─────────
+        # When P51 is enabled and the bridge has accepted the "twap_vwap"
+        # capability, delegate the full TWAP execution to Rust.  Rust owns ALL
+        # sub-ms scheduling, micro-slicing, and anti-detection logic.  Python
+        # receives fill events via twap_slice_fill callbacks and a terminal
+        # algo_complete event.
+        #
+        # Shadow mode (P51_SHADOW_MODE=1, default):
+        #   Python fires the Rust request fire-and-forget, then immediately falls
+        #   through to P32 for actual execution.  Rust's result is cached for
+        #   side-by-side comparison in the P51 dashboard panel.
+        #
+        # Native mode (P51_SHADOW_MODE=0):
+        #   Python awaits algo_complete from Rust.  If Rust completes successfully,
+        #   Python returns a synthetic fill dict.  Timeout/error falls through to
+        #   P32 — NO order is dropped.
+        #
+        # Fail-closed: any exception → fall through to P32/P9 unchanged.
+        if (
+            _P51_ENABLE
+            and usd_amount >= P32_TWAP_THRESHOLD_USD
+            and "TWAP" not in tag
+            and "ICE"  not in tag
+            and "MKT"  not in tag
+        ):
+            _p51_bridge = self.bridge
+            _p51_cap_ok = (
+                _p51_bridge is not None
+                and getattr(_p51_bridge, "_connected", False)
+                and (
+                    "twap_vwap" in getattr(_p51_bridge, "_p49_caps", frozenset())
+                    or _P51_FORCE
+                )
+            )
+            if _p51_cap_ok:
+                if _P51_SHADOW_MODE:
+                    # Shadow: fire-and-forget, fall through to P32 immediately.
+                    asyncio.ensure_future(
+                        self._p51_fire_shadow_twap(
+                            symbol, side, usd_amount, swap, coin_cfg, tag,
+                        )
+                    )
+                    # Falls through to P32 below — no await, no blocking.
+                else:
+                    # Native: await Rust; on success return synthetic fill dict.
+                    _p51_result = await self._p51_twap_via_bridge(
+                        symbol, side, usd_amount, swap, pos_side, tag, coin_cfg,
+                    )
+                    if _p51_result is not None:
+                        return _p51_result
+                    log.info(
+                        "[P51] TWAP native fallback → P32 engine for %s %s $%.2f",
+                        side.upper(), symbol, usd_amount,
+                    )
+        # ── [/P51-TWAP] ───────────────────────────────────────────────────────
 
         # ── [P32-STEALTH-TWAP] Route large orders through the stealth TWAP engine ─
         # Only applies to non-TWAP-tagged orders to prevent infinite recursion.
@@ -5705,6 +8582,101 @@ class Executor:
             )
         else:
             raw_price = self._sor.limit_price(side, tick)
+
+        # ── [P48] Emit Strategic Intent to Rust Bridge ────────────────────────
+        # Python has computed the ideal limit price (raw_price).  When P48 is
+        # enabled and the bridge is live, derive the strategic envelope from
+        # raw_price (already computed above — NOT recomputed, preventing double
+        # adjusted_limit_price() calls and P43 OBI state corruption) and emit
+        # a fire-and-forget set_strategic_intent to the Rust tactical predator.
+        # Rust owns the sub-1ms floating within [floor, ceil]; Python retains
+        # KILL-SWITCH authority via cancel_strategic_intent().
+        _p48_bridge = self.bridge
+        if (
+            _P48_ENABLE
+            and spread_mgr is not None
+            and _p48_bridge is not None
+            and getattr(_p48_bridge, "_p48_enabled", False)
+            and getattr(_p48_bridge, "_connected", False)
+            and raw_price > 0
+            and "TWAP" not in tag
+            and "ICE"  not in tag
+            and "MKT"  not in tag
+        ):
+            try:
+                # Pass raw_price as target_px — this PREVENTS the double call
+                # to adjusted_limit_price() inside compute_strategic_intent().
+                _p48_floor, _p48_ceil, _p48_target, _p48_spread = (
+                    spread_mgr.compute_strategic_intent(
+                        side,
+                        tick,
+                        symbol,
+                        order_book  = book if book else None,
+                        target_px   = raw_price,          # ← BUG-1 fix
+                    )
+                )
+                _p48_inst = inst   # full OKX instrument ID (e.g. "BTC-USDT-SWAP")
+
+                # ── [P48-SAFE-FUTURE] Wrap in explicit coroutine so unhandled
+                # exceptions are logged at debug level instead of polluting the
+                # event loop's unhandled-task-exception handler. (BUG-2 fix)
+                async def _p48_send(
+                    bridge=_p48_bridge,
+                    _sym=_p48_inst, _side=side,
+                    _fl=_p48_floor, _cl=_p48_ceil, _tgt=_p48_target,
+                    _sp=_p48_spread, _ttl=_P48_TTL_SECS,
+                    _tag=tag,
+                ) -> None:
+                    try:
+                        # ── [P49] Intent V2 enrichment ────────────────────────
+                        # When the v49+ bridge has accepted "intent_v2", pull
+                        # fresh P47 microstructure data and attach it to the
+                        # intent so Rust can apply smarter floating decisions.
+                        _regime_v2   = None
+                        _toxicity_v2 = None
+                        _obi_v2      = None
+                        if (P49_ENABLE and
+                                "intent_v2" in getattr(bridge, "_p49_caps", frozenset())):
+                            try:
+                                _ms = bridge.get_p47_microstructure(_sym)
+                                # _ms = (toxicity, ofi, ofi_bid_pull, ofi_ask_pull, is_fresh)
+                                if _ms[4]:   # is_fresh
+                                    _toxicity_v2 = _ms[0]
+                                    _obi_v2      = _ms[1]
+                                # Pull regime from last published brain state
+                                _bs_regime_map = getattr(bridge, "_p49_last_brain_state", {}).get("regime_map", {})
+                                _regime_v2 = _bs_regime_map.get(_sym) or _bs_regime_map.get(
+                                    _sym.split("-")[0], None
+                                )
+                            except Exception:
+                                pass  # non-fatal; intent sent without enrichment
+                        # ── [/P49] ────────────────────────────────────────────
+                        await bridge.send_strategic_intent(
+                            symbol         = _sym,
+                            side           = _side,
+                            price_floor    = _fl,
+                            price_ceil     = _cl,
+                            target_px      = _tgt,
+                            max_spread_bps = _sp,
+                            ttl_secs       = _ttl,
+                            regime         = _regime_v2,    # [P49]
+                            toxicity       = _toxicity_v2,  # [P49]
+                            obi_score      = _obi_v2,       # [P49]
+                        )
+                        log.debug(
+                            "[P48] intent sent: %s %s floor=%.8f target=%.8f "
+                            "ceil=%.8f ttl=%.0fs tag=%s",
+                            _sym, _side, _fl, _tgt, _cl, _ttl, _tag,
+                        )
+                    except Exception as _p48_err:
+                        log.debug("[P48] send_strategic_intent failed (non-fatal): %s", _p48_err)
+
+                asyncio.ensure_future(_p48_send())
+
+            except Exception as _p48_setup_exc:
+                # Non-fatal — Python-side pennying (raw_price) remains active.
+                log.debug("[P48] compute_strategic_intent skipped: %s", _p48_setup_exc)
+        # ── [/P48] ────────────────────────────────────────────────────────────
 
         if raw_price <= 0:
             log.error("[%s] raw_price=0 for %s — aborting.", tag, symbol)
@@ -6009,6 +8981,40 @@ class Executor:
         reason    = oracle_signal.signal_type
         mult      = oracle_signal.multiplier
 
+        # ── [TRACK16-DT] Express-path decision-trace state ────────────────────
+        # Capture ts and build base record BEFORE any early-return guard fires
+        # so every exit has the context it needs to emit a trace record.
+        # Mirrors the _dt_base / _dt() pattern in _maybe_enter exactly.
+        # All writes are fail-open — no express gate or execution logic is altered.
+        _express_dt_ts: float            = time.time()
+        _express_dt_llm_verdict: str     = ""     # set after LLM runs (if LLM runs)
+        _express_dt_p32: Optional[float] = None   # set after VetoArb runs
+        _express_dt_base: dict = {
+            "ts":             _express_dt_ts,
+            "symbol":         symbol,
+            "direction":      direction,
+            "regime":         "express",
+            "confidence":     0.0,    # no Signal object on express path
+            "z_score":        0.0,
+            "kelly_f":        0.0,
+            "mtf_aligned":    False,
+            "sniper_boost":   False,
+            "oracle_boosted": True,
+            "whale_mult":     round(float(mult), 4),
+            "source_path":    "express",
+        }
+
+        def _express_dt(rec: dict) -> None:
+            """[TRACK16-DT] Fail-open trace write for express path.
+            JSON tail + async DB insert.  Never raises; never blocks execution."""
+            _append_decision_trace(rec)
+            if self.db is not None:
+                try:
+                    asyncio.ensure_future(self.db.insert_decision_trace(rec))
+                except Exception as _dt16_fe:
+                    log.debug("[TRACK16-DT] ensure_future failed: %s", _dt16_fe)
+        # ── [/TRACK16-DT] ─────────────────────────────────────────────────────
+
         log.warning(
             "[P16-2] trigger_atomic_express_trade: %s direction=%s mult=%.1f× reason=%s",
             symbol, direction, mult, reason,
@@ -6028,19 +9034,49 @@ class Executor:
 
         if self._p20_zombie_mode:
             log.info("[P16-2/P20-1] %s express skipped: Zombie Mode active.", symbol)
+            _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                "outcome": "BLOCKED", "gate_name": "ZOMBIE",
+                "reason": "zombie mode active",
+                "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                "sizing_usd": None, "modifiers": {},
+            })
             return False
 
         if self.drawdown._killed:
+            _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                "outcome": "BLOCKED", "gate_name": "DRAWDOWN_KILLED",
+                "reason": "drawdown kill switch active",
+                "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                "sizing_usd": None, "modifiers": {},
+            })
             return False
 
         cb = self._p7_cb
         if cb is not None and cb.is_tripped:
+            _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                "outcome": "BLOCKED", "gate_name": "CIRCUIT_BREAKER",
+                "reason": "circuit breaker tripped",
+                "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                "sizing_usd": None, "modifiers": {},
+            })
             return False
 
         if self._vol_guard.emergency_pause:
+            _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                "outcome": "BLOCKED", "gate_name": "VOL_GUARD",
+                "reason": "volatility guard emergency pause",
+                "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                "sizing_usd": None, "modifiers": {},
+            })
             return False
 
         if symbol not in self.symbols:
+            _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                "outcome": "BLOCKED", "gate_name": "SYMBOL_NOT_TRACKED",
+                "reason": f"{symbol} not in tracked symbols",
+                "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                "sizing_usd": None, "modifiers": {},
+            })
             return False
 
         # ── [P7] Macro Safety Floor (Express Lane) ───────────────────────────
@@ -6060,12 +9096,30 @@ class Executor:
                     "[P7] Express whale BLOCKED by Macro Safety Floor: %s LONG while macro=%s score=%.3f",
                     symbol, _macro_label or "unknown", _macro_score,
                 )
+                _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                    "outcome": "BLOCKED", "gate_name": "MACRO_FLOOR",
+                    "reason": (
+                        f"macro_score={_macro_score:.3f} ({_macro_label[:30] or 'bearish'})"
+                        f" blocks long"
+                    )[:120],
+                    "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return False
             if direction == "short" and (_macro_score >= 0.7 or "strongly bullish" in _label_low or "extreme greed" in _label_low):
                 log.warning(
                     "[P7] Express whale BLOCKED by Macro Safety Floor: %s SHORT while macro=%s score=%.3f",
                     symbol, _macro_label or "unknown", _macro_score,
                 )
+                _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                    "outcome": "BLOCKED", "gate_name": "MACRO_FLOOR",
+                    "reason": (
+                        f"macro_score={_macro_score:.3f} ({_macro_label[:30] or 'bullish'})"
+                        f" blocks short"
+                    )[:120],
+                    "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return False
         except Exception:
             # Never block express path due to telemetry parsing errors.
@@ -6075,6 +9129,14 @@ class Executor:
             now = time.time()
             last_fire = self._p16_last_express.get(symbol, 0.0)
             if now - last_fire < P16_EXPRESS_DEDUPE_SECS:
+                _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                    "outcome": "BLOCKED", "gate_name": "EXPRESS_DEDUPE",
+                    "reason": (
+                        f"cooldown {now - last_fire:.1f}s < {P16_EXPRESS_DEDUPE_SECS:.0f}s"
+                    )[:120],
+                    "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return False
 
             # [LLMFB-3] LLM veto with empty-response fallback.
@@ -6112,15 +9174,79 @@ class Executor:
                     _express_narrative = _make_neutral_narrative()
 
                 if _express_narrative.verdict == "CATASTROPHE_VETO":
-                    log.warning(
-                        "[P17-3/P18-3] Express Lane CATASTROPHE VETO %s %s: "
-                        "score=%.4f — aborting atomic trade and liquidating.",
-                        symbol, direction, _express_narrative.score,
-                    )
-                    asyncio.ensure_future(
-                        self.liquidate_all_positions(symbol, reason="P18_EXPRESS_CATASTROPHE")
-                    )
+                    # [TRACK16-DT] Capture LLM verdict for trace before any return.
+                    _express_dt_llm_verdict = getattr(_express_narrative, "verdict", "") or ""
+                    # [PHASE14] Consecutive-guard: same counter and thresholds as the
+                    # entry-path P18 site.  Both sites share _p18_catastrophe_consecutive
+                    # so consecutive verdicts from either path compound toward the limit.
+                    _p18_ex_consec = self._p18_catastrophe_consecutive.get(symbol, 0) + 1
+                    self._p18_catastrophe_consecutive[symbol] = _p18_ex_consec
+
+                    if _p18_ex_consec < P18_CATASTROPHE_CONSECUTIVE_REQUIRED:
+                        # Not yet sustained — warn and abort this entry without liquidating.
+                        log.warning(
+                            "[P17-3/P18-3/PHASE14] Express CATASTROPHE VETO %s %s: "
+                            "score=%.4f — consecutive=%d/%d (waiting for sustained "
+                            "verdict before liquidation fires).",
+                            symbol, direction, _express_narrative.score,
+                            _p18_ex_consec, P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+                        )
+                    else:
+                        # Consecutive requirement met — check position hold guard.
+                        _p18_ex_pos = self.positions.get(symbol)
+                        _p18_ex_hold = (
+                            time.time() - _p18_ex_pos.entry_ts
+                            if _p18_ex_pos is not None else 9999.0
+                        )
+                        if (
+                            P18_CATASTROPHE_MIN_HOLD_SECS > 0.0
+                            and _p18_ex_hold < P18_CATASTROPHE_MIN_HOLD_SECS
+                        ):
+                            log.warning(
+                                "[P17-3/P18-3/PHASE14] Express CATASTROPHE VETO %s %s: "
+                                "score=%.4f consecutive=%d/%d — HOLD GUARD: "
+                                "position age=%.1fs < min_hold=%.1fs; "
+                                "suppressing liquidation this cycle.",
+                                symbol, direction, _express_narrative.score,
+                                _p18_ex_consec, P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+                                _p18_ex_hold, P18_CATASTROPHE_MIN_HOLD_SECS,
+                            )
+                        else:
+                            # All guards passed — fire nuclear liquidation.
+                            log.warning(
+                                "[P17-3/P18-3] Express Lane CATASTROPHE VETO %s %s: "
+                                "score=%.4f consecutive=%d/%d hold=%.1fs — "
+                                "aborting atomic trade and liquidating.",
+                                symbol, direction, _express_narrative.score,
+                                _p18_ex_consec, P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+                                _p18_ex_hold,
+                            )
+                            asyncio.ensure_future(
+                                self.liquidate_all_positions(symbol, reason="P18_EXPRESS_CATASTROPHE")
+                            )
+                    # [TRACK16-DT] CATASTROPHE trace — fires regardless of liquidation branch.
+                    _express_dt({**_express_dt_base,
+                        "outcome": "BLOCKED", "gate_name": "LLM_CATASTROPHE",
+                        "reason": (
+                            f"verdict=CATASTROPHE_VETO score={getattr(_express_narrative,'score',0):.4f}"
+                            f" consecutive={_p18_ex_consec}/{P18_CATASTROPHE_CONSECUTIVE_REQUIRED}"
+                        )[:120],
+                        "llm_verdict": _express_dt_llm_verdict,
+                        "p32_p_success": _express_dt_p32,
+                        "sizing_usd": None, "modifiers": {},
+                    })
                     return False            # ── [P32-VETO-ARB][P37-VPIN] Whale-Driven but Safety-Gated ─────────
+                # [TRACK16-DT] Capture non-CATASTROPHE LLM verdict for trace.
+                _express_dt_llm_verdict = getattr(_express_narrative, "verdict", "") or ""
+                # [PHASE14] Express path non-CATASTROPHE verdict — reset counter.
+                if self._p18_catastrophe_consecutive.get(symbol, 0) > 0:
+                    log.debug(
+                        "[P18/PHASE14] Express %s verdict=%s — P18 catastrophe "
+                        "consecutive counter reset to 0.",
+                        symbol,
+                        getattr(_express_narrative, "verdict", "unknown"),
+                    )
+                    self._p18_catastrophe_consecutive[symbol] = 0
             # Even when WHALE_SNIPER is active (>= 10× multiplier), do NOT bypass
             # institutional safety gates: Flow Toxicity (P37), Spoofing (P36.1),
             # Hedge rebalance veto (P35.1), and Skew veto (P34.1) all live inside
@@ -6166,6 +9292,21 @@ class Executor:
                     except Exception:
                         pass
 
+                    # [FIX-001] Whale vel_boost floor — cold-start override.
+                    # velocity_monitor starts with no data (boost=1.0 → vel_score=0.5).
+                    # For confirmed whale mult ≥6×, override vel_boost=1.10 so:
+                    #   vel_score = (1.10-1.0)*5.0 + 0.5 = 1.0
+                    #   p_success = (corr_score + 1.0) / 2 ≥ 0.75 — passes 0.65 gate.
+                    # This does NOT bypass P37/P36/P35/P34 hard vetos (they short-circuit
+                    # before this score is used). It only fixes cold-start deadlock.
+                    if mult >= 6.0 and _vel_boost < 1.10:
+                        _vel_boost = 1.10
+                        log.info(
+                            "[FIX-001] Whale vel_boost override: mult=%.1f× → "
+                            "vel_boost=1.10 (vel_score=1.0, unblocking cold-start deadlock)",
+                            mult,
+                        )
+
                     _local_price: float = 0.0
                     _global_mid:  Optional[float] = None
                     try:
@@ -6182,7 +9323,9 @@ class Executor:
                         velocity_boost=_vel_boost,
                         local_price=_local_price,
                         global_mid_price=_global_mid,
+                        direction=direction,
                     )
+                    _express_dt_p32 = _p_success   # [TRACK16-DT] capture for trace
                     if _p_success < 0.65:
                         log.warning(
                             "[P32-VETO-ARB] Express whale entry BLOCKED by safety gate: "
@@ -6197,214 +9340,318 @@ class Executor:
                             )
                         except Exception:
                             pass
+                        _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                            "outcome": "BLOCKED", "gate_name": "VETO_ARB",
+                            "reason": f"p_success={_p_success:.4f} < 0.65",
+                            "llm_verdict": _express_dt_llm_verdict,
+                            "p32_p_success": _express_dt_p32,
+                            "sizing_usd": None, "modifiers": {},
+                        })
                         return False
             except Exception as _expr_veto_exc:
                 log.debug("[P32-VETO-ARB] Express safety gate error %s: %s", symbol, _expr_veto_exc)
             # ── [/P32-VETO-ARB][P37-VPIN] ──────────────────────────────────────
 
             if symbol in self.positions:
+                _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                    "outcome": "BLOCKED", "gate_name": "ALREADY_OPEN",
+                    "reason": f"position already open for {symbol}",
+                    "llm_verdict": _express_dt_llm_verdict, "p32_p_success": _express_dt_p32,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return False
 
-            tick = await self.hub.get_tick(symbol)
-            if not tick or tick.ask <= 0 or tick.bid <= 0:
-                return False
-
-            use_swap = (direction == "short") or (OKX_LEVERAGE > 1)
-            meta = await self._icache.get_instrument_info(symbol, swap=use_swap)
-
-            cfg = self._coin_cfg(symbol)
-            min_lot_usd = 10.0
-            if meta and tick.ask > 0:
-                min_lot_usd = float(meta.lot_sz if hasattr(meta, 'lot_sz') else 0.01) * tick.ask
-
-            usd_amount = min(
-                max(self._avail * P16_EXPRESS_ALLOC_PCT, cfg.min_usd_value, min_lot_usd),
-                P16_EXPRESS_MAX_USD,
+            # ── [PHASE2] Trade Admission Gate (P16 express path) ──────────────
+            # The normal _maybe_enter path runs the gate before reaching here.
+            # The P16 express path is a separate entry point and must also pass
+            # the same gate.  use_swap matches the logic at line 7889 below.
+            _express_use_swap = (direction == "short") or (OKX_LEVERAGE > 1)
+            _express_admission = await self._admission_gate(
+                symbol=symbol,
+                use_swap=_express_use_swap,
+                kelly_f=0.0,        # no Signal object in express path; edge proxy N/A
+                confidence=0.0,     # [PHASE7] express path has no Signal; CONF gate
+                                    # is inactive at default threshold (0.0 ≥ 0.0).
+                                    # If ADMISSION_MIN_CONFIDENCE > 0, express trades
+                                    # will be blocked — this is intentional: the
+                                    # operator controls this via the env var.
+                regime="express",   # [PHASE8] express path has no signal regime.
+                                    # If ADMISSION_SUPPRESS_REGIMES includes "express",
+                                    # all express trades will be blocked — intentional.
             )
-
-            if usd_amount > self._avail * 0.95:
-                return False
-
-            offset_frac = P16_BBO_OFFSET_BPS / 10_000.0
-            if direction == "long":
-                raw_price = tick.ask * (1.0 + offset_frac)
-                side, pos_side = "buy", ("long" if use_swap else "net")
-            else:
-                raw_price = tick.bid * (1.0 - offset_frac)
-                side, pos_side = "sell", "short"
-
-            inst    = _inst_id(symbol, swap=use_swap)
-            td_mode = "cross" if use_swap else OKX_TD_MODE_SPOT
-
-            if use_swap and OKX_LEVERAGE > 1:
-                await self._set_leverage(inst, OKX_LEVERAGE, mgn_mode=td_mode)
-
-            final_price = InstrumentCache.round_price(raw_price, meta) if meta else raw_price
-
-            # ── [P36.2-DYNCLAMP] Whale Sniper Price Limit Guard ──────────────
-            # Prevent OKX sCode 51006 on express/whale orders by clamping the
-            # aggressive limit price to exchange-enforced buyLmt / sellLmt bands.
-            # Uses DynamicBuffer so high-volatility periods stay ahead of OKX limits.
-            try:
-                _ws_inst = _inst_id(symbol, swap=use_swap)
-                _ws_dyn_buf = self._p362_get_dynamic_buffer(symbol)
-                _ws_buy_lmt, _ws_sell_lmt = self._icache.get_price_limits(_ws_inst)
-                if side == "buy" and _ws_buy_lmt > 0 and final_price > _ws_buy_lmt:
-                    _ws_clamped = _ws_buy_lmt * (1.0 - _ws_dyn_buf)
-                    if meta:
-                        _ws_clamped = InstrumentCache.round_price(_ws_clamped, meta)
-                    log.warning(
-                        "[P36.2-DYNCLAMP][WHALE-SNIPER] %s BUY price %.8f "
-                        "exceeds buyLmt %.8f → clamped to %.8f (buf=%.4f%%)",
-                        symbol, final_price, _ws_buy_lmt, _ws_clamped,
-                        _ws_dyn_buf * 100,
-                    )
-                    final_price = _ws_clamped
-                elif side == "sell" and _ws_sell_lmt > 0 and final_price < _ws_sell_lmt:
-                    _ws_clamped = _ws_sell_lmt * (1.0 + _ws_dyn_buf)
-                    if meta:
-                        _ws_clamped = InstrumentCache.round_price(_ws_clamped, meta)
-                    log.warning(
-                        "[P36.2-DYNCLAMP][WHALE-SNIPER] %s SELL price %.8f "
-                        "below sellLmt %.8f → clamped to %.8f (buf=%.4f%%)",
-                        symbol, final_price, _ws_sell_lmt, _ws_clamped,
-                        _ws_dyn_buf * 100,
-                    )
-                    final_price = _ws_clamped
-            except Exception as _ws_plg_exc:
-                log.debug(
-                    "[P36.2-DYNCLAMP][WHALE-SNIPER] Price limit check for %s: %s "
-                    "(non-fatal).", symbol, _ws_plg_exc,
+            if not _express_admission.passed:
+                log.info(
+                    "[PHASE2-GATE][P16-EXPRESS] %s %s BLOCKED [%s]: %s",
+                    symbol, direction,
+                    _express_admission.gate_name, _express_admission.reason,
                 )
-            # ── [/P36.2-DYNCLAMP] ────────────────────────────────────────────
-
-            # [QUANT-1] + [MINSZ-1] Quantize express trade size.
-            ct_val  = (meta.ct_val if meta and meta.ct_val > 0 else OKX_CT_VAL) if use_swap else 1.0
-            raw_sz  = (usd_amount / raw_price) / ct_val if use_swap else usd_amount / raw_price
-            q = await self._quantize_sz(symbol, raw_sz, use_swap, tag=f"{P16_EXPRESS_TAG}_{symbol}")
-            if not q.valid:
-                log.error("[P16-2] %s express: quantized size invalid — aborting.", symbol)
-                return False
-            sz_str = q.sz_str
-
-            tag = f"{P16_EXPRESS_TAG}_{direction.upper()}_{symbol}"
-
-            agg_body = self._sor.build_aggressive_limit_body(
-                inst, side, sz_str, f"{final_price:.8f}",
-                td_mode, use_swap, pos_side, tag,
-            )
-            # [P40] WHALE_SNIPER Express Lane: if this is a whale-sniper signal
-            # (multiplier > P23_WHALE_SNIPER_MULT_THRESH), pass priority to the
-            # bridge so it routes through the Rust pre-heated HTTP connection pool
-            # targeting <500µs order submission latency.
-            # Phase 37 Alpha logic and Whale Sniper multiplier thresholds are
-            # preserved verbatim — only the transport layer changes.
-            _p40_priority = "WHALE_SNIPER" if _whale_sniper_active else None
-            resp = await self._place_order(agg_body, priority=_p40_priority)
-            ord_id: Optional[str] = None
-            if resp and resp.get("code") == "0":
-                ord_id = resp["data"][0]["ordId"]
-            else:
-                log.error("[P16-2] Aggressive limit placement rejected: %s", resp)
-
-            fill_order: Optional[dict] = None
-            if ord_id:
-                fill_order = await self._wait_fill(inst, ord_id, timeout=P16_EXPRESS_FILL_TIMEOUT)
-                if fill_order is None or fill_order.get("state") != "filled":
-                    try:
-                        await self._cancel_order(inst, ord_id)
-                    except Exception:
-                        pass
-                    fill_order = None
-
-            if fill_order is None:
-                tick2 = await self.hub.get_tick(symbol)
-                if not tick2:
-                    return False
-                ref_price2 = tick2.ask if side == "buy" else tick2.bid
-                if ref_price2 <= 0:
-                    return False
-                raw_sz2 = (usd_amount / ref_price2) / ct_val if use_swap else usd_amount / ref_price2
-                q2 = await self._quantize_sz(symbol, raw_sz2, use_swap, tag=f"{P16_EXPRESS_TAG}_MKT_{symbol}")
-                if not q2.valid:
-                    log.error("[P16-2] %s market fallback: quantized size invalid — aborting.", symbol)
-                    return False
-                mkt_body = self._sor.build_market_body(
-                    inst, side, q2.sz_str, td_mode, use_swap, pos_side,
-                    f"{P16_EXPRESS_TAG}_MKT",
-                )
-                resp_mkt = await self._place_order(mkt_body)
-                if not resp_mkt or resp_mkt.get("code") != "0":
-                    return False
-                ord_id_mkt = resp_mkt["data"][0]["ordId"]
-                fill_order = await self._wait_fill(inst, ord_id_mkt, timeout=15.0)
-                if fill_order is None or fill_order.get("state") != "filled":
-                    return False
-
-            fill_px = float(fill_order.get("avgPx") or fill_order.get("px") or 0)
-            fill_sz = float(fill_order.get("accFillSz") or fill_order.get("sz") or 0)
-
-            if fill_px <= 0 or fill_sz <= 0:
-                return False
-
-            inst_type = "SWAP" if use_swap else "SPOT"
-            self.positions[symbol] = Position(
-                symbol=symbol, direction=direction, inst_type=inst_type,
-                qty=fill_sz, cost_basis=fill_px, usd_cost=usd_amount,
-                entry_signal=None, okx_order_id=fill_order.get("ordId", ""),
-                sniper_entry=False, trail_multiplier=1.0,
-                entry_limit_px=fill_px, p16_express=True,
-            )
-
-            await self.db.insert_trade({
-                "ts": int(time.time()), "symbol": symbol, "side": side,
-                "qty": fill_sz, "price": fill_px, "cost_basis": fill_px,
-                "pnl_pct": 0.0, "realized_usd": None,
-                "tag": f"{self._pending_mode_label} {tag}",
-                "order_id": fill_order.get("ordId", str(uuid.uuid4())),
-                "inst_type": inst_type,
-            })
-
-            self._p16_last_express[symbol] = time.time()
-            self._p16_express_fills       += 1
-
-            _express_mult    = _express_narrative.conviction_multiplier if _express_narrative else 1.0
-            _express_verdict = _express_narrative.verdict               if _express_narrative else "N/A"
-            _express_score   = _express_narrative.score                 if _express_narrative else None
-            self._shadow_log(
-                symbol=symbol, direction=direction, tag=tag,
-                real_usd=usd_amount, baseline_usd=usd_amount,
-                conviction_multiplier=_express_mult,
-                regime="express",
-                narrative_verdict=_express_verdict,
-                narrative_score=_express_score,
-                fill_px=fill_px, fill_sz=fill_sz,
-            )
-
-            log.warning(
-                "[P16-2] EXPRESS FILL confirmed: %s %s qty=%.6f @ %.4f (%s) "
-                "oracle_mult=%.1f× total_express_fills=%d",
-                direction.upper(), symbol, fill_sz, fill_px, inst_type,
-                mult, self._p16_express_fills,
-            )
-
-            sentinel = self._p11_sentinel
-            if sentinel is not None:
+                # [PHASE11] Count per-gate rejections for policy dashboard.
                 try:
-                    asyncio.create_task(
-                        sentinel.notify_atomic_fill(
-                            symbol=symbol, direction=direction,
-                            fill_px=fill_px, fill_sz=fill_sz,
-                            usd_notional=usd_amount,
-                            oracle_mult=oracle_signal.multiplier if oracle_signal else 1.0,
-                            reason=oracle_signal.signal_type if oracle_signal else "WHALE_SWEEP",
-                        ),
-                        name=f"sentinel_atomic_fill_{symbol}",
+                    _gn = _express_admission.gate_name
+                    self._gate_rejection_counters[_gn] = (
+                        self._gate_rejection_counters.get(_gn, 0) + 1
                     )
-                except Exception as exc:
-                    log.debug("[P16-2] sentinel.notify_atomic_fill error: %s", exc)
+                except Exception as _ctr_exc:
+                    log.debug("[PHASE11] gate counter express error: %s", _ctr_exc)
+                _express_dt({**_express_dt_base,    # [TRACK16-DT]
+                    "outcome": "BLOCKED",
+                    "gate_name": _express_admission.gate_name,
+                    "reason": (_express_admission.reason or "")[:120],
+                    "llm_verdict": _express_dt_llm_verdict,
+                    "p32_p_success": _express_dt_p32,
+                    "sizing_usd": None, "modifiers": {},
+                })
+                return False
+            # ── [/PHASE2-GATE] ────────────────────────────────────────────────
 
-            return True
+
+            # [PHASE3-I1] Mark symbol in-flight after admission gate passes,
+            # before any order reaches _place_order.  The finally block
+            # guarantees cleanup on every exit path: success, early return,
+            # or exception.  Closes deferred item D4 from Phase 2.
+            self._entry_in_flight[symbol] = True
+            try:
+                tick = await self.hub.get_tick(symbol)
+                use_swap = (direction == "short") or (OKX_LEVERAGE > 1)
+                meta = await self._icache.get_instrument_info(symbol, swap=use_swap)
+                # [PHASE3-I4] Fail-closed defence-in-depth: the admission gate
+                # already confirmed metadata.  A None here signals a cache
+                # eviction race; abort explicitly rather than degrade silently.
+                if meta is None:
+                    log.warning(
+                        "[PHASE3][P16-EXPRESS] %s: instrument metadata absent "
+                        "after admission gate — aborting "
+                        "(defence-in-depth fail-close).",
+                        symbol,
+                    )
+                    return False
+
+
+                cfg = self._coin_cfg(symbol)
+                min_lot_usd = 10.0
+                if tick.ask > 0:
+                    min_lot_usd = float(meta.lot_sz if hasattr(meta, 'lot_sz') else 0.01) * tick.ask
+
+                usd_amount = min(
+                    max(self._avail * P16_EXPRESS_ALLOC_PCT, cfg.min_usd_value, min_lot_usd),
+                    P16_EXPRESS_MAX_USD,
+                )
+
+                if usd_amount > self._avail * 0.95:
+                    return False
+
+                offset_frac = P16_BBO_OFFSET_BPS / 10_000.0
+                if direction == "long":
+                    raw_price = tick.ask * (1.0 + offset_frac)
+                    side, pos_side = "buy", ("long" if use_swap else "net")
+                else:
+                    raw_price = tick.bid * (1.0 - offset_frac)
+                    side, pos_side = "sell", "short"
+
+                inst    = _inst_id(symbol, swap=use_swap)
+                td_mode = "cross" if use_swap else OKX_TD_MODE_SPOT
+
+                if use_swap and OKX_LEVERAGE > 1:
+                    await self._set_leverage(inst, OKX_LEVERAGE, mgn_mode=td_mode)
+
+                final_price = InstrumentCache.round_price(raw_price, meta) if meta else raw_price
+
+                # ── [P36.2-DYNCLAMP] Whale Sniper Price Limit Guard ──────────────
+                # Prevent OKX sCode 51006 on express/whale orders by clamping the
+                # aggressive limit price to exchange-enforced buyLmt / sellLmt bands.
+                # Uses DynamicBuffer so high-volatility periods stay ahead of OKX limits.
+                try:
+                    _ws_inst = _inst_id(symbol, swap=use_swap)
+                    _ws_dyn_buf = self._p362_get_dynamic_buffer(symbol)
+                    _ws_buy_lmt, _ws_sell_lmt = self._icache.get_price_limits(_ws_inst)
+                    if side == "buy" and _ws_buy_lmt > 0 and final_price > _ws_buy_lmt:
+                        _ws_clamped = _ws_buy_lmt * (1.0 - _ws_dyn_buf)
+                        if meta:
+                            _ws_clamped = InstrumentCache.round_price(_ws_clamped, meta)
+                        log.warning(
+                            "[P36.2-DYNCLAMP][WHALE-SNIPER] %s BUY price %.8f "
+                            "exceeds buyLmt %.8f → clamped to %.8f (buf=%.4f%%)",
+                            symbol, final_price, _ws_buy_lmt, _ws_clamped,
+                            _ws_dyn_buf * 100,
+                        )
+                        final_price = _ws_clamped
+                    elif side == "sell" and _ws_sell_lmt > 0 and final_price < _ws_sell_lmt:
+                        _ws_clamped = _ws_sell_lmt * (1.0 + _ws_dyn_buf)
+                        if meta:
+                            _ws_clamped = InstrumentCache.round_price(_ws_clamped, meta)
+                        log.warning(
+                            "[P36.2-DYNCLAMP][WHALE-SNIPER] %s SELL price %.8f "
+                            "below sellLmt %.8f → clamped to %.8f (buf=%.4f%%)",
+                            symbol, final_price, _ws_sell_lmt, _ws_clamped,
+                            _ws_dyn_buf * 100,
+                        )
+                        final_price = _ws_clamped
+                except Exception as _ws_plg_exc:
+                    log.debug(
+                        "[P36.2-DYNCLAMP][WHALE-SNIPER] Price limit check for %s: %s "
+                        "(non-fatal).", symbol, _ws_plg_exc,
+                    )
+                # ── [/P36.2-DYNCLAMP] ────────────────────────────────────────────
+
+                # [QUANT-1] + [MINSZ-1] Quantize express trade size.
+                ct_val  = (meta.ct_val if meta and meta.ct_val > 0 else OKX_CT_VAL) if use_swap else 1.0
+                raw_sz  = (usd_amount / raw_price) / ct_val if use_swap else usd_amount / raw_price
+                q = await self._quantize_sz(symbol, raw_sz, use_swap, tag=f"{P16_EXPRESS_TAG}_{symbol}")
+                if not q.valid:
+                    log.error("[P16-2] %s express: quantized size invalid — aborting.", symbol)
+                    return False
+                sz_str = q.sz_str
+
+                tag = f"{P16_EXPRESS_TAG}_{direction.upper()}_{symbol}"
+
+                agg_body = self._sor.build_aggressive_limit_body(
+                    inst, side, sz_str, f"{final_price:.8f}",
+                    td_mode, use_swap, pos_side, tag,
+                )
+                # [P40] WHALE_SNIPER Express Lane: if this is a whale-sniper signal
+                # (multiplier > P23_WHALE_SNIPER_MULT_THRESH), pass priority to the
+                # bridge so it routes through the Rust pre-heated HTTP connection pool
+                # targeting <500µs order submission latency.
+                # Phase 37 Alpha logic and Whale Sniper multiplier thresholds are
+                # preserved verbatim — only the transport layer changes.
+                _p40_priority = "WHALE_SNIPER" if _whale_sniper_active else None
+                resp = await self._place_order(agg_body, priority=_p40_priority)
+                ord_id: Optional[str] = None
+                if resp and resp.get("code") == "0":
+                    ord_id = resp["data"][0]["ordId"]
+                else:
+                    log.error("[P16-2] Aggressive limit placement rejected: %s", resp)
+
+                fill_order: Optional[dict] = None
+                if ord_id:
+                    fill_order = await self._wait_fill(inst, ord_id, timeout=P16_EXPRESS_FILL_TIMEOUT)
+                    if fill_order is None or fill_order.get("state") != "filled":
+                        try:
+                            await self._cancel_order(inst, ord_id)
+                        except Exception:
+                            pass
+                        fill_order = None
+
+                if fill_order is None:
+                    tick2 = await self.hub.get_tick(symbol)
+                    if not tick2:
+                        return False
+                    ref_price2 = tick2.ask if side == "buy" else tick2.bid
+                    if ref_price2 <= 0:
+                        return False
+                    raw_sz2 = (usd_amount / ref_price2) / ct_val if use_swap else usd_amount / ref_price2
+                    q2 = await self._quantize_sz(symbol, raw_sz2, use_swap, tag=f"{P16_EXPRESS_TAG}_MKT_{symbol}")
+                    if not q2.valid:
+                        log.error("[P16-2] %s market fallback: quantized size invalid — aborting.", symbol)
+                        return False
+                    mkt_body = self._sor.build_market_body(
+                        inst, side, q2.sz_str, td_mode, use_swap, pos_side,
+                        f"{P16_EXPRESS_TAG}_MKT",
+                    )
+                    resp_mkt = await self._place_order(mkt_body)
+                    if not resp_mkt or resp_mkt.get("code") != "0":
+                        return False
+                    ord_id_mkt = resp_mkt["data"][0]["ordId"]
+                    fill_order = await self._wait_fill(inst, ord_id_mkt, timeout=15.0)
+                    if fill_order is None or fill_order.get("state") != "filled":
+                        return False
+
+                fill_px = float(fill_order.get("avgPx") or fill_order.get("px") or 0)
+                fill_sz = float(fill_order.get("accFillSz") or fill_order.get("sz") or 0)
+
+                if fill_px <= 0 or fill_sz <= 0:
+                    return False
+
+                inst_type = "SWAP" if use_swap else "SPOT"
+                self.positions[symbol] = Position(
+                    symbol=symbol, direction=direction, inst_type=inst_type,
+                    qty=fill_sz, cost_basis=fill_px, usd_cost=usd_amount,
+                    entry_signal=None, okx_order_id=fill_order.get("ordId", ""),
+                    sniper_entry=False, trail_multiplier=1.0,
+                    entry_limit_px=fill_px, p16_express=True,
+                )
+
+                _express_ord_id  = fill_order.get("ordId", str(uuid.uuid4()))
+                _express_tag     = f"{self._pending_mode_label} {tag}"
+                # [PHASE4] Enrich any fill-event row already written for this ordId.
+                # [PHASE16-C9] Skip patch when ordId is empty — an empty string used
+                # as a WHERE key would match any row stored with order_id="" and could
+                # silently corrupt unrelated rows.  The INSERT below is the primary
+                # write in that case, which is the correct fallback behaviour.
+                if _express_ord_id:
+                    await self.db.patch_open_attribution(
+                        _express_ord_id,
+                        trade_id=self.positions[symbol].trade_id,
+                        tag=_express_tag,
+                    )
+                await self.db.insert_trade({
+                    "ts": int(time.time()), "symbol": symbol, "side": side,
+                    "qty": fill_sz, "price": fill_px, "cost_basis": fill_px,
+                    "pnl_pct": 0.0, "realized_usd": None,
+                    "tag": _express_tag,
+                    "order_id": _express_ord_id,
+                    "inst_type": inst_type,
+                    # [PHASE1] Write trade_id on open leg so open and close rows are linked.
+                    "trade_id": self.positions[symbol].trade_id,
+                    # [PHASE4] is_close_leg=0: open leg.
+                    "is_close_leg": 0,
+                })
+                if hasattr(self.db, 'commit'):
+                    await self.db.commit()
+                log.info("[DB-SYNC] Trade committed for %s | Side: %s", symbol, side)
+
+                self._p16_last_express[symbol] = time.time()
+                self._p16_express_fills       += 1
+
+                _express_mult    = _express_narrative.conviction_multiplier if _express_narrative else 1.0
+                _express_verdict = _express_narrative.verdict               if _express_narrative else "N/A"
+                _express_score   = _express_narrative.score                 if _express_narrative else None
+                self._shadow_log(
+                    symbol=symbol, direction=direction, tag=tag,
+                    real_usd=usd_amount, baseline_usd=usd_amount,
+                    conviction_multiplier=_express_mult,
+                    regime="express",
+                    narrative_verdict=_express_verdict,
+                    narrative_score=_express_score,
+                    fill_px=fill_px, fill_sz=fill_sz,
+                )
+
+                log.warning(
+                    "[P16-2] EXPRESS FILL confirmed: %s %s qty=%.6f @ %.4f (%s) "
+                    "oracle_mult=%.1f× total_express_fills=%d",
+                    direction.upper(), symbol, fill_sz, fill_px, inst_type,
+                    mult, self._p16_express_fills,
+                )
+
+                sentinel = self._p11_sentinel
+                if sentinel is not None:
+                    try:
+                        asyncio.create_task(
+                            sentinel.notify_atomic_fill(
+                                symbol=symbol, direction=direction,
+                                fill_px=fill_px, fill_sz=fill_sz,
+                                usd_notional=usd_amount,
+                                oracle_mult=oracle_signal.multiplier if oracle_signal else 1.0,
+                                reason=oracle_signal.signal_type if oracle_signal else "WHALE_SWEEP",
+                            ),
+                            name=f"sentinel_atomic_fill_{symbol}",
+                        )
+                    except Exception as exc:
+                        log.debug("[P16-2] sentinel.notify_atomic_fill error: %s", exc)
+
+                # [TRACK16-DT] ADMITTED trace — emit after all book-keeping is
+                # done and before returning True so sizing_usd is accurate.
+                _express_dt({**_express_dt_base,
+                    "outcome": "ADMITTED", "gate_name": "PASS",
+                    "reason": f"express fill {direction} qty={fill_sz:.6f} @ {fill_px:.4f}",
+                    "llm_verdict": _express_dt_llm_verdict,
+                    "p32_p_success": _express_dt_p32,
+                    "sizing_usd": round(usd_amount, 2),
+                    "modifiers": {"oracle_mult": round(float(mult), 4)},
+                })
+                return True
+            finally:
+                self._entry_in_flight[symbol] = False
 
     # ── Position open / close ──────────────────────────────────────────────────
     async def _open_long(
@@ -6451,10 +9698,23 @@ class Executor:
                 return False
             fill_px       = float(order.get("avgPx") or order.get("px") or 0)
             fill_sz       = float(order.get("accFillSz") or order.get("sz") or 0)
-            used_order_id = order.get("ordId", "")
+            # [D9 / PHASE13] Guard against empty ordId (e.g. exchange error path
+            # that returns a fill dict without an ordId field).  An empty string
+            # would collide on the UNIQUE order_id constraint and silently drop
+            # a second open-leg write.  uuid4 fallback matches the express-lane
+            # pattern at _express_ord_id above.
+            used_order_id = order.get("ordId", "") or str(uuid.uuid4())
 
         if fill_px <= 0 or fill_sz <= 0:
             return False
+
+        # [P46] Stamp fill timestamp immediately after exchange confirms fill.
+        _p46_fill_ts = time.time()
+        self._p46_record_entry(
+            symbol=symbol, direction="long", signal=signal,
+            fill_px=fill_px, fill_sz=fill_sz, usd_amount=usd_amount,
+            tag=tag, fill_ts=_p46_fill_ts,
+        )
 
         self.positions[symbol] = Position(
             symbol=symbol, direction="long", inst_type=inst_type,
@@ -6464,17 +9724,41 @@ class Executor:
             trail_multiplier=signal.trail_multiplier,
             entry_limit_px=fill_px,
         )
+        # [PHASE4] Enrich the row that _on_fill_event may have already written
+        # (tag=okx_fill_untracked/tracked, trade_id=NULL) with the canonical
+        # trade_id, tag, and is_close_leg=0.  If the fill-event row doesn't
+        # exist yet, the INSERT below acts as the primary write.
+        # [PHASE16-C9] Guard: skip patch when order_id is empty — an empty string
+        # used as a WHERE key would match any DB row stored with order_id="" and
+        # could silently corrupt unrelated open-leg rows.  The INSERT below is the
+        # correct primary write in that case.
+        _canonical_tag = f"{self._pending_mode_label} {tag}"
+        if used_order_id:
+            await self.db.patch_open_attribution(
+                used_order_id,
+                trade_id=self.positions[symbol].trade_id,
+                tag=_canonical_tag,
+            )
         await self.db.insert_trade({
             "ts": int(time.time()), "symbol": symbol, "side": "buy",
             "qty": fill_sz, "price": fill_px, "cost_basis": fill_px,
             "pnl_pct": 0.0, "realized_usd": None,
-            "tag": f"{self._pending_mode_label} {tag}",
+            "tag": _canonical_tag,
             "order_id": used_order_id, "inst_type": inst_type,
+            # [PHASE1] Write trade_id on open leg so open and close rows are linked.
+            "trade_id": self.positions[symbol].trade_id,
+            # [PHASE4] is_close_leg=0: open leg, excluded from close-only KPIs.
+            "is_close_leg": 0,
         })
+        if hasattr(self.db, 'commit'):
+            await self.db.commit()
+        log.info("[DB-SYNC] Trade committed for %s | Side: %s", symbol, "buy")
 
         baseline     = _shadow_baseline_usd if _shadow_baseline_usd > 0 else usd_amount
         n_verdict    = _shadow_narrative.verdict if _shadow_narrative else "N/A"
         n_score      = _shadow_narrative.score   if _shadow_narrative else None
+        # ── [P46] Pull precision telemetry from pending context ───────────────
+        _p46_ctx = self._p46_pending_ctx.pop(symbol, {})
         self._shadow_log(
             symbol=symbol, direction="long", tag=tag,
             real_usd=usd_amount, baseline_usd=baseline,
@@ -6483,6 +9767,10 @@ class Executor:
             narrative_verdict=n_verdict,
             narrative_score=n_score,
             fill_px=fill_px, fill_sz=fill_sz,
+            signal_ts      = _p46_ctx.get("signal_ts",      0.0),
+            theoretical_px = _p46_ctx.get("theoretical_px", 0.0),
+            p39_active     = _p46_ctx.get("p39_active",     0),
+            p41_active     = _p46_ctx.get("p41_confirmed",  0),
         )
 
         auditor = self._p7_auditor
@@ -6561,10 +9849,20 @@ class Executor:
                 return False
             fill_px       = float(order.get("avgPx") or order.get("px") or 0)
             fill_sz       = float(order.get("accFillSz") or order.get("sz") or 0)
-            used_order_id = order.get("ordId", "")
+            # [D9 / PHASE13] Same uuid4 fallback as _open_long — prevents empty
+            # string from reaching the UNIQUE order_id constraint on insert.
+            used_order_id = order.get("ordId", "") or str(uuid.uuid4())
 
         if fill_px <= 0 or fill_sz <= 0:
             return False
+
+        # [P46] Stamp fill timestamp immediately after exchange confirms fill.
+        _p46_fill_ts = time.time()
+        self._p46_record_entry(
+            symbol=symbol, direction="short", signal=signal,
+            fill_px=fill_px, fill_sz=fill_sz, usd_amount=usd_amount,
+            tag=tag, fill_ts=_p46_fill_ts,
+        )
 
         self.positions[symbol] = Position(
             symbol=symbol, direction="short", inst_type="SWAP",
@@ -6574,17 +9872,37 @@ class Executor:
             trail_multiplier=signal.trail_multiplier,
             entry_limit_px=fill_px,
         )
+        # [PHASE4] Enrich the row that _on_fill_event may have already written
+        # with canonical trade_id, tag, and is_close_leg=0.
+        # [PHASE16-C9] Guard: skip patch when order_id is empty — same rationale as
+        # the long-entry path above.  The INSERT below is the primary write fallback.
+        _canonical_tag_short = f"{self._pending_mode_label} {tag}"
+        if used_order_id:
+            await self.db.patch_open_attribution(
+                used_order_id,
+                trade_id=self.positions[symbol].trade_id,
+                tag=_canonical_tag_short,
+            )
         await self.db.insert_trade({
             "ts": int(time.time()), "symbol": symbol, "side": "sell",
             "qty": fill_sz, "price": fill_px, "cost_basis": fill_px,
             "pnl_pct": 0.0, "realized_usd": None,
-            "tag": f"{self._pending_mode_label} {tag}",
+            "tag": _canonical_tag_short,
             "order_id": used_order_id, "inst_type": "SWAP",
+            # [PHASE1] Write trade_id on open leg so open and close rows are linked.
+            "trade_id": self.positions[symbol].trade_id,
+            # [PHASE4] is_close_leg=0: open leg, excluded from close-only KPIs.
+            "is_close_leg": 0,
         })
+        if hasattr(self.db, 'commit'):
+            await self.db.commit()
+        log.info("[DB-SYNC] Trade committed for %s | Side: %s", symbol, "sell")
 
         baseline  = _shadow_baseline_usd if _shadow_baseline_usd > 0 else usd_amount
         n_verdict = _shadow_narrative.verdict if _shadow_narrative else "N/A"
         n_score   = _shadow_narrative.score   if _shadow_narrative else None
+        # ── [P46] Pull precision telemetry from pending context ───────────────
+        _p46_ctx = self._p46_pending_ctx.pop(symbol, {})
         self._shadow_log(
             symbol=symbol, direction="short", tag=tag,
             real_usd=usd_amount, baseline_usd=baseline,
@@ -6593,6 +9911,10 @@ class Executor:
             narrative_verdict=n_verdict,
             narrative_score=n_score,
             fill_px=fill_px, fill_sz=fill_sz,
+            signal_ts      = _p46_ctx.get("signal_ts",      0.0),
+            theoretical_px = _p46_ctx.get("theoretical_px", 0.0),
+            p39_active     = _p46_ctx.get("p39_active",     0),
+            p41_active     = _p46_ctx.get("p41_confirmed",  0),
         )
 
         auditor = self._p7_auditor
@@ -6631,7 +9953,38 @@ class Executor:
                  " [SNIPER]" if signal.sniper_boost else "")
         return True
 
-    async def _close_position(self, symbol: str, tag: str = "CLOSE") -> bool:
+    async def _close_position(
+        self,
+        symbol: str,
+        tag: str = "CLOSE",
+        exit_reason: Optional[ExitReason] = None,
+    ) -> bool:
+        # ── [PHASE1] Duplicate-close guard ───────────────────────────────────
+        # Acquire a per-symbol asyncio.Lock before touching self.positions.
+        # If the lock is already held (concurrent close in-flight for this
+        # symbol), return False immediately — the first caller owns the close.
+        if symbol not in self._close_locks:
+            self._close_locks[symbol] = asyncio.Lock()
+        _close_lock = self._close_locks[symbol]
+        if _close_lock.locked():
+            log.warning(
+                "[PHASE1] _close_position: concurrent close already in-flight "
+                "for %s — aborting duplicate.", symbol,
+            )
+            return False
+        async with _close_lock:
+            return await self._close_position_inner(symbol, tag, exit_reason)
+
+    async def _close_position_inner(
+        self,
+        symbol: str,
+        tag: str = "CLOSE",
+        exit_reason: Optional[ExitReason] = None,
+    ) -> bool:
+        # Resolve ExitReason from tag if caller did not supply one explicitly.
+        if exit_reason is None:
+            exit_reason = tag_to_exit_reason(tag)
+
         pos = self.positions.get(symbol)
         if not pos:
             return False
@@ -6683,7 +10036,39 @@ class Executor:
                         auditor.record(symbol, expected_px=close_price,
                                        actual_px=actual_fill_px, side=close_side,
                                        filled=True)
-                    await self._record_close(pos, actual_fill_px, tag)
+                    # [PHASE10] Compute close-side friction at the limit-fill path.
+                    # close_price is the bid/ask rounded to tick — the expected fill
+                    # price for a limit order.  Positive slippage = adverse (paid
+                    # more than expected on a buy, received less than expected on a sell).
+                    # spread_at_close_bps captures the market's liquidity cost at the
+                    # moment the order was submitted.  tick is guaranteed non-None here
+                    # (we are inside `if tick:`).
+                    _p10_slip: Optional[float] = None
+                    _p10_spread: Optional[float] = None
+                    try:
+                        if close_price > 0:
+                            if close_side == "sell":
+                                _p10_slip = round(
+                                    (close_price - actual_fill_px) / close_price * 10_000, 4
+                                )
+                            else:
+                                _p10_slip = round(
+                                    (actual_fill_px - close_price) / close_price * 10_000, 4
+                                )
+                        if tick.bid > 0:
+                            _p10_spread = round(
+                                (tick.ask - tick.bid) / tick.bid * 10_000, 4
+                            )
+                    except Exception as _p10_exc:
+                        log.debug("[PHASE10] limit-path friction compute error %s: %s",
+                                  symbol, _p10_exc)
+                    await self._record_close(
+                        pos, actual_fill_px, tag, exit_reason,
+                        close_order_id=ord_id,
+                        close_slippage_bps=_p10_slip,
+                        spread_at_close_bps=_p10_spread,
+                        expected_close_px=close_price,
+                    )
                     return True
                 await self._cancel_order(inst, ord_id)
 
@@ -6704,38 +10089,213 @@ class Executor:
             auditor.record(symbol, expected_px=expected_mkt,
                            actual_px=actual_fill_px, side=close_side, filled=True)
 
-        await self._record_close(pos, actual_fill_px, tag)
+        # [PHASE10] Compute close-side friction at the market-fallback path.
+        # expected_mkt is the best bid (sell) / best ask (buy) at order submission —
+        # the reference price for a market order.  tick may be None on this path
+        # (no tick = no expected price = no friction fields).
+        _p10_slip_mkt: Optional[float] = None
+        _p10_spread_mkt: Optional[float] = None
+        _p10_expected_mkt: Optional[float] = None
+        try:
+            if tick:
+                _p10_expected_mkt = tick.bid if close_side == "sell" else tick.ask
+                if _p10_expected_mkt and _p10_expected_mkt > 0:
+                    if close_side == "sell":
+                        _p10_slip_mkt = round(
+                            (_p10_expected_mkt - actual_fill_px) / _p10_expected_mkt * 10_000, 4
+                        )
+                    else:
+                        _p10_slip_mkt = round(
+                            (actual_fill_px - _p10_expected_mkt) / _p10_expected_mkt * 10_000, 4
+                        )
+                if tick.bid > 0:
+                    _p10_spread_mkt = round(
+                        (tick.ask - tick.bid) / tick.bid * 10_000, 4
+                    )
+        except Exception as _p10m_exc:
+            log.debug("[PHASE10] market-path friction compute error %s: %s",
+                      symbol, _p10m_exc)
+
+        await self._record_close(
+            pos, actual_fill_px, tag, exit_reason,
+            close_order_id=ord_id2,
+            close_slippage_bps=_p10_slip_mkt,
+            spread_at_close_bps=_p10_spread_mkt,
+            expected_close_px=_p10_expected_mkt,
+        )
         return True
 
-    async def _record_close(self, pos: Position, fill_px: float, tag: str):
+    async def _record_close(
+        self,
+        pos: Position,
+        fill_px: float,
+        tag: str,
+        exit_reason: Optional[ExitReason] = None,
+        close_order_id: Optional[str] = None,
+        close_slippage_bps: Optional[float] = None,
+        spread_at_close_bps: Optional[float] = None,
+        expected_close_px: Optional[float] = None,
+    ):
+        # [PHASE1] Resolve ExitReason from tag if not supplied.
+        if exit_reason is None:
+            exit_reason = tag_to_exit_reason(tag)
+        exit_cat = exit_reason_category(exit_reason)
+
         pnl_pct = (
             (fill_px - pos.cost_basis) / pos.cost_basis * 100
             if pos.direction == "long"
             else (pos.cost_basis - fill_px) / pos.cost_basis * 100
         ) if pos.cost_basis > 0 else 0.0
         realized = pnl_pct / 100 * pos.usd_cost
-        await self.db.insert_trade({
-            "ts": int(time.time()), "symbol": pos.symbol,
-            "side": "sell" if pos.direction == "long" else "buy",
-            "qty": pos.qty, "price": fill_px,
-            "cost_basis": pos.cost_basis, "pnl_pct": round(pnl_pct, 4),
-            "realized_usd": round(realized, 6), "tag": tag,
-            "order_id": str(uuid.uuid4()), "inst_type": pos.inst_type,
-        })
+
+        # [PHASE4] Use the real exchange ordId when available so the canonical
+        # close row can be cross-referenced to the exchange and (more importantly)
+        # deduplication against the noise row written by _on_fill_event works via
+        # the UNIQUE constraint on order_id.  Fall back to uuid4 only when the
+        # caller does not have a real ordId (should not happen on normal paths).
+        effective_ord_id = close_order_id if close_order_id else str(uuid.uuid4())
+
+        # [PHASE6] Compute close-leg diagnostic fields.
+        # entry_confidence / entry_kelly_f: from the Signal that created the position.
+        # hold_time_secs: wall-clock seconds from entry_ts to this close call.
+        # All three are None-safe — positions opened before Phase 6 have
+        # entry_signal=None; entry_ts defaults to time.time() at creation.
+        _sig = pos.entry_signal
+        _entry_confidence: Optional[float] = (
+            round(float(_sig.confidence), 6) if _sig is not None else None
+        )
+        _entry_kelly_f: Optional[float] = (
+            round(float(_sig.kelly_f), 6) if _sig is not None else None
+        )
+        _hold_time_secs: Optional[float] = round(time.time() - pos.entry_ts, 2)
+
+        # [POST-ROADMAP-DT] Entry-context signal fields — regime, direction, z_score
+        # from the Signal that created the position.  None-safe: positions opened
+        # before this migration (or with entry_signal=None) produce NULL in the DB.
+        # Stored as-is: regime and direction are short strings ("bull"/"bear"/"chop",
+        # "long"/"short"); z_score is rounded to 6dp for storage consistency.
+        _entry_regime:    Optional[str]   = (
+            str(_sig.regime)    if _sig is not None else None
+        )
+        _entry_direction: Optional[str]   = (
+            str(_sig.direction) if _sig is not None else None
+        )
+        _entry_z_score:   Optional[float] = (
+            round(float(_sig.z_score), 6) if _sig is not None else None
+        )
+
+        # [PHASE7] Feed the per-symbol early-flush tracker.
+        # A close qualifies as an "early flush" when:
+        #   • exit category is RISK or ANOMALY (emergency/risk-driven close)
+        #   • hold_time_secs is below the configured max threshold
+        # The flush deque is bounded by ADMISSION_FLUSH_LOOKBACK (maxlen) so
+        # old entries are automatically evicted as new flushes arrive.
+        # We always track regardless of whether ADMISSION_FLUSH_COOLDOWN_SECS is
+        # enabled so that data is ready when the operator turns on the gate.
+        try:
+            if (
+                exit_cat in (ExitReasonCategory.RISK, ExitReasonCategory.ANOMALY)
+                and _hold_time_secs is not None
+                and _hold_time_secs < ADMISSION_FLUSH_MAX_HOLD_SECS
+            ):
+                if pos.symbol not in self._flush_tracker:
+                    self._flush_tracker[pos.symbol] = deque(
+                        maxlen=max(1, ADMISSION_FLUSH_LOOKBACK)
+                    )
+                self._flush_tracker[pos.symbol].append((time.time(), _hold_time_secs))
+                log.debug(
+                    "[PHASE7] early-flush recorded %s: hold=%.1fs cat=%s "
+                    "(deque size=%d/%d)",
+                    pos.symbol, _hold_time_secs, exit_cat.value,
+                    len(self._flush_tracker[pos.symbol]),
+                    ADMISSION_FLUSH_LOOKBACK,
+                )
+        except Exception as _ft_exc:
+            log.debug("[PHASE7] flush tracker update error %s: %s", pos.symbol, _ft_exc)
+        # ── [/PHASE7] ─────────────────────────────────────────────────────────
+
+        # [PHASE4] Attempt to PATCH the existing row that _on_fill_event wrote
+        # (which carries the same real ordId but pnl=0 and no attribution).
+        # If the fill-event row is not yet present (0 rows affected), fall back
+        # to a fresh INSERT so the canonical close row is always persisted.
+        _patched = await self.db.patch_close_attribution(
+            order_id             = effective_ord_id,
+            trade_id             = pos.trade_id,
+            tag                  = tag,
+            exit_reason_type     = exit_reason.value,
+            exit_reason_category = exit_cat.value,
+            pnl_pct              = round(pnl_pct, 4),
+            realized_usd         = round(realized, 6),
+            # [PHASE6] Pass diagnostic fields into the patch so the fill-event
+            # row (if it already exists) gets them in a single UPDATE.
+            entry_confidence     = _entry_confidence,
+            entry_kelly_f        = _entry_kelly_f,
+            hold_time_secs       = _hold_time_secs,
+            # [PHASE10] Friction fields — None for HEDGE_TRIM and any path where
+            # a pre-order tick was unavailable.  Existing callers that do not pass
+            # these params receive None, which is written as SQL NULL.
+            close_slippage_bps   = close_slippage_bps,
+            spread_at_close_bps  = spread_at_close_bps,
+            # [POST-ROADMAP-DT] Entry-context signal fields.
+            entry_regime         = _entry_regime,
+            entry_direction      = _entry_direction,
+            entry_z_score        = _entry_z_score,
+        )
+        if not _patched:
+            # No pre-existing row to patch — insert fresh canonical close row.
+            await self.db.insert_trade({
+                "ts": int(time.time()), "symbol": pos.symbol,
+                "side": "sell" if pos.direction == "long" else "buy",
+                "qty": pos.qty, "price": fill_px,
+                "cost_basis": pos.cost_basis, "pnl_pct": round(pnl_pct, 4),
+                "realized_usd": round(realized, 6), "tag": tag,
+                "order_id": effective_ord_id, "inst_type": pos.inst_type,
+                # [PHASE1] Canonical attribution columns.
+                "trade_id":             pos.trade_id,
+                "exit_reason_type":     exit_reason.value,
+                "exit_reason_category": exit_cat.value,
+                # [PHASE4] Mark as canonical close row.
+                "is_close_leg":         1,
+                # [PHASE6] Close-leg diagnostic columns.
+                "entry_confidence":     _entry_confidence,
+                "entry_kelly_f":        _entry_kelly_f,
+                "hold_time_secs":       _hold_time_secs,
+                # [PHASE10] Friction columns — None for HEDGE_TRIM and no-tick paths.
+                "close_slippage_bps":   close_slippage_bps,
+                "spread_at_close_bps":  spread_at_close_bps,
+                # [POST-ROADMAP-DT] Entry-context signal columns.
+                "entry_regime":         _entry_regime,
+                "entry_direction":      _entry_direction,
+                "entry_z_score":        _entry_z_score,
+            })
+        if hasattr(self.db, 'commit'):
+            await self.db.commit()
+        log.info("[DB-SYNC] Trade committed for %s | Side: %s", pos.symbol, "sell" if pos.direction == "long" else "buy")
         if pos.entry_signal:
             self.brain.record_outcome(pos.symbol, pos.entry_signal.tf,
                                        pos.direction, pnl_pct)
         self._perf.record(pos.symbol, pnl_pct)
 
         # ── [P32-SLIP-ADAPT] Record realized slippage for this trade ──────────
-        # Use cost_basis as the "expected" price and fill_px as the actual.
-        # Side is determined by the position direction (long → sell to close,
-        # short → buy to close — the close direction is what we measure slippage on).
+        # [PHASE10] Fix: use the actual expected close price (bid/ask at order
+        # submission time) when available.  Before Phase 10, pos.cost_basis
+        # (the entry price) was used, which measured the full round-trip move
+        # rather than close-side execution quality — a semantic error that could
+        # produce negative slippage (apparent "benefit") on winning trades.
+        # expected_close_px is supplied by _close_position_inner on both the
+        # limit-fill and market-fallback paths.  It is None only on HEDGE_TRIM
+        # and legacy callers, in which case we fall back to pos.cost_basis to
+        # preserve pre-Phase-10 behavior for those paths.
         try:
             _close_side = "sell" if pos.direction == "long" else "buy"
+            _p32_expected = (
+                expected_close_px
+                if expected_close_px is not None
+                else pos.cost_basis
+            )
             self._p32_record_slippage(
                 pos.symbol,
-                expected_px=pos.cost_basis,
+                expected_px=_p32_expected,
                 fill_px=fill_px,
                 side=_close_side,
             )
@@ -6744,6 +10304,47 @@ class Executor:
         # ── [/P32-SLIP-ADAPT] ─────────────────────────────────────────────────
 
         log.info("CLOSE %s [%s] pnl=%.2f%%", pos.symbol, tag, pnl_pct)
+
+        # ── [TRACK17-EXIT] Close decision-trace — fail-open, observational ──────
+        # Emitted after the trade is written to the DB but before position is
+        # removed from self.positions.  All required locals are already in scope.
+        # Uses the same _append_decision_trace + asyncio.ensure_future pattern as
+        # _maybe_enter/_dt() and trigger_atomic_express_trade/_express_dt().
+        # No close logic is altered; no await on the critical close path.
+        try:
+            _close_trace_rec: dict = {
+                "ts":             time.time(),
+                "symbol":         pos.symbol,
+                "direction":      pos.direction,
+                "regime":         exit_cat.value,
+                "confidence":     round(float(_entry_confidence or 0.0), 6),
+                "z_score":        round(float(_entry_z_score   or 0.0), 4),
+                "kelly_f":        round(float(_entry_kelly_f   or 0.0), 6),
+                "mtf_aligned":    False,
+                "sniper_boost":   False,
+                "oracle_boosted": False,
+                "whale_mult":     1.0,
+                "outcome":        "CLOSED",
+                "gate_name":      exit_reason.value,
+                "reason":         (
+                    f"pnl={pnl_pct:.2f}% hold={_hold_time_secs:.0f}s"
+                    if _hold_time_secs is not None
+                    else f"pnl={pnl_pct:.2f}%"
+                ),
+                "llm_verdict":    "",
+                "p32_p_success":  None,
+                "sizing_usd":     round(pos.usd_cost, 2),
+                "source_path":    "close",
+                "pnl_pct":        round(pnl_pct, 4),
+                "hold_time_secs": _hold_time_secs,
+            }
+            _append_decision_trace(_close_trace_rec)
+            _db_ct = self.db
+            if _db_ct is not None:
+                asyncio.ensure_future(_db_ct.insert_decision_trace(_close_trace_rec))
+        except Exception as _ct_exc:
+            log.debug("[TRACK17-EXIT] close trace error %s: %s", pos.symbol, _ct_exc)
+        # ── [/TRACK17-EXIT] ──────────────────────────────────────────────────────
 
         sentinel = self._p11_sentinel
         if sentinel is not None:
@@ -6827,6 +10428,43 @@ class Executor:
             )
             return False
 
+        # [P40.2-PLAUSIBILITY] Extend ghost suppression to implausibly tiny
+        # positive values (e.g. live_equity≈1.011 against lkg≈4980, ratio≈0.02%).
+        # A genuine sustained account collapse would have already dragged LKG
+        # downward; a single frame this extreme while positions or a P37 exit are
+        # active is definitionally a transient bogus bridge read.
+        # We suppress the circuit-breaker check (return False) without resetting
+        # any real risk state so that a genuine collapse can still trip later.
+        if (
+            P23_CB_SUPPRESS_WITH_LKG
+            and _BRIDGE_EQUITY_PLAUSIBILITY_RATIO > 0.0
+            and live_equity > 0.0
+            and lkg >= _EXECUTOR_MIN_VALID_EQUITY
+            and live_equity < lkg * _BRIDGE_EQUITY_PLAUSIBILITY_RATIO
+        ):
+            try:
+                _p37_any = (
+                    any(self._p37_exit_in_flight.values())
+                    if self._p37_exit_in_flight else False
+                )
+                _has_ctx = bool(self.positions) or _p37_any
+            except Exception:
+                _has_ctx = True  # fail-safe: suppress rather than false-trip
+            if _has_ctx:
+                log.warning(
+                    "[P23-HOTFIX-1][PLAUSIBILITY-SHIELD] CB suppressed — "
+                    "live_equity=%.6f is %.4f%% of LKG=%.6f "
+                    "(threshold %.1f%%) — implausible transient frame; "
+                    "flatten NOT triggered. context: has_pos=%s p37_exit=%s",
+                    live_equity,
+                    (live_equity / lkg * 100.0),
+                    lkg,
+                    _BRIDGE_EQUITY_PLAUSIBILITY_RATIO * 100.0,
+                    bool(self.positions),
+                    _p37_any,
+                )
+                return False
+
         # Both zero / uninitialised — do not trigger (no data, defer to next cycle).
         if live_equity <= 0.0 and lkg <= 0.0:
             log.debug(
@@ -6854,9 +10492,29 @@ class Executor:
             return
         if not self.positions:
             return
-        smallest_sym = min(self.positions, key=lambda s: self.positions[s].usd_cost)
-        pos          = self.positions[smallest_sym]
-        trim_qty     = pos.qty * HEDGE_TRIM_PCT
+
+        # [PHASE14] Position hold guard — skip positions younger than
+        # HEDGE_TRIM_MIN_HOLD_SECS.  If ALL positions are too young, defer the
+        # entire trim without consuming the cooldown timestamp so the guard retries
+        # naturally on the next cycle.
+        if HEDGE_TRIM_MIN_HOLD_SECS > 0.0:
+            _eligible = {
+                sym: p for sym, p in self.positions.items()
+                if (now - p.entry_ts) >= HEDGE_TRIM_MIN_HOLD_SECS
+            }
+            if not _eligible:
+                log.debug(
+                    "[P4-4/PHASE14] Hedge trim deferred — all %d open position(s) "
+                    "younger than HEDGE_TRIM_MIN_HOLD_SECS=%.1fs.",
+                    len(self.positions), HEDGE_TRIM_MIN_HOLD_SECS,
+                )
+                return
+            smallest_sym = min(_eligible, key=lambda s: _eligible[s].usd_cost)
+        else:
+            smallest_sym = min(self.positions, key=lambda s: self.positions[s].usd_cost)
+
+        pos      = self.positions[smallest_sym]
+        trim_qty = pos.qty * HEDGE_TRIM_PCT
         use_swap     = pos.inst_type == "SWAP"
         meta = await self._icache.get_instrument_info(smallest_sym, swap=use_swap)
         if meta and meta.min_sz > 0 and trim_qty < meta.min_sz:
@@ -6878,6 +10536,23 @@ class Executor:
             return
         sz_str = q.sz_str
 
+        # [PHASE15] Fetch tick BEFORE the market order so the pre-order bid/ask
+        # can serve as the expected-price reference for friction computation.
+        # Matches the market-fallback semantics in _close_position_inner.
+        # Fail-open: if hub returns None, friction fields remain None and the
+        # trim proceeds unaffected.
+        _ht_tick: Optional[object] = None
+        _ht_expected_px: Optional[float] = None
+        try:
+            _ht_tick = await self.hub.get_tick(smallest_sym)
+            if _ht_tick:
+                _ht_expected_px = (
+                    _ht_tick.bid if close_side == "sell" else _ht_tick.ask
+                )
+        except Exception as _ht_tick_exc:
+            log.debug("[PHASE15] hedge trim tick fetch error %s: %s",
+                      smallest_sym, _ht_tick_exc)
+
         mkt  = self._sor.build_market_body(
             inst, close_side, sz_str, td_mode,
             use_swap, pos_side_close, "HEDGE_TRIM")
@@ -6895,14 +10570,90 @@ class Executor:
                     if pos.direction == "long"
                     else (pos.cost_basis - trim_px) / pos.cost_basis * 100
                 ) if pos.cost_basis > 0 else 0.0
-                await self.db.insert_trade({
-                    "ts": int(now), "symbol": pos.symbol,
-                    "side": close_side, "qty": trimmed, "price": trim_px,
-                    "cost_basis": pos.cost_basis, "pnl_pct": round(pnl_pct, 4),
-                    "realized_usd": round(pnl_pct / 100 * (trimmed * pos.cost_basis), 6),
-                    "tag": "HEDGE_TRIM", "order_id": order.get("ordId", str(uuid.uuid4())),
-                    "inst_type": pos.inst_type,
-                })
+                _trim_ord_id     = order.get("ordId", str(uuid.uuid4()))
+                _trim_realized   = round(pnl_pct / 100 * (trimmed * pos.cost_basis), 6)
+                _trim_exit_type  = ExitReason.STRATEGY_HEDGE_CLOSE.value
+                _trim_exit_cat   = ExitReasonCategory.STRATEGY.value
+
+                # [PHASE15] Compute hedge-trim close-side friction.
+                # Positive slippage = adverse (received less than expected on sell,
+                # paid more than expected on buy).  Wrapped in try/except so a
+                # compute failure never blocks the trim attribution write.
+                _ht_slip: Optional[float] = None
+                _ht_spread: Optional[float] = None
+                try:
+                    if _ht_expected_px and _ht_expected_px > 0 and trim_px > 0:
+                        if close_side == "sell":
+                            _ht_slip = round(
+                                (_ht_expected_px - trim_px) / _ht_expected_px * 10_000, 4
+                            )
+                        else:
+                            _ht_slip = round(
+                                (trim_px - _ht_expected_px) / _ht_expected_px * 10_000, 4
+                            )
+                    if _ht_tick and _ht_tick.bid > 0:
+                        _ht_spread = round(
+                            (_ht_tick.ask - _ht_tick.bid) / _ht_tick.bid * 10_000, 4
+                        )
+                except Exception as _ht_fric_exc:
+                    log.debug("[PHASE15] hedge trim friction compute error %s: %s",
+                              smallest_sym, _ht_fric_exc)
+
+                # [PHASE16-C5] Feed hedge-trim fill quality into the P32 adaptive
+                # slippage window so LIMIT_ONLY protection can trigger on hedge-trim
+                # slippage, not only on full-close slippage.  Uses the same expected
+                # price / fill price / side already computed for friction persistence
+                # above.  Fail-open: any error is logged at debug and never blocks
+                # the attribution write that follows.
+                try:
+                    if _ht_expected_px and _ht_expected_px > 0 and trim_px > 0:
+                        self._p32_record_slippage(
+                            smallest_sym,
+                            expected_px=_ht_expected_px,
+                            fill_px=trim_px,
+                            side=close_side,
+                        )
+                except Exception as _ht_p32_exc:
+                    log.debug("[PHASE16-C5] hedge trim P32 slip record error %s: %s",
+                              smallest_sym, _ht_p32_exc)
+
+                # [PHASE4] Use patch-first attribution, consistent with _record_close, so
+                # that is_close_leg=1 survives even when _on_fill_event writes the row first.
+                # patch_close_attribution enriches the fill-event noise row in-place;
+                # if no such row exists yet, the INSERT OR IGNORE below is the primary write.
+                # [PHASE15] Also passes close_slippage_bps and spread_at_close_bps so
+                # HEDGE_TRIM rows are no longer NULL in the friction columns.
+                _trim_patched = await self.db.patch_close_attribution(
+                    order_id             = _trim_ord_id,
+                    trade_id             = pos.trade_id,
+                    tag                  = "HEDGE_TRIM",
+                    exit_reason_type     = _trim_exit_type,
+                    exit_reason_category = _trim_exit_cat,
+                    pnl_pct              = round(pnl_pct, 4),
+                    realized_usd         = _trim_realized,
+                    close_slippage_bps   = _ht_slip,
+                    spread_at_close_bps  = _ht_spread,
+                )
+                if not _trim_patched:
+                    await self.db.insert_trade({
+                        "ts": int(now), "symbol": pos.symbol,
+                        "side": close_side, "qty": trimmed, "price": trim_px,
+                        "cost_basis": pos.cost_basis, "pnl_pct": round(pnl_pct, 4),
+                        "realized_usd": _trim_realized,
+                        "tag": "HEDGE_TRIM", "order_id": _trim_ord_id,
+                        "inst_type": pos.inst_type,
+                        # [PHASE4] Partial-close attribution.
+                        "trade_id":             pos.trade_id,
+                        "exit_reason_type":     _trim_exit_type,
+                        "exit_reason_category": _trim_exit_cat,
+                        "is_close_leg":         1,
+                        # [PHASE15] Friction columns — None when tick unavailable.
+                        "close_slippage_bps":   _ht_slip,
+                        "spread_at_close_bps":  _ht_spread,
+                    })
+                if hasattr(self.db, 'commit'):
+                    await self.db.commit()
+                log.info("[DB-SYNC] Trade committed for %s | Side: %s", pos.symbol, close_side)
         self._last_hedge_ts = now
 
     # ── [P3-2] DCA ────────────────────────────────────────────────────────────
@@ -6947,6 +10698,58 @@ class Executor:
         pos.dca_stages += 1
         pos.dca_ts_list.append(now)
         pos.trail_active = False
+        # ── [TRACK17-DCA] DCA decision-trace — fail-open, observational ─────────
+        # Emitted immediately after the position state is updated (dca_stages
+        # already incremented).  Uses the same _append_decision_trace +
+        # asyncio.ensure_future pattern as all other trace emit sites.
+        # No DCA logic is altered; no await on the critical DCA path.
+        try:
+            _dca_trace_rec: dict = {
+                "ts":             now,
+                "symbol":         symbol,
+                "direction":      pos.direction,
+                "regime":         "dca",
+                "confidence":     0.0,
+                "z_score":        0.0,
+                "kelly_f":        0.0,
+                "mtf_aligned":    False,
+                "sniper_boost":   False,
+                "oracle_boosted": False,
+                "whale_mult":     1.0,
+                "outcome":        "DCA",
+                "gate_name":      f"DCA_{pos.dca_stages}",
+                "reason":         (
+                    f"stage={pos.dca_stages} usd={dca_usd:.0f} "
+                    f"cb={pos.cost_basis:.4f}"
+                )[:120],
+                "llm_verdict":    "",
+                "p32_p_success":  None,
+                "sizing_usd":     round(dca_usd, 2),
+                "source_path":    "dca",
+                "pnl_pct":        None,
+                "hold_time_secs": None,
+            }
+            _append_decision_trace(_dca_trace_rec)
+            _db_dca = self.db
+            if _db_dca is not None:
+                asyncio.ensure_future(_db_dca.insert_decision_trace(_dca_trace_rec))
+        except Exception as _dca_tr_exc:
+            log.debug("[TRACK17-DCA] dca trace error %s: %s", symbol, _dca_tr_exc)
+        # ── [/TRACK17-DCA] ───────────────────────────────────────────────────────
+        # [PHASE4] Enrich the fill-event row for this DCA order with trade_id so
+        # the add-to-position fill can be linked back to its round-trip.
+        # is_close_leg stays 0 (DCA adds are not close events; excluded from KPIs).
+        _dca_ord_id = order.get("ordId", "")
+        if _dca_ord_id:
+            try:
+                await self.db.patch_open_attribution(
+                    _dca_ord_id,
+                    trade_id=pos.trade_id,
+                    tag=f"DCA_{pos.dca_stages}",
+                )
+            except Exception as _dca_patch_exc:
+                log.debug("[P3-2][PHASE4] DCA patch_open_attribution failed %s: %s",
+                          symbol, _dca_patch_exc)
 
     # ── [P3-1] Trailing PM ─────────────────────────────────────────────────────
     async def _update_trailing(
@@ -7043,17 +10846,122 @@ class Executor:
             return
         if self._vol_guard.emergency_pause:
             return
-        if not signal.mtf_aligned:
-            return
+
+        # ── [P44-DCB] Rolling Drawdown Circuit Breaker entry gate ─────────────
+        # _dcb_frozen is set by the Sentinel's RollingDrawdownCB on every tick.
+        # It is a soft freeze: open positions are untouched, new entries blocked.
+        # _dcb_frozen_until auto-expires; the Sentinel clears the flag on reset.
+        if getattr(self, "_dcb_frozen", False):
+            _dcb_exp = getattr(self, "_dcb_frozen_until", 0.0)
+            if _dcb_exp <= 0.0 or time.time() < _dcb_exp:
+                log.debug(
+                    "[P44-DCB] %s entry blocked: DCB freeze active "
+                    "(expires in %.0fs)",
+                    symbol, max(0.0, _dcb_exp - time.time()),
+                )
+                return
+            # Expiry has passed — self-clear the stale flag.
+            self._dcb_frozen       = False
+            self._dcb_frozen_until = 0.0
+        # ── [/P44-DCB] ────────────────────────────────────────────────────────
         if symbol in self._shadow_watches:
             return
 
+        # ── [TRACK09-DT] Capture immutable signal snapshot before any mutation ─
+        # Placed here — after all pre-signal system guards (zombie, CB, vol,
+        # DCB, shadow) and before the first signal-aware check (_admission_gate).
+        # signal.confidence is mutated later in the sweep path; capturing it
+        # here ensures the trace always reflects the original signal quality.
+        _dt_base: dict = {
+            "ts":             time.time(),
+            "symbol":         symbol,
+            "direction":      getattr(signal, "direction", ""),
+            "regime":         getattr(signal, "regime", ""),
+            "confidence":     round(float(getattr(signal, "confidence", 0.0)), 6),
+            "z_score":        round(float(getattr(signal, "z_score", 0.0) or 0.0), 4),
+            "kelly_f":        round(float(getattr(signal, "kelly_f", 0.0)), 6),
+            "mtf_aligned":    bool(getattr(signal, "mtf_aligned", False)),
+            "sniper_boost":   bool(getattr(signal, "sniper_boost", False)),
+            "oracle_boosted": bool(getattr(signal, "oracle_boosted", False)),
+            "whale_mult":     round(float(getattr(signal, "whale_multiplier", 1.0)), 4),
+            "source_path":    "entry",   # [TRACK16-DT] standard _maybe_enter path
+        }
+        _dt_llm_verdict:   str            = ""    # set after LLM consultation
+        _dt_p32_p_success: Optional[float] = None  # set after VetoArb runs
+        # [TRACK10-DT] Local closure: write trace to JSON (Track 09) AND fire
+        # a non-blocking DB insert (Track 10).  asyncio.ensure_future schedules
+        # the coroutine on the running loop without suspending _maybe_enter.
+        # self.db may be None in test harnesses — guard accordingly.
+        def _dt(rec: dict) -> None:
+            _append_decision_trace(rec)
+            if self.db is not None:
+                try:
+                    asyncio.ensure_future(self.db.insert_decision_trace(rec))
+                except Exception as _dt_fe:
+                    log.debug("[TRACK10-DT] ensure_future failed: %s", _dt_fe)
+        # ── [/TRACK09-DT] ────────────────────────────────────────────────────
+
+        # ── [PHASE2] Trade Admission Gate ─────────────────────────────────────
+        # Hard go/no-go before any order path reaches submission.
+        # Runs AFTER the cheap boolean-flag gates (zombie, CB, vol_guard, DCB,
+        # shadow-watch) and BEFORE the expensive OBI / LLM / sizing path.
+        #
+        # use_swap mirrors the logic in _open_long / _open_short so the metadata
+        # lookup targets the correct instrument type (SWAP vs SPOT).
+        _gate_use_swap = (
+            (signal.regime == "bull" and OKX_LEVERAGE > 1)
+            if signal.direction == "long"
+            else True   # shorts always use SWAP
+        )
+        _admission = await self._admission_gate(
+            symbol=symbol,
+            use_swap=_gate_use_swap,
+            kelly_f=getattr(signal, "kelly_f", 0.0),
+            confidence=getattr(signal, "confidence", 0.0),
+            regime=getattr(signal, "regime", ""),
+        )
+        if not _admission.passed:
+            log.info(
+                "[PHASE2-GATE] %s %s BLOCKED [%s]: %s",
+                symbol, signal.direction,
+                _admission.gate_name, _admission.reason,
+            )
+            # [PHASE11] Count per-gate rejections for policy dashboard.
+            try:
+                _gn = _admission.gate_name
+                self._gate_rejection_counters[_gn] = (
+                    self._gate_rejection_counters.get(_gn, 0) + 1
+                )
+            except Exception as _ctr_exc:
+                log.debug("[PHASE11] gate counter entry error: %s", _ctr_exc)
+            # [TRACK09-DT / TRACK10-DT]
+            _dt({**_dt_base,
+                "outcome": "BLOCKED", "gate_name": _admission.gate_name,
+                "reason": (_admission.reason or "")[:120],
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": None, "modifiers": {},
+            })
+            return
+        # ── [/PHASE2-GATE] ────────────────────────────────────────────────────
+
         if hasattr(self, 'gate') and self.gate is not None:
             if not await self.gate._gated_enter(symbol, signal, tick, oracle_sig):
+                _dt({**_dt_base,
+                    "outcome": "BLOCKED", "gate_name": "GATED_ENTER",
+                    "reason": "gated_enter returned False",
+                    "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return
 
         obi_blocked = await self._check_obi_filter(symbol, signal.direction, signal=signal)
         if obi_blocked:
+            _dt({**_dt_base,
+                "outcome": "BLOCKED", "gate_name": "OBI",
+                "reason": "order-book imbalance filter",
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": None, "modifiers": {},
+            })
             return
 
         # [LLMFB-3] LLM veto with empty-response / exception fallback.
@@ -7108,17 +11016,80 @@ class Executor:
             # [P24-DEFENSE] Intelligence Bridge — persist the latest NarrativeResult
             # so _write_status_json() can include it verbatim in status['intelligence'].
             self._last_narrative = _p17_narrative
+            # [TRACK09-DT] Capture verdict after all fallback paths are resolved.
+            _dt_llm_verdict = getattr(_p17_narrative, "verdict", "") or ""
 
             if _p17_narrative.verdict == "CATASTROPHE_VETO":
-                log.critical(
-                    "[P18-3/P20-2] CATASTROPHE VETO %s %s: score=%.4f — "
-                    "triggering nuclear liquidation.",
-                    symbol, signal.direction, _p17_narrative.score,
-                )
-                asyncio.ensure_future(
-                    self.liquidate_all_positions(symbol, reason="P18_CATASTROPHE_ENTRY")
-                )
+                # [PHASE14] Consecutive-guard: increment per-symbol counter.
+                # Liquidation fires only when the counter reaches
+                # P18_CATASTROPHE_CONSECUTIVE_REQUIRED (default 1 = current behaviour).
+                _p18_consec = self._p18_catastrophe_consecutive.get(symbol, 0) + 1
+                self._p18_catastrophe_consecutive[symbol] = _p18_consec
+
+                if _p18_consec < P18_CATASTROPHE_CONSECUTIVE_REQUIRED:
+                    # Threshold not yet met — warn and wait for the next cycle.
+                    log.warning(
+                        "[P18-3/PHASE14] CATASTROPHE VETO %s %s: score=%.4f — "
+                        "consecutive=%d/%d (waiting for sustained verdict before "
+                        "liquidation fires).",
+                        symbol, signal.direction, _p17_narrative.score,
+                        _p18_consec, P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+                    )
+                else:
+                    # Consecutive requirement met — check position hold guard.
+                    _p18_pos = self.positions.get(symbol)
+                    _p18_hold_secs = (
+                        time.time() - _p18_pos.entry_ts
+                        if _p18_pos is not None else 9999.0
+                    )
+                    if (
+                        P18_CATASTROPHE_MIN_HOLD_SECS > 0.0
+                        and _p18_hold_secs < P18_CATASTROPHE_MIN_HOLD_SECS
+                    ):
+                        # Position too young — skip this cycle.
+                        log.warning(
+                            "[P18-3/PHASE14] CATASTROPHE VETO %s %s: score=%.4f "
+                            "consecutive=%d/%d — HOLD GUARD: position age=%.1fs "
+                            "< min_hold=%.1fs; suppressing liquidation this cycle.",
+                            symbol, signal.direction, _p17_narrative.score,
+                            _p18_consec, P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+                            _p18_hold_secs, P18_CATASTROPHE_MIN_HOLD_SECS,
+                        )
+                    else:
+                        # All guards passed — fire nuclear liquidation.
+                        log.critical(
+                            "[P18-3/P20-2] CATASTROPHE VETO %s %s: score=%.4f "
+                            "consecutive=%d/%d hold=%.1fs — "
+                            "triggering nuclear liquidation.",
+                            symbol, signal.direction, _p17_narrative.score,
+                            _p18_consec, P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+                            _p18_hold_secs,
+                        )
+                        asyncio.ensure_future(
+                            self.liquidate_all_positions(symbol, reason="P18_CATASTROPHE_ENTRY")
+                        )
+                # [TRACK09-DT / TRACK10-DT]
+                _dt({**_dt_base,
+                    "outcome": "BLOCKED", "gate_name": "LLM_CATASTROPHE",
+                    "reason": (
+                        f"verdict=CATASTROPHE_VETO score={getattr(_p17_narrative,'score',0):.4f}"
+                        f" consecutive={self._p18_catastrophe_consecutive.get(symbol,0)}"
+                        f"/{P18_CATASTROPHE_CONSECUTIVE_REQUIRED}"
+                    )[:120],
+                    "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return
+
+            # [PHASE14] Non-CATASTROPHE verdict — reset the per-symbol consecutive
+            # counter so a future isolated spike must restart from zero.
+            if self._p18_catastrophe_consecutive.get(symbol, 0) > 0:
+                log.debug(
+                    "[P18/PHASE14] %s verdict=%s — P18 catastrophe consecutive "
+                    "counter reset to 0.",
+                    symbol, _p17_narrative.verdict,
+                )
+                self._p18_catastrophe_consecutive[symbol] = 0
 
             if _p17_narrative.verdict == "VETO":
                 log.info(
@@ -7131,6 +11102,13 @@ class Executor:
                         for d in _p17_narrative.council_detail
                     ),
                 )
+                # [TRACK09-DT / TRACK10-DT]
+                _dt({**_dt_base,
+                    "outcome": "BLOCKED", "gate_name": "LLM_VETO",
+                    "reason": f"verdict=VETO score={getattr(_p17_narrative,'score',0):.4f}",
+                    "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return
 
             # [P25] SNIPER-ONLY gate — reject low-conviction entries when active
@@ -7164,6 +11142,16 @@ class Executor:
                         )
                     except Exception:
                         pass
+                    # [TRACK09-DT / TRACK10-DT]
+                    _dt({**_dt_base,
+                        "outcome": "BLOCKED", "gate_name": "SNIPER_ONLY",
+                        "reason": (
+                            f"conviction_mult={_conv_mult:.4f} < "
+                            f"threshold={P25_SNIPER_ONLY_CONV_THRESHOLD:.1f}"
+                        ),
+                        "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                        "sizing_usd": None, "modifiers": {},
+                    })
                     return
 
         # ── [P32-VETO-ARB] Unified Veto Arbitrator ───────────────────────────
@@ -7230,7 +11218,9 @@ class Executor:
                     velocity_boost=_vel_boost,
                     local_price=_local_price,
                     global_mid_price=_global_mid,
+                    direction=signal.direction,
                 )
+                _dt_p32_p_success = _p32_p_success  # [TRACK09-DT]
                 if _p32_p_success < 0.65:
                     log.info(
                         "[P32-VETO-ARB] Entry BLOCKED %s %s: p_success=%.4f < 0.65 "
@@ -7245,13 +11235,67 @@ class Executor:
                         )
                     except Exception:
                         pass
+                    # [TRACK09-DT / TRACK10-DT]
+                    _dt({**_dt_base,
+                        "outcome": "BLOCKED", "gate_name": "VETO_ARB",
+                        "reason": f"p_success={_p32_p_success:.4f} < 0.65",
+                        "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                        "sizing_usd": None, "modifiers": {},
+                    })
                     return
         except Exception as _veto_arb_exc:
             log.debug("[P32-VETO-ARB] Veto arbitrator check error %s: %s",
                       symbol, _veto_arb_exc)
         # ── [/P32-VETO-ARB] ──────────────────────────────────────────────────
 
+        # ── [P39] Ghost Oracle Lead-Lag Snipe check ───────────────────────────
+        # Evaluate Coinbase velocity signal BEFORE the OKX confidence gate so
+        # conf_bypass can lower the threshold while the lead-lag window is open.
+        # _p39_check_ghost_snipe() is fully synchronous (no awaits) and
+        # exception-safe, so it cannot stall or corrupt the entry pipeline.
+        _p39_snipe_active = False
+        _p39_size_boost   = 1.0
+        try:
+            _p39_toxicity = 0.0
+            try:
+                _p39_toxicity = await self.hub.get_flow_toxicity(symbol)
+            except Exception:
+                pass
+
+            _p39 = self._p39_check_ghost_snipe(
+                symbol=symbol, direction=signal.direction, toxicity=_p39_toxicity,
+            )
+            if _p39["fire"]:
+                _p39_snipe_active = True
+                _p39_size_boost   = _p39["size_boost"]
+                # Stamp cooldown before entry so it's enforced even if a later
+                # gate (e.g. funding brake) blocks the trade.
+                self._p39_last_snipe_ts[symbol] = time.time()
+                self._p39_snipe_fires += 1
+                log.info(
+                    "[P39-GHOST] 🎯 SNIPE ARMED %s  fires=%d",
+                    _p39["reason"], self._p39_snipe_fires,
+                )
+            else:
+                log.debug(
+                    "[P39-GHOST] vetoed %s %s — %s",
+                    symbol, signal.direction, _p39["veto_reason"],
+                )
+        except Exception as _p39_exc:
+            log.debug("[P39-GHOST] gate error %s: %s (non-critical)", symbol, _p39_exc)
+        # ── [/P39] ───────────────────────────────────────────────────────────
+
         min_conf = self._perf.conf_for(symbol)
+
+        # [P39] Ghost snipe conf bypass — lowers min_conf to allow entry before
+        # the OKX ticker fully reflects the Coinbase price shift.
+        if _p39_snipe_active and min_conf > P39_GHOST_CONF_BYPASS:
+            _pre_bypass = min_conf
+            min_conf    = min_conf - P39_GHOST_CONF_BYPASS
+            log.debug(
+                "[P39-GHOST] conf bypass %s: min_conf %.3f → %.3f",
+                symbol, _pre_bypass, min_conf,
+            )
 
         gov = self._p10_governor
         if gov is not None and gov.is_priority_deploy(symbol):
@@ -7314,16 +11358,39 @@ class Executor:
         if signal.confidence < min_conf:
             if sweep_active:
                 signal.confidence = original_conf
+            # [TRACK09-DT / TRACK10-DT]
+            _dt({**_dt_base,
+                "outcome": "BLOCKED", "gate_name": "CONF_FLOOR",
+                "reason": (
+                    f"conf={_dt_base['confidence']:.4f} < floor={round(min_conf, 6):.4f}"
+                ),
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": None, "modifiers": {},
+            })
             return
 
         if self.brain.correlation_freeze():
             if sweep_active:
                 signal.confidence = original_conf
+            # [TRACK09-DT / TRACK10-DT]
+            _dt({**_dt_base,
+                "outcome": "BLOCKED", "gate_name": "CORR_FREEZE",
+                "reason": "correlation freeze active",
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": None, "modifiers": {},
+            })
             return
 
         if signal.chop_sniper_only and not signal.sniper_boost and not sweep_active:
             if sweep_active:
                 signal.confidence = original_conf
+            # [TRACK09-DT / TRACK10-DT]
+            _dt({**_dt_base,
+                "outcome": "BLOCKED", "gate_name": "CHOP_SNIPER_ONLY",
+                "reason": "chop_sniper_only=True without sniper_boost",
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": None, "modifiers": {},
+            })
             return
 
         cfg           = self._coin_cfg(symbol)
@@ -7340,12 +11407,29 @@ class Executor:
             if kelly_alloc == 0.0:
                 if sweep_active:
                     signal.confidence = original_conf
+                # [TRACK09-DT / TRACK10-DT]
+                _dt({**_dt_base,
+                    "outcome": "BLOCKED", "gate_name": "KELLY_ZERO",
+                    "reason": "kelly_alloc=0 from KellySizer",
+                    "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return
         else:
             kelly_alloc = max(signal.kelly_f, START_ALLOC_PCT, 0.001)
             kelly_alloc = min(kelly_alloc, eff_max_alloc)
 
         base_usd = max(self._avail * kelly_alloc, cfg.min_usd_value)
+
+        # [P39] Ghost Oracle size boost — scales base_usd with Coinbase TPS.
+        # Capped at 95% of available equity by the downstream guard.
+        if _p39_snipe_active and _p39_size_boost > 1.0:
+            _pre_boost = base_usd
+            base_usd   = base_usd * _p39_size_boost
+            log.info(
+                "[P39-GHOST] Size boost %s: $%.2f → $%.2f (%.3fx)",
+                symbol, _pre_boost, base_usd, _p39_size_boost,
+            )
 
         if gov is not None:
             try:
@@ -7360,6 +11444,15 @@ class Executor:
         if usd_amount > self._avail * 0.95:
             if sweep_active:
                 signal.confidence = original_conf
+            # [TRACK09-DT / TRACK10-DT]
+            _dt({**_dt_base,
+                "outcome": "BLOCKED", "gate_name": "AVAIL_CAP",
+                "reason": (
+                    f"usd={round(usd_amount, 2)} > 95% of avail={round(self._avail, 2)}"
+                ),
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": None, "modifiers": {},
+            })
             return
 
         _shadow_baseline_usd = usd_amount
@@ -7423,33 +11516,51 @@ class Executor:
             signal.confidence = original_conf
             sweep_tag = ("SWEEP_SNIPER_LONG" if signal.direction == "long"
                          else "SWEEP_SNIPER_SHORT")
-            if signal.direction == "long":
-                use_swap = signal.regime == "bull" and OKX_LEVERAGE > 1
-                result   = await self._execute_iceberg(
-                    symbol, "buy", usd_amount,
-                    swap=use_swap, pos_side="long" if use_swap else "net",
-                    tag=sweep_tag, coin_cfg=cfg,
-                )
-            else:
-                result = await self._execute_iceberg(
-                    symbol, "sell", usd_amount,
-                    swap=True, pos_side="short", tag=sweep_tag, coin_cfg=cfg,
-                )
-            if result:
+            # [TRACK09-DT / TRACK10-DT] Sweep path admitted
+            _dt({**_dt_base,
+                "outcome": "ADMITTED", "gate_name": "PASS",
+                "reason": "sweep_sniper path",
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": round(usd_amount, 2),
+                "modifiers": {
+                    "risk_off":        _p25_risk_off,
+                    "p39_snipe":       _p39_snipe_active,
+                    "p39_size_boost":  round(_p39_size_boost, 4),
+                    "conviction_mult": round(_shadow_conviction_mult, 4),
+                },
+            })
+            # [PHASE2] Mark symbol in-flight before first order submission.
+            self._entry_in_flight[symbol] = True
+            try:
                 if signal.direction == "long":
-                    await self._open_long(
-                        symbol, usd_amount, signal,
-                        _shadow_baseline_usd=_shadow_baseline_usd,
-                        _shadow_conviction_mult=_shadow_conviction_mult,
-                        _shadow_narrative=_p17_narrative,
+                    use_swap = signal.regime == "bull" and OKX_LEVERAGE > 1
+                    result   = await self._execute_iceberg(
+                        symbol, "buy", usd_amount,
+                        swap=use_swap, pos_side="long" if use_swap else "net",
+                        tag=sweep_tag, coin_cfg=cfg,
                     )
                 else:
-                    await self._open_short(
-                        symbol, usd_amount, signal,
-                        _shadow_baseline_usd=_shadow_baseline_usd,
-                        _shadow_conviction_mult=_shadow_conviction_mult,
-                        _shadow_narrative=_p17_narrative,
+                    result = await self._execute_iceberg(
+                        symbol, "sell", usd_amount,
+                        swap=True, pos_side="short", tag=sweep_tag, coin_cfg=cfg,
                     )
+                if result:
+                    if signal.direction == "long":
+                        await self._open_long(
+                            symbol, usd_amount, signal,
+                            _shadow_baseline_usd=_shadow_baseline_usd,
+                            _shadow_conviction_mult=_shadow_conviction_mult,
+                            _shadow_narrative=_p17_narrative,
+                        )
+                    else:
+                        await self._open_short(
+                            symbol, usd_amount, signal,
+                            _shadow_baseline_usd=_shadow_baseline_usd,
+                            _shadow_conviction_mult=_shadow_conviction_mult,
+                            _shadow_narrative=_p17_narrative,
+                        )
+            finally:
+                self._entry_in_flight[symbol] = False
             return
 
         if self._should_force_shadow(signal.regime):
@@ -7477,6 +11588,9 @@ class Executor:
                             else "LONG_ENTRY") if side == "buy" else (
                             "SHORT_ENTRY_SNIPER" if signal.sniper_boost
                             else "SHORT_ENTRY")
+                # [P39] Mark ghost snipe entries so shadow_audit.csv is queryable.
+                if _p39_snipe_active:
+                    tag_pfx = tag_pfx + "_GHOST"
                 mode_tag = (f"_P10_{self._p10_execution_mode.upper()}"
                             if self._is_shadow_only_mode() else "")
                 watch = ShadowWatch(
@@ -7486,24 +11600,185 @@ class Executor:
                     tag=f"SHADOW_{tag_pfx}{mode_tag}", coin_cfg=cfg,
                 )
                 self._register_shadow(watch)
+                # [TRACK09-DT / TRACK10-DT] Shadow path admitted
+                _dt({**_dt_base,
+                    "outcome": "SHADOW", "gate_name": "SHADOW",
+                    "reason": "shadow watch registered",
+                    "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                    "sizing_usd": round(usd_amount, 2),
+                    "modifiers": {
+                        "risk_off":        _p25_risk_off,
+                        "p39_snipe":       _p39_snipe_active,
+                        "p39_size_boost":  round(_p39_size_boost, 4),
+                        "conviction_mult": round(_shadow_conviction_mult, 4),
+                    },
+                })
                 return
 
-        if signal.direction == "long":
+        # [PHASE2] Mark symbol in-flight before execution.  Cleared in finally
+        # regardless of fill outcome so the gate is never permanently locked.
+        self._entry_in_flight[symbol] = True
+        try:
+          if signal.direction == "long":
+            # ── [P41] Liquidity Baiting — pre-entry hidden buyer scan ─────────
+            # Run AFTER all veto gates and sizing are settled, BEFORE the order
+            # is placed.  The bait test is non-blocking: it never vetoes, only
+            # optionally boosts size when a hidden institutional buyer is found.
+            # Skipped automatically by _p41_run_bait_test() when:
+            #   • P41_BAIT_ENABLE=0  • cooldown active  • global cap hit
+            #   • signal.confidence below P41_BAIT_MIN_CONF
+            _p41_bait_confirmed = False   # [P46] captured for telemetry
+            _p41_bait_boost     = 1.0     # [P46] captured for telemetry
+            try:
+                if signal.confidence >= P41_BAIT_MIN_CONF:
+                    use_swap_bait = signal.regime == "bull" and OKX_LEVERAGE > 1
+                    _p41 = await asyncio.wait_for(
+                        self._p41_run_bait_test(symbol, "long", swap=use_swap_bait),
+                        timeout=P41_BAIT_TIMEOUT_MS / 1000.0,
+                    )
+                    if _p41["hidden_buyer"]:
+                        _p41_bait_confirmed = True
+                        _p41_bait_boost     = _p41["size_boost"]
+                        _pre_bait_usd = usd_amount
+                        usd_amount    = min(
+                            usd_amount * _p41["size_boost"],
+                            self._avail * 0.95,
+                        )
+                        _shadow_conviction_mult = (
+                            usd_amount / _shadow_baseline_usd
+                            if _shadow_baseline_usd > 0 else _shadow_conviction_mult
+                        )
+                        log.info(
+                            "[P41-BAIT] Size boost applied %s long: "
+                            "$%.2f → $%.2f (%.2fx) — hidden buyer at %.8f",
+                            symbol, _pre_bait_usd, usd_amount,
+                            _p41["size_boost"], _p41["bait_px"],
+                        )
+                    elif _p41.get("skip_reason"):
+                        log.debug(
+                            "[P41-BAIT] Skipped %s long: %s",
+                            symbol, _p41["skip_reason"],
+                        )
+            except asyncio.TimeoutError:
+                log.debug(
+                    "[P41-BAIT] Timeout (>%.0fms) %s long — proceeding without bait.",
+                    P41_BAIT_TIMEOUT_MS, symbol,
+                )
+            except Exception as _p41_exc:
+                log.debug("[P41-BAIT] Error %s: %s (non-critical)", symbol, _p41_exc)
+            # ── [/P41] ───────────────────────────────────────────────────────
+            # ── [P46] Stamp pending telemetry context for _open_long ──────────
+            _p46_theo = (
+                (tick.bid + tick.ask) / 2.0
+                if tick and tick.bid > 0 and tick.ask > 0 else 0.0
+            )
+            self._p46_pending_ctx[symbol] = {
+                "signal_ts":      getattr(signal, "ts", 0.0),
+                "order_ts":       time.time(),
+                "theoretical_px": _p46_theo,
+                "p39_active":     int(_p39_snipe_active),
+                "p39_cb_tps":     self._p39_cb_tps_cache.get(symbol, 0.0),
+                "p39_size_boost": _p39_size_boost,
+                "p41_confirmed":  int(_p41_bait_confirmed),
+                "p41_bait_boost": _p41_bait_boost,
+            }
+            # ── [/P46] ───────────────────────────────────────────────────────
+            # [TRACK09-DT / TRACK10-DT] Normal long admitted
+            _dt({**_dt_base,
+                "outcome": "ADMITTED", "gate_name": "PASS",
+                "reason": "long entry",
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": round(usd_amount, 2),
+                "modifiers": {
+                    "risk_off":        _p25_risk_off,
+                    "p39_snipe":       _p39_snipe_active,
+                    "p39_size_boost":  round(_p39_size_boost, 4),
+                    "conviction_mult": round(_shadow_conviction_mult, 4),
+                },
+            })
             await self._open_long(
                 symbol, usd_amount, signal,
                 _shadow_baseline_usd=_shadow_baseline_usd,
                 _shadow_conviction_mult=_shadow_conviction_mult,
                 _shadow_narrative=_p17_narrative,
             )
-        elif signal.direction == "short":
+          elif signal.direction == "short":
             if signal.regime == "chop" and not self._is_shadow_only_mode():
+                # [TRACK09-DT / TRACK10-DT] Short in chop blocked
+                _dt({**_dt_base,
+                    "outcome": "BLOCKED", "gate_name": "CHOP_SHORT",
+                    "reason": "short entry blocked in chop regime",
+                    "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                    "sizing_usd": None, "modifiers": {},
+                })
                 return
+            # ── [P41] Liquidity Baiting — short side ─────────────────────────
+            _p41_bait_confirmed = False   # [P46] captured for telemetry
+            _p41_bait_boost     = 1.0     # [P46] captured for telemetry
+            try:
+                if signal.confidence >= P41_BAIT_MIN_CONF:
+                    _p41_short = await asyncio.wait_for(
+                        self._p41_run_bait_test(symbol, "short", swap=True),
+                        timeout=P41_BAIT_TIMEOUT_MS / 1000.0,
+                    )
+                    if _p41_short["hidden_buyer"]:
+                        _p41_bait_confirmed = True
+                        _p41_bait_boost     = _p41_short["size_boost"]
+                        _pre_bait_usd = usd_amount
+                        usd_amount    = min(
+                            usd_amount * _p41_short["size_boost"],
+                            self._avail * 0.95,
+                        )
+                        _shadow_conviction_mult = (
+                            usd_amount / _shadow_baseline_usd
+                            if _shadow_baseline_usd > 0 else _shadow_conviction_mult
+                        )
+                        log.info(
+                            "[P41-BAIT] Size boost applied %s short: "
+                            "$%.2f → $%.2f (%.2fx) — hidden seller at %.8f",
+                            symbol, _pre_bait_usd, usd_amount,
+                            _p41_short["size_boost"], _p41_short["bait_px"],
+                        )
+            except (asyncio.TimeoutError, Exception) as _p41s_exc:
+                log.debug("[P41-BAIT] Short bait error %s: %s (non-critical)", symbol, _p41s_exc)
+            # ── [/P41] ───────────────────────────────────────────────────────
+            # ── [P46] Stamp pending telemetry context for _open_short ─────────
+            _p46_theo = (
+                (tick.bid + tick.ask) / 2.0
+                if tick and tick.bid > 0 and tick.ask > 0 else 0.0
+            )
+            self._p46_pending_ctx[symbol] = {
+                "signal_ts":      getattr(signal, "ts", 0.0),
+                "order_ts":       time.time(),
+                "theoretical_px": _p46_theo,
+                "p39_active":     int(_p39_snipe_active),
+                "p39_cb_tps":     self._p39_cb_tps_cache.get(symbol, 0.0),
+                "p39_size_boost": _p39_size_boost,
+                "p41_confirmed":  int(_p41_bait_confirmed),
+                "p41_bait_boost": _p41_bait_boost,
+            }
+            # ── [/P46] ───────────────────────────────────────────────────────
+            # [TRACK09-DT / TRACK10-DT] Normal short admitted
+            _dt({**_dt_base,
+                "outcome": "ADMITTED", "gate_name": "PASS",
+                "reason": "short entry",
+                "llm_verdict": _dt_llm_verdict, "p32_p_success": _dt_p32_p_success,
+                "sizing_usd": round(usd_amount, 2),
+                "modifiers": {
+                    "risk_off":        _p25_risk_off,
+                    "p39_snipe":       _p39_snipe_active,
+                    "p39_size_boost":  round(_p39_size_boost, 4),
+                    "conviction_mult": round(_shadow_conviction_mult, 4),
+                },
+            })
             await self._open_short(
                 symbol, usd_amount, signal,
                 _shadow_baseline_usd=_shadow_baseline_usd,
                 _shadow_conviction_mult=_shadow_conviction_mult,
                 _shadow_narrative=_p17_narrative,
             )
+        finally:
+            self._entry_in_flight[symbol] = False
 
     # ── Main cycle ─────────────────────────────────────────────────────────────
     async def _cycle(self):
@@ -7596,6 +11871,47 @@ class Executor:
                         self._hard_reset_sync(force_truth=_force_truth),
                         name="p24_hard_reset_sync",
                     )
+                # ── [TRACK07-WB3] Score feedback: set per-symbol autotune override ──
+                elif _event == "set_autotune_override":
+                    _wb_sym = str(_ce.get("symbol", "")).strip().upper()
+                    if _wb_sym:
+                        _wb_cf = float(_ce.get("conf_floor", MIN_SIGNAL_CONF))
+                        _wb_ac = float(_ce.get("alloc_cap",  MAX_ALLOC_PCT))
+                        self._perf.set_override(_wb_sym, _wb_cf, _wb_ac)
+                    else:
+                        log.warning("[TRACK07-WB3] set_autotune_override: empty symbol — ignored")
+                # ── [TRACK07-WB4] Score feedback: reset per-symbol autotune override ─
+                elif _event == "reset_autotune_override":
+                    _wb_sym = str(_ce.get("symbol", "")).strip().upper()
+                    if _wb_sym:
+                        self._perf.reset_override(_wb_sym)
+                    else:
+                        log.warning("[TRACK07-WB4] reset_autotune_override: empty symbol — ignored")
+                # ── [/TRACK07] ────────────────────────────────────────────────────
+                # ── [TRACK31-RR1] RL regime weight reset controls ─────────────────
+                elif _event == "reset_regime_weight":
+                    _rr_regime = str(_ce.get("regime", "")).strip().lower()
+                    if _rr_regime in ("bull", "bear", "chop"):
+                        asyncio.create_task(
+                            self.brain.reset_regime_weight(_rr_regime),
+                            name=f"track31_reset_regime_{_rr_regime}",
+                        )
+                        log.info(
+                            "[TRACK31-RR1] reset_regime_weight queued for regime='%s'",
+                            _rr_regime,
+                        )
+                    else:
+                        log.warning(
+                            "[TRACK31-RR1] reset_regime_weight: unknown regime %r — ignored",
+                            _rr_regime,
+                        )
+                elif _event == "reset_all_regime_weights":
+                    asyncio.create_task(
+                        self.brain.reset_all_weights(),
+                        name="track31_reset_all_regimes",
+                    )
+                    log.info("[TRACK31-RR1] reset_all_regime_weights queued")
+                # ── [/TRACK31-RR1] ────────────────────────────────────────────────
         except Exception as _ce_exc:
             log.warning("[P24-DEFENSE] Control event read error: %s", _ce_exc)
 
@@ -7661,6 +11977,79 @@ class Executor:
                         )
         except Exception as _p37_exc:
             log.debug("[P37-VPIN] Cycle toxicity batch injection error: %s", _p37_exc)
+
+        # [P38-OFI] Inject Order Flow Imbalance snapshot into VetoArbitrator
+        # for each traded symbol.  OBIMonitor.update() is called in real-time
+        # from DataHub._on_book(); this cycle injection ensures the most recent
+        # snapshot is loaded before the first entry evaluation of the cycle.
+        try:
+            if self._p32_veto_arb is not None:
+                for _p38_sym in self.symbols:
+                    try:
+                        _p38_ofi, _p38_bid_pull, _p38_ask_pull = (
+                            await self.hub.get_ofi_score(_p38_sym)
+                        )
+                        self._p32_veto_arb.set_ofi_score(
+                            _p38_sym, _p38_ofi, _p38_bid_pull, _p38_ask_pull
+                        )
+                    except Exception as _p38_sym_exc:
+                        log.debug(
+                            "[P38-OFI] Cycle OFI injection error %s: %s",
+                            _p38_sym, _p38_sym_exc,
+                        )
+        except Exception as _p38_exc:
+            log.debug("[P38-OFI] Cycle OFI batch injection error: %s", _p38_exc)
+        # ── [/P38-OFI injection] ──────────────────────────────────────────────
+
+        # ── [P42-SHADOW] Inject Global Market Macro data into VetoArbitrator ──
+        # Reads the latest SPY/DXY 5-minute deltas from the GlobalMarketSentinel
+        # and pushes them into the VetoArbitrator so the PRE-ZEROTH gate in
+        # compute_p_success() has fresh macro context for the current cycle.
+        # This runs AFTER P38 injection (keeping veto gate order intact) and
+        # BEFORE the circuit-breaker check so a macro crash can also inform
+        # position flattening logic in future phases.
+        try:
+            if self._p32_veto_arb is not None:
+                # ── [P42-CORR] Feed live BTC mid-price for rolling Pearson-r ──
+                # Must run BEFORE get_global_market_status() so the correlation
+                # snapshot that we're about to read includes this cycle's sample.
+                try:
+                    _btc_tick_for_corr = await self.hub.get_tick(self._coin.symbol)
+                    if _btc_tick_for_corr and _btc_tick_for_corr.bid > 0 and _btc_tick_for_corr.ask > 0:
+                        _btc_mid_for_corr = (_btc_tick_for_corr.bid + _btc_tick_for_corr.ask) / 2.0
+                    else:
+                        _btc_mid_for_corr = getattr(_btc_tick_for_corr, "last", 0.0) or 0.0
+                    if _btc_mid_for_corr > 0:
+                        self.hub.feed_btc_price_for_correlation(_btc_mid_for_corr)
+                except Exception as _corr_feed_exc:
+                    log.debug("[P42-CORR] BTC feed error (non-fatal): %s", _corr_feed_exc)
+                # ── [/P42-CORR] ──────────────────────────────────────────────
+
+                _p42_status = self.hub.get_global_market_status()
+                self._p32_veto_arb.set_global_market_data(
+                    spy_drop_pct  = _p42_status.get("spy_5m_pct",    0.0),
+                    dxy_spike_pct = _p42_status.get("dxy_5m_pct",    0.0),
+                    data_age_secs = _p42_status.get("data_age_secs", 9999.0),
+                    spy_btc_corr  = _p42_status.get("spy_btc_corr",  1.0),
+                )
+                # Embed P42 macro snapshot in status for dashboard display.
+                try:
+                    _p42_veto_snap = self._p32_veto_arb.get_p42_status()
+                    self._status["p42_shadow"] = _p42_veto_snap
+                except Exception:
+                    pass
+                log.debug(
+                    "[P42-SHADOW] Cycle injection: spy_5m=%+.3f%% dxy_5m=%+.3f%% "
+                    "age=%.0fs spy_btc_corr=%.3f veto=%s",
+                    _p42_status.get("spy_5m_pct",    0.0),
+                    _p42_status.get("dxy_5m_pct",    0.0),
+                    _p42_status.get("data_age_secs", 9999.0),
+                    _p42_status.get("spy_btc_corr",  1.0),
+                    _p42_veto_snap.get("veto_active", False) if "_p42_veto_snap" in dir() else False,
+                )
+        except Exception as _p42_exc:
+            log.debug("[P42-SHADOW] Cycle macro injection error: %s", _p42_exc)
+        # ── [/P42-SHADOW injection] ───────────────────────────────────────────
 
         # [P23-HOTFIX-1] Decoupled circuit-breaker check — suppresses ghost-state
         # death-loop by not panicking when LKG equity is healthy.
@@ -8002,6 +12391,7 @@ class Executor:
                         "p18_conviction_multiplier": _p18_conv_multiplier,
                         "p18_dynamic_sizing_active": P18_DYNAMIC_SIZING,
                         "p19_shadow_audit_path":     self._shadow_audit_path,
+                        "p46_telem_path":            P46_TELEM_PATH,   # [P46-DASH]
                         "p7_cb_tripped":          (cb.is_tripped if cb is not None else False),
                         "p20_zombie_mode":        self._p20_zombie_mode,
                         "p20_council_detail":     _p20_council_detail,
@@ -8118,6 +12508,100 @@ class Executor:
             _strategy_mode = "🤖 AI_PREMIUM"
         self._strategy_mode = _strategy_mode
 
+        # [PHASE11] Build admission_policy snapshot before the main status dict.
+        # Wrapped in try/except so any serialisation error degrades to {} and
+        # never raises into _cycle().  Fail-open by design.
+        try:
+            _p11_admission_policy: dict = {
+                # ── current threshold values ──────────────────────────────────
+                "min_confidence":         ADMISSION_MIN_CONFIDENCE,
+                "min_edge_pct":           ADMISSION_MIN_EDGE_PCT,
+                "flush_cooldown_secs":    ADMISSION_FLUSH_COOLDOWN_SECS,
+                "flush_lookback":         ADMISSION_FLUSH_LOOKBACK,
+                "flush_max_hold_secs":    ADMISSION_FLUSH_MAX_HOLD_SECS,
+                "suppress_symbols":       sorted(ADMISSION_SUPPRESS_SYMBOLS),
+                "suppress_regimes":       sorted(ADMISSION_SUPPRESS_REGIMES),
+                "bridge_stale_secs":      ADMISSION_BRIDGE_STALE_SECS,
+                # ── [TRACK14] exposure gate config + live state ───────────────
+                "max_open_positions":     ADMISSION_MAX_OPEN_POSITIONS,
+                "max_deployed_pct":       ADMISSION_MAX_DEPLOYED_PCT,
+                "current_open_positions": len(self.positions),
+                "current_deployed_usd":   round(
+                    sum(
+                        float(p.usd_cost) if (p.usd_cost and p.usd_cost == p.usd_cost)
+                        else 0.0
+                        for p in self.positions.values()
+                    ), 2
+                ),
+                "current_deployed_pct":   round(
+                    sum(
+                        float(p.usd_cost) if (p.usd_cost and p.usd_cost == p.usd_cost)
+                        else 0.0
+                        for p in self.positions.values()
+                    ) / self._equity, 4
+                ) if self._equity > 0.0 else 0.0,
+                # ── [TRACK27] per-symbol cap config + live state ──────────────
+                "max_per_symbol_usd": ADMISSION_MAX_PER_SYMBOL_USD,
+                "current_per_symbol_usd": {
+                    sym: round(float(p.usd_cost), 2)
+                    for sym, p in self.positions.items()
+                    if p.usd_cost is not None and p.usd_cost == p.usd_cost  # NaN guard
+                },
+                # ── VPIN emergency-exit hardening thresholds ──────────────────
+                "vpin_emerg_toxicity":    P37_EMERGENCY_EXIT_TOXICITY,
+                "vpin_emerg_consecutive": P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED,
+                "vpin_emerg_min_hold":    P37_EMERGENCY_EXIT_MIN_HOLD_SECS,
+                # ── per-gate rejection counts (in-memory, resets on restart) ──
+                "gate_rejections":        dict(self._gate_rejection_counters),
+                # ── flush-tracker snapshot (in-memory, resets on restart) ─────
+                "flush_tracker": {
+                    sym: {
+                        "entries":             len(dq),
+                        "last_flush_ago_secs": (
+                            round(time.time() - dq[-1][0], 1) if dq else None
+                        ),
+                    }
+                    for sym, dq in self._flush_tracker.items()
+                    if dq
+                },
+            }
+        except Exception as _p11_exc:
+            log.debug("[PHASE11] admission_policy snapshot error: %s", _p11_exc)
+            _p11_admission_policy = {}
+
+        # [FIX-SINGLE-WRITER] Save supervisor-enriched keys before replacing
+        # self._status.  engine_supervisor._gui_bridge() no longer writes
+        # trader_status.json directly; instead it merges its enrichments into
+        # executor._status via executor._status.update(status).  Because _cycle()
+        # replaces self._status with a brand-new dict on every iteration, those
+        # enrichments must be preserved here and restored below so the cycle-end
+        # _write_status_json() always emits the full enriched document.
+        #
+        # Keys in this set are exclusively produced by _gui_bridge and are NOT
+        # rebuilt by _cycle().  Executor-owned keys are rebuilt fresh every cycle
+        # and are intentionally excluded so stale supervisor data never shadows
+        # a fresh executor value.
+        _SUPERVISOR_CARRY_KEYS: frozenset = frozenset({
+            "brain", "agents",
+            "p7_cb_drawdown", "p7_kelly_scale", "p7_slippage", "p7_spread",
+            "p18_adaptive_conviction",
+            "p20_global_risk",       # _gui_bridge version adds drawdown metrics
+            "p20_shadow_hmm_metrics",
+            "p21_execution",
+            "p22", "p22_latency_bar", "p22_whale_tape",
+            "p40_5_heartbeat",
+            "p47_microstructure", "p48_floating", "p49_protocol",
+            "p50_native", "p51_algo", "p52_supervisor",
+            "p53_mesh", "p54_kernel_bypass",
+            "kelly_fraction", "correlation_frozen",
+            "p19_state_save_interval_secs",
+        })
+        _carried_supervisor: dict = {
+            k: self._status[k]
+            for k in _SUPERVISOR_CARRY_KEYS
+            if k in self._status
+        }
+
         self._status = {
             "timestamp":       time.time(),
             "demo_mode":       self.demo,
@@ -8179,6 +12663,7 @@ class Executor:
             "p18_divergence_score_floor":  P18_DIVERGENCE_SCORE_FLOOR,
             "p18_divergence_haircut":      P18_DIVERGENCE_HAIRCUT,
             "p19_shadow_audit_path":       self._shadow_audit_path,
+            "p46_telem_path":              P46_TELEM_PATH,        # [P46-DASH] full path to execution_telemetry.csv
             "p19_gc_enabled":              True,
             "p20_global_risk":             p20_risk_snap,
             "p20_zombie_mode":             self._p20_zombie_mode,
@@ -8225,6 +12710,12 @@ class Executor:
                 for sym, hist in self._p32_slip_history.items()
                 if hist
             },
+            # [P44-DCB] Rolling Drawdown Circuit Breaker freeze state
+            "p44_dcb_frozen":       self._dcb_frozen,
+            "p44_dcb_frozen_until": round(self._dcb_frozen_until, 2),
+            "p44_dcb_freeze_remaining": round(
+                max(0.0, self._dcb_frozen_until - time.time()), 1
+            ),
             # [P35.1-HEDGE] Dynamic Delta-Neutral Hedge Commander — live snapshot
             "p35_hedge": (
                 self._p10_governor.p35_hedge_snapshot
@@ -8240,7 +12731,59 @@ class Executor:
             "analytics": (getattr(self, "_analytics_data", None) or {}),
             # [ANALYTICS-NULL-SHIELD] symbols always present as {} — never None.
             "symbols":   {},
+            # [PHASE11] Admission policy state snapshot (built before this dict).
+            "admission_policy": _p11_admission_policy,
+            # [TRACK04-SF4] Per-symbol autotune state snapshot.
+            # Provides a single coherent view of CoinPerformanceTracker overrides
+            # for every tracked symbol regardless of position state.  Built from
+            # self._perf (CoinPerformanceTracker) using the same sync helper methods
+            # (conf_for / alloc_for / overrides_active) that the admission path uses.
+            # At most one trade cycle stale — acceptable for operator display.
+            "autotune_state": {
+                sym: {
+                    "active":     self._perf.overrides_active(sym),
+                    "conf_floor": round(self._perf.conf_for(sym), 4),
+                    "alloc_cap":  round(
+                        self._perf.alloc_for(sym, self._coin_cfg(sym).max_alloc_pct), 4
+                    ),
+                    "trade_count": len(
+                        getattr(self._perf._perfs.get(sym), "results", [])
+                    ),
+                    "win_rate": (
+                        lambda r: round(sum(r) / len(r), 4) if len(r) > 0 else None
+                    )(getattr(self._perf._perfs.get(sym), "results", [])),
+                    # [TRACK15] "manual" if operator set via Score Feedback Controls,
+                    # "auto" if set by autotune engine, None when no override active.
+                    "source": getattr(self._perf._perfs.get(sym), "override_source", None),
+                }
+                for sym in self.symbols
+            },
+            # [TRACK04-SF5] RL regime weight snapshot.
+            # get_state() is a sync method that reads _stats directly without the
+            # asyncio lock — equivalent to what save_state() calls each cycle.
+            # At most one trade cycle stale.  Returns multiplier, wins, losses,
+            # total_pnl, last_updated per regime.
+            "rl_regime_weights": self.brain._rl_table.get_state(),
+            # [TRACK04-SF5] RL config constants — published once so the dashboard
+            # can show the operator what thresholds govern the RL learning.
+            "rl_config": {
+                "learn_rate": RL_LEARN_RATE,
+                "max_mult":   RL_MAX_MULT,
+                "min_mult":   RL_MIN_MULT,
+                "min_trades": RL_MIN_TRADES,
+            },
         }
+
+        # [FIX-SINGLE-WRITER] Restore supervisor-enriched keys into the freshly
+        # built self._status dict.  Uses dict.update() so that carried keys always
+        # land in the new dict.  This is intentional for keys like p20_global_risk
+        # where _gui_bridge produces a richer version (adds drawdown_pct,
+        # global_peak_equity, etc.) that would otherwise be lost.  Pure executor
+        # keys (strategy_mode, p20_zombie_mode, timestamps, etc.) are NOT in
+        # _SUPERVISOR_CARRY_KEYS so they are never overwritten.
+        # On the very first cycle _carried_supervisor is empty — no-op.
+        if _carried_supervisor:
+            self._status.update(_carried_supervisor)
 
         # [P24-DEFENSE] Entropy Trend — sample the current cycle's Shannon Entropy
         # from _last_narrative (if available) and append to the rolling deque.
@@ -8358,17 +12901,20 @@ class Executor:
 
     async def _publish_status(self) -> None:
         """
-        [P24-DEFENSE-1] Lightweight heartbeat write — called at the VERY TOP of
-        _cycle() before any equity check or circuit-breaker gate.
+        [P24-DEFENSE-1] Lightweight in-memory heartbeat — called at the VERY TOP
+        of _cycle() before any equity check or circuit-breaker gate.
 
-        This guarantees the Dashboard always receives an updated timestamp and
-        ghost-state indicators even when the executor is stuck in a ghost-equity
-        loop, a zombie-mode hard gate, or waiting for the exchange WebSocket to
-        re-establish.
+        Patches the in-memory self._status dict with current ghost-state
+        indicators and a fresh heartbeat_ts.  These values are then carried
+        to disk by the cycle-end _write_status_json() call.
 
-        It writes whatever self._status currently holds (from the previous cycle)
-        with an updated 'heartbeat_ts' field injected into the dict.  If _status
-        is empty (first boot), the write is a no-op so we don't publish garbage.
+        [FIX-SINGLE-WRITER] The redundant start-of-cycle file write has been
+        removed.  _write_status_json() at the END of _cycle() is now the sole
+        executor file-write path.  This eliminates the double-write contention
+        (start-of-cycle + end-of-cycle) that was the primary driver of Windows
+        WinError 5 / atomic replace failures on trader_status.json.
+
+        If _status is empty (first boot), this is a no-op — nothing to patch.
         """
         if not self._status:
             return
@@ -8376,21 +12922,26 @@ class Executor:
             self._status["heartbeat_ts"] = time.time()
             self._status["consecutive_ghost_reads"] = self._consecutive_ghost_reads
             self._status["equity_is_ghost"] = self._equity_is_ghost
-            self._write_status_json()
+            # [FIX-SINGLE-WRITER] File write removed — cycle-end _write_status_json() carries this.
         except Exception as exc:
             log.debug("[P24-DEFENSE-1] _publish_status error: %s", exc)
 
     # ── [ATOMIC-1] Atomic JSON status writer ──────────────────────────────────
     def _write_status_json(self) -> None:
         """
-        [ATOMIC-1] Write self._status to trader_status.json atomically using
-        write-to-.tmp then os.replace().  Readers always see a complete file.
+        [ATOMIC-1] Write self._status to trader_status.json atomically.
+
+        [D1-C / PHASE13] Now delegates entirely to the canonical atomic_write_json
+        utility from pt_utils (NamedTemporaryFile + fsync + 3-attempt retry +
+        temp cleanup).  The hand-rolled inline NamedTemporaryFile / PermissionError
+        retry loop has been removed — atomic_write_json supersedes it on all
+        platforms including Windows.
 
         [ATOMIC-MIRROR-SYNC] Before serialisation, patches account.retained_equity
         with self._equity so every write carries Binary Truth equity.
         [ANALYTICS-NULL-SHIELD] Guarantees analytics and symbols are never null.
         """
-        # [ATOMIC-MIRROR-SYNC] Mirror self._equity → account.retained_equity on
+        # [ATOMIC-MIRROR-SYNC] Mirror self._equity -> account.retained_equity on
         # every write so no write path can omit the Binary Truth field.
         try:
             acct = self._status.get("account")
@@ -8406,41 +12957,18 @@ class Executor:
                 self._status["symbols"] = {}
         except Exception:
             pass
-        tmp_path = TRADER_STATUS_PATH + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(TRADER_STATUS_PATH), exist_ok=True)
-            payload = json.dumps(self._status, default=str)
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(payload)
-            # [v32.1-WINLOCK] Windows file-lock retry — the Dashboard's read cycle
-            # briefly holds an exclusive handle on trader_status.json.  If
-            # os.replace() races against that read we get a PermissionError
-            # (WinError 5).  Retry up to 5 times with 50 ms back-off so the
-            # Executor write-cycle is never permanently blocked.
-            _replace_attempts = 5
-            for _ri in range(_replace_attempts):
-                try:
-                    os.replace(tmp_path, TRADER_STATUS_PATH)
-                    break  # success
-                except PermissionError as _pe:
-                    _is_win5 = getattr(_pe, "winerror", None) == 5
-                    if _ri < _replace_attempts - 1:
-                        log.debug(
-                            "[v32.1-WINLOCK] os.replace PermissionError (WinError %s) "
-                            "on attempt %d/%d — retrying in 50 ms.",
-                            getattr(_pe, "winerror", "?"), _ri + 1, _replace_attempts,
-                        )
-                        time.sleep(0.05)
-                    else:
-                        raise  # all retries exhausted — propagate to outer handler
-        except Exception as exc:
-            log.warning("[ATOMIC-1] _write_status_json failed: %s", exc)
-            # Best-effort cleanup of orphaned .tmp
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+        # [D1-C / PHASE13] Canonical atomic write: same-dir NTF + fsync + 3-attempt
+        # retry + Windows direct-write fallback + temp cleanup.
+        # atomic_write_json returns False only when BOTH the rename path AND
+        # the direct-write fallback have failed (very unusual; indicates a
+        # filesystem or permissions problem beyond transient handle contention).
+        if not atomic_write_json(TRADER_STATUS_PATH, self._status):
+            log.warning(
+                "[ATOMIC-1] _write_status_json: all write paths failed "
+                "(rename retries + direct-write fallback) — %s NOT updated. "
+                "Check hub_data/ directory permissions or disk space.",
+                TRADER_STATUS_PATH,
+            )
 
     async def run(self, interval: float = 1.0):
         log.info(
@@ -8452,7 +12980,255 @@ class Executor:
             self._shadow_audit_path, P20_DRAWDOWN_ZOMBIE_PCT,
         )
 
-        # ── [Phase 40.3] Immediate Boot Status Write ──────────────────────────────
+        # ── [PHASE7] Admission gate visibility — log disabled state on boot ───
+        # Each gate logs its current state so operators can verify configuration
+        # from the startup log without needing to find the env var documentation.
+        if ADMISSION_MIN_EDGE_PCT <= 0.0:
+            log.info(
+                "[PHASE7-GATE] EDGE gate DISABLED (ADMISSION_MIN_EDGE_PCT=0.0) — "
+                "set ADMISSION_MIN_EDGE_PCT > 0 in .env to enforce kelly_f floor."
+            )
+        else:
+            log.info(
+                "[PHASE7-GATE] EDGE gate ENABLED: kelly_f must be ≥ %.6f "
+                "(proxy only; does not include fees/slippage).",
+                ADMISSION_MIN_EDGE_PCT,
+            )
+        if ADMISSION_MIN_CONFIDENCE <= 0.0:
+            log.info(
+                "[PHASE7-GATE] CONF gate DISABLED (ADMISSION_MIN_CONFIDENCE=0.0) — "
+                "set ADMISSION_MIN_CONFIDENCE > 0 in .env to enforce minimum entry confidence."
+            )
+        else:
+            log.info(
+                "[PHASE7-GATE] CONF gate ENABLED: confidence must be ≥ %.6f "
+                "(hard gate; applies to all entry paths including express).",
+                ADMISSION_MIN_CONFIDENCE,
+            )
+        if ADMISSION_FLUSH_COOLDOWN_SECS <= 0.0:
+            log.info(
+                "[PHASE7-GATE] EARLY_FLUSH gate DISABLED (ADMISSION_FLUSH_COOLDOWN_SECS=0.0) — "
+                "set ADMISSION_FLUSH_COOLDOWN_SECS > 0 in .env to suppress re-entry "
+                "after %d consecutive short RISK/ANOMALY exits (hold < %.0fs).",
+                ADMISSION_FLUSH_LOOKBACK, ADMISSION_FLUSH_MAX_HOLD_SECS,
+            )
+        else:
+            log.info(
+                "[PHASE7-GATE] EARLY_FLUSH gate ENABLED: cooldown=%.0fs after "
+                "%d×short RISK/ANOMALY exits (hold < %.0fs).",
+                ADMISSION_FLUSH_COOLDOWN_SECS,
+                ADMISSION_FLUSH_LOOKBACK,
+                ADMISSION_FLUSH_MAX_HOLD_SECS,
+            )
+        # ── [/PHASE7] ─────────────────────────────────────────────────────────
+
+        # ── [PHASE8] Admission gate visibility — symbol and regime suppression ─
+        if not ADMISSION_SUPPRESS_SYMBOLS:
+            log.info(
+                "[PHASE8-GATE] SYMBOL_BLOCKED gate DISABLED "
+                "(ADMISSION_SUPPRESS_SYMBOLS is empty) — "
+                "set ADMISSION_SUPPRESS_SYMBOLS=SYM1,SYM2 in .env to suppress "
+                "specific symbols at admission."
+            )
+        else:
+            log.info(
+                "[PHASE8-GATE] SYMBOL_BLOCKED gate ENABLED: %d symbol(s) suppressed: %s",
+                len(ADMISSION_SUPPRESS_SYMBOLS),
+                ", ".join(sorted(ADMISSION_SUPPRESS_SYMBOLS)),
+            )
+        if not ADMISSION_SUPPRESS_REGIMES:
+            log.info(
+                "[PHASE8-GATE] REGIME_BLOCKED gate DISABLED "
+                "(ADMISSION_SUPPRESS_REGIMES is empty) — "
+                "set ADMISSION_SUPPRESS_REGIMES=chop,bear in .env to suppress "
+                "entries by signal regime."
+            )
+        else:
+            log.info(
+                "[PHASE8-GATE] REGIME_BLOCKED gate ENABLED: %d regime(s) suppressed: %s "
+                "(express-path note: regime='express' — include 'express' to block "
+                "all express-path trades).",
+                len(ADMISSION_SUPPRESS_REGIMES),
+                ", ".join(sorted(ADMISSION_SUPPRESS_REGIMES)),
+            )
+        # ── [/PHASE8] ─────────────────────────────────────────────────────────
+
+        # ── [PHASE9] VPIN exit guard visibility — log state on boot ──────────
+        if P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED <= 1:
+            log.info(
+                "[PHASE9-GATE] VPIN CONSECUTIVE guard DISABLED "
+                "(P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED=1) — "
+                "emergency exit fires on the first spike above threshold. "
+                "Set P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED=2 (or higher) "
+                "in .env to require sustained toxicity before exiting."
+            )
+        else:
+            log.info(
+                "[PHASE9-GATE] VPIN CONSECUTIVE guard ENABLED: "
+                "P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED=%d — "
+                "emergency exit requires %d consecutive tape-monitor ticks "
+                "above P37_EMERGENCY_EXIT_TOXICITY=%.2f before firing.",
+                P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED,
+                P37_EMERGENCY_EXIT_CONSECUTIVE_REQUIRED,
+                P37_EMERGENCY_EXIT_TOXICITY,
+            )
+        if P37_EMERGENCY_EXIT_MIN_HOLD_SECS <= 0.0:
+            log.info(
+                "[PHASE9-GATE] VPIN MIN-HOLD guard DISABLED "
+                "(P37_EMERGENCY_EXIT_MIN_HOLD_SECS=0.0) — "
+                "no minimum position age before emergency exit is permitted. "
+                "Set P37_EMERGENCY_EXIT_MIN_HOLD_SECS > 0 in .env to protect "
+                "recently-entered positions from immediate VPIN exits."
+            )
+        else:
+            log.info(
+                "[PHASE9-GATE] VPIN MIN-HOLD guard ENABLED: "
+                "P37_EMERGENCY_EXIT_MIN_HOLD_SECS=%.1fs — "
+                "positions younger than %.1f seconds are immune to VPIN exits.",
+                P37_EMERGENCY_EXIT_MIN_HOLD_SECS,
+                P37_EMERGENCY_EXIT_MIN_HOLD_SECS,
+            )
+        # ── [/PHASE9] ─────────────────────────────────────────────────────────
+
+        # ── [D2 / PHASE13] Zombie equity-gate boot visibility ─────────────────
+        # _P20_ZOMBIE_CONSECUTIVE_REQUIRED controls how many consecutive bad equity
+        # reads (below P20_DRAWDOWN_ZOMBIE_PCT) are required before zombie mode
+        # fires.  Like the Phase 9 VPIN guards, its active value is logged at
+        # startup so the operator can confirm configuration from the boot log.
+        if _P20_ZOMBIE_CONSECUTIVE_REQUIRED <= 1:
+            log.info(
+                "[D2-GATE] ZOMBIE CONSECUTIVE guard at minimum "
+                "(_P20_ZOMBIE_CONSECUTIVE_REQUIRED=1) — zombie mode fires on the "
+                "first consecutive equity read below P20_DRAWDOWN_ZOMBIE_PCT=%.1f%%. "
+                "Set P20_ZOMBIE_CONSECUTIVE_REQUIRED=2 (or higher) in .env to require "
+                "sustained bad equity before triggering zombie mode.",
+                P20_DRAWDOWN_ZOMBIE_PCT,
+            )
+        else:
+            log.info(
+                "[D2-GATE] ZOMBIE CONSECUTIVE guard active: "
+                "_P20_ZOMBIE_CONSECUTIVE_REQUIRED=%d — zombie mode requires %d "
+                "consecutive equity reads below P20_DRAWDOWN_ZOMBIE_PCT=%.1f%% "
+                "before triggering.",
+                _P20_ZOMBIE_CONSECUTIVE_REQUIRED,
+                _P20_ZOMBIE_CONSECUTIVE_REQUIRED,
+                P20_DRAWDOWN_ZOMBIE_PCT,
+            )
+        # ── [/D2] ─────────────────────────────────────────────────────────────
+
+        # ── [PHASE14] Forced-exit hardening boot visibility ───────────────────
+        # P18 CATASTROPHE_VETO guards and hedge-trim hold guard.  Values logged
+        # here so the operator can confirm configuration from the boot log,
+        # mirroring the Phase 9 VPIN and Phase 13 D2 visibility blocks.
+
+        # P18 consecutive guard
+        if P18_CATASTROPHE_CONSECUTIVE_REQUIRED <= 1:
+            log.info(
+                "[PHASE14-GATE] P18 CATASTROPHE consecutive guard at minimum "
+                "(P18_CATASTROPHE_CONSECUTIVE_REQUIRED=1) — a single CATASTROPHE_VETO "
+                "verdict fires nuclear liquidation immediately. "
+                "Set P18_CATASTROPHE_CONSECUTIVE_REQUIRED=2 (or higher) in .env "
+                "to require sustained verdicts before liquidation fires."
+            )
+        else:
+            log.info(
+                "[PHASE14-GATE] P18 CATASTROPHE consecutive guard active: "
+                "P18_CATASTROPHE_CONSECUTIVE_REQUIRED=%d — nuclear liquidation requires "
+                "%d consecutive CATASTROPHE_VETO verdicts per symbol.",
+                P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+                P18_CATASTROPHE_CONSECUTIVE_REQUIRED,
+            )
+
+        # P18 hold guard
+        if P18_CATASTROPHE_MIN_HOLD_SECS <= 0.0:
+            log.info(
+                "[PHASE14-GATE] P18 CATASTROPHE hold guard DISABLED "
+                "(P18_CATASTROPHE_MIN_HOLD_SECS=0.0) — no minimum position age "
+                "before P18 liquidation is permitted. "
+                "Set P18_CATASTROPHE_MIN_HOLD_SECS > 0 in .env to protect "
+                "recently-entered positions from immediate P18 liquidation."
+            )
+        else:
+            log.info(
+                "[PHASE14-GATE] P18 CATASTROPHE hold guard ENABLED: "
+                "P18_CATASTROPHE_MIN_HOLD_SECS=%.1fs — positions younger than "
+                "%.1f seconds are immune to P18 liquidation.",
+                P18_CATASTROPHE_MIN_HOLD_SECS,
+                P18_CATASTROPHE_MIN_HOLD_SECS,
+            )
+
+        # Hedge trim hold guard
+        if HEDGE_TRIM_MIN_HOLD_SECS <= 0.0:
+            log.info(
+                "[PHASE14-GATE] HEDGE_TRIM hold guard DISABLED "
+                "(HEDGE_TRIM_MIN_HOLD_SECS=0.0) — any position may be selected "
+                "for hedge trim regardless of age. "
+                "Set HEDGE_TRIM_MIN_HOLD_SECS > 0 in .env to protect "
+                "recently-entered positions from correlation-freeze trimming. "
+                "Note: cold-start hedge trim suppression is always active "
+                "(HEDGE_COOLDOWN_SECS=%.1fs from boot).",
+                HEDGE_COOLDOWN_SECS,
+            )
+        else:
+            log.info(
+                "[PHASE14-GATE] HEDGE_TRIM hold guard ENABLED: "
+                "HEDGE_TRIM_MIN_HOLD_SECS=%.1fs — positions younger than %.1f "
+                "seconds are skipped during correlation-freeze hedge trimming.",
+                HEDGE_TRIM_MIN_HOLD_SECS,
+                HEDGE_TRIM_MIN_HOLD_SECS,
+            )
+        # ── [/PHASE14] ────────────────────────────────────────────────────────
+
+        # ── [TRACK14-GATE] Exposure gate boot visibility ──────────────────────
+        # CONCURRENT_CAP and DEPLOYED_CAP were added in Track 14.  Mirroring the
+        # Phase 7/8/9 pattern so operators can confirm gate state from the startup
+        # log without navigating to the dashboard.
+        if ADMISSION_MAX_OPEN_POSITIONS <= 0:
+            log.info(
+                "[TRACK14-GATE] CONCURRENT_CAP gate DISABLED "
+                "(ADMISSION_MAX_OPEN_POSITIONS=0) — "
+                "set ADMISSION_MAX_OPEN_POSITIONS > 0 in .env to cap concurrent "
+                "open positions at admission."
+            )
+        else:
+            log.info(
+                "[TRACK14-GATE] CONCURRENT_CAP gate ENABLED: "
+                "max %d concurrent open position(s) — "
+                "new entries blocked when open-position count reaches this threshold.",
+                ADMISSION_MAX_OPEN_POSITIONS,
+            )
+        if ADMISSION_MAX_DEPLOYED_PCT <= 0.0:
+            log.info(
+                "[TRACK14-GATE] DEPLOYED_CAP gate DISABLED "
+                "(ADMISSION_MAX_DEPLOYED_PCT=0.0) — "
+                "set ADMISSION_MAX_DEPLOYED_PCT > 0.0 in .env to cap total deployed "
+                "cost-basis as a fraction of equity at admission."
+            )
+        else:
+            log.info(
+                "[TRACK14-GATE] DEPLOYED_CAP gate ENABLED: "
+                "max %.1f%% of equity deployed (cost-basis) — "
+                "new entries blocked when Σ usd_cost / equity reaches this threshold. "
+                "Fail-open when equity ≤ 0.",
+                ADMISSION_MAX_DEPLOYED_PCT * 100,
+            )
+        # ── [TRACK27-PSC1] Per-symbol cap boot visibility ─────────────────────
+        if ADMISSION_MAX_PER_SYMBOL_USD <= 0.0:
+            log.info(
+                "[TRACK27-PSC1] PER_SYMBOL_CAP gate DISABLED "
+                "(ADMISSION_MAX_PER_SYMBOL_USD=0.0) — "
+                "set ADMISSION_MAX_PER_SYMBOL_USD > 0.0 in .env to cap cost-basis "
+                "per symbol at admission."
+            )
+        else:
+            log.info(
+                "[TRACK27-PSC1] PER_SYMBOL_CAP gate ENABLED: "
+                "max $%.2f cost-basis per symbol — "
+                "new entries for a symbol blocked when that symbol's usd_cost "
+                "reaches this threshold.  Fail-open on any arithmetic error.",
+                ADMISSION_MAX_PER_SYMBOL_USD,
+            )
+        # ── [/TRACK14-GATE] ───────────────────────────────────────────────────
         # Seeds a minimal boot-state dict so the dashboard sees "0 s stale" from
         # process start.  The full status dict is overwritten by the first _cycle().
         self._status = {

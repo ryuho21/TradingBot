@@ -11,40 +11,26 @@ Components:
                        fraction with a macro sentiment score.
 
 Bug-fix changelog (this revision):
-  [FIX-DB-NONE]  _read_snapshots() now returns [] on ANY exception path,
-                 including when the table does not yet exist (training mode /
-                 cold-start before the first DB write).  Columns are validated
-                 individually so a NULL cell never produces a TypeError.
+  [FIX-004]  DB COLD-START Grace Period — On first monitor cycle, if the
+             account_snapshots table is completely empty (zero rows ever
+             written), CircuitBreaker initialises a 60-minute (configurable
+             via P7_COLD_START_GRACE_SECS) grace window during which all
+             drawdown checks are bypassed.  This prevents a brand-new
+             deployment from triggering a false circuit-breaker trip before
+             any real equity data has been recorded.
 
-  [FIX-CHECK-NONE]  _check() has explicit None/zero guards on every arithmetic
-                 path.  No subtraction or division is performed on a value that
-                 could be None.  Returns 0.0 (not None) in every early-exit.
-
-  [FIX-METRIC-INIT]  last_drawdown_pct, peak_equity, latest_equity are
-                 initialised to 0.0 (float) at construction, not left
-                 un-initialised.  This prevents AttributeError if status is
-                 read before the first monitor tick.
-
-  [FIX-SCORE-TUPLE]  _get_score() now wraps every code path in try/except and
-                 is guaranteed to return Tuple[float, str] — never None,
-                 never a bare float.  Unpacking can never raise TypeError.
-
-  [FIX-OR-PARSE]  _fetch_or_score() validates that 'choices' is non-empty
-                 before indexing, and that 'content' is a non-None str before
-                 stripping.
-
-  [FIX-LOCK-REENTRANT]  _check() reads self._is_tripped / self.tripped_at
-                 under the lock into local variables, then releases the lock
-                 BEFORE calling _trip() or _reset() — asyncio.Lock is
-                 non-reentrant and a second acquisition in the same coroutine
-                 would deadlock.  (Preserves original FIX-1 intent, now also
-                 guards the new None-check paths.)
-
-  [P23-GHOST-CB]  _check() now reads trader_status.json at the top of every
-                 monitor cycle.  If the key "equity_is_ghost" is True, the
-                 entire drawdown computation is skipped and 0.0 is returned.
-                 This prevents the CircuitBreaker from tripping on a transient
-                 WebSocket zero-equity reading rather than real loss.
+  [FIX-DB-NONE]  _read_snapshots() returns [] on ANY exception path.
+  [FIX-CHECK-NONE]  _check() has explicit None/zero guards on every arithmetic path.
+  [FIX-METRIC-INIT]  last_drawdown_pct, peak_equity, latest_equity initialised to 0.0.
+  [FIX-SCORE-TUPLE]  _get_score() guaranteed to return Tuple[float, str].
+  [FIX-OR-PARSE]  _fetch_or_score() validates choices and content fields.
+  [FIX-LOCK-REENTRANT]  _check() reads state under lock, releases before callbacks.
+  [P23-GHOST-CB]  _check() reads equity_is_ghost from status file; skips on True.
+  [FIX-ATOMIC]   CircuitBreaker._patch_status — replaced fixed ".tmp" write with
+                 pt_utils.atomic_write_json (NamedTemporaryFile random-suffix +
+                 fsync + 3-attempt retry).  Eliminates WinError 5 / Access is
+                 denied races on Windows caused by the previous predictable
+                 temp filename.
 
 All earlier fixes (FIX-1 through FIX-10, NEW-8) are preserved.
 """
@@ -53,13 +39,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import sqlite3
 import time
-from decimal import Decimal, getcontext, InvalidOperation
 from dataclasses import dataclass, field
+from decimal import Decimal, getcontext, InvalidOperation
 from typing import Optional, Tuple
+
+getcontext().prec = 8
 
 try:
     from openai import AsyncOpenAI        # type: ignore[import]
@@ -68,48 +55,9 @@ except ImportError:
     AsyncOpenAI = None                    # type: ignore[assignment,misc]
     _OPENAI_SDK_AVAILABLE = False
 
-getcontext().prec = 8
-
 log = logging.getLogger("phase7_risk")
-
-def _env_float(key: str, default: float) -> float:
-    """Parse float env var safely; fall back to default on missing/invalid."""
-    raw = os.environ.get(key, None)
-    if raw is None or raw == "":
-        return float(default)
-    try:
-        return float(raw)
-    except Exception:
-        logging.getLogger(__name__).warning("Invalid %s=%r; using default %s", key, raw, default)
-        return float(default)
-
-def _env_int(key: str, default: int) -> int:
-    """Parse int env var safely; fall back to default on missing/invalid."""
-    raw = os.environ.get(key, None)
-    if raw is None or raw == "":
-        return int(default)
-    try:
-        return int(float(raw))
-    except Exception:
-        logging.getLogger(__name__).warning("Invalid %s=%r; using default %s", key, raw, default)
-        return int(default)
-
-
-
-def _D(val) -> Decimal:
-    """Coerce val into Decimal safely for financial math."""
-    try:
-        if isinstance(val, Decimal):
-            return val
-        if val is None:
-            return Decimal("0")
-        # reject NaN
-        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-            return Decimal("0")
-        return Decimal(str(val))
-    except Exception:
-        return Decimal("0")
-
+logging.getLogger("phase7_risk").addHandler(logging.NullHandler())
+from pt_utils import _env_float, _env_int, atomic_write_json  # [P0-UTIL]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -121,6 +69,10 @@ CB_RESET_AFTER_SECS     = _env_float("P7_CB_RESET_AFTER_SECS", 1800.0)
 CB_MIN_VALID_EQUITY     = _env_float("P7_CB_MIN_VALID_EQUITY", 10.0)
 CB_MAX_SINGLE_DROP_PCT  = _env_float("P7_CB_MAX_SINGLE_DROP_PCT", 50.0)
 CB_GRACE_SECS           = _env_float("P7_CB_GRACE_SECS", 60.0)
+
+# [FIX-004] DB COLD-START: If account_snapshots table is completely empty on the
+# first monitor cycle, bypass drawdown checks for this many seconds (default 3600 = 1h).
+P7_COLD_START_GRACE_SECS = _env_float("P7_COLD_START_GRACE_SECS", 3600.0)
 
 KELLY_BULL_THRESHOLD  = _env_float("P7_KELLY_BULL_THRESHOLD", 0.3)
 KELLY_BEAR_THRESHOLD  = _env_float("P7_KELLY_BEAR_THRESHOLD", -0.3)
@@ -180,6 +132,13 @@ class CircuitBreaker:
 
         self._start_time: float = time.time()
 
+        # [FIX-004] DB COLD-START — state for the 60-minute grace period.
+        # _cold_start_checked  : True after the first DB row-count check.
+        # _cold_start_grace_until : Epoch time until which drawdown checks are
+        #                           bypassed when the DB was found completely empty.
+        self._cold_start_checked: bool    = False
+        self._cold_start_grace_until: float = 0.0
+
         log.info(
             "[P7] CircuitBreaker created — threshold=%.1f%% lookback=%.0fs "
             "interval=%.0fs reset_cooldown=%.0fs grace=%.0fs "
@@ -207,7 +166,8 @@ class CircuitBreaker:
             with open(self._status_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             return bool(data.get("equity_is_ghost", False))
-        except Exception:
+        except Exception as _status_read_exc:
+            log.debug("[P7-RISK] status file read failed (may not exist yet): %s", _status_read_exc)
             return False
 
     # ── Property: is_tripped ──────────────────────────────────────────────────
@@ -288,19 +248,70 @@ class CircuitBreaker:
                 # [FIX-6a] Discard sub-threshold readings.
                 if eq_f < CB_MIN_VALID_EQUITY:
                     continue
+                # [FIX-004] Discard equity=0 rows — these are cold-start DB sentinel
+                # values written before the REST account poll confirms real equity.
+                # The executor's ghost-guard correctly rejects equity=0 for Kelly, but
+                # if that row lands in account_snapshots the CB sees a 100% drop
+                # ($N → $0) and logs a spurious WARNING every 15s.
+                # Real zero-equity events can only occur if the account is liquidated,
+                # which would produce a sequence of declining rows, not a single 0 spike.
+                if eq_f == 0.0:
+                    log.debug(
+                        "[P7-FIX-004] Skipping equity=0 DB row (ts=%.0f) — "
+                        "cold-start sentinel, not a real reading.",
+                        ts_f,
+                    )
+                    continue
                 valid.append((ts_f, eq_f))
 
             return valid
 
         except Exception as exc:
-            log.warning("[P7] CircuitBreaker: DB read error — %s", exc)
+            log.warning("[P7] CircuitBreaker: DB read error — %s", exc, exc_info=True)
             return []
         finally:
             if conn is not None:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    log.debug("[PHASE7] cleanup: %s", _exc)
+
+    # ── [FIX-004] DB Cold-Start: count total rows ─────────────────────────────
+
+    def _count_all_snapshots(self) -> int:
+        """
+        [FIX-004] Return the total number of rows ever written to
+        account_snapshots (not just those within the lookback window).
+
+        Used on the very first _check() call to detect a brand-new deployment
+        with an empty database so that the 60-minute cold-start grace period
+        can be activated before any drawdown arithmetic is attempted.
+
+        Returns 0 if the table does not exist (first-ever run) or on any
+        DB error.  Always returns int, never raises.
+        """
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(
+                self._db_path, check_same_thread=False, timeout=10.0
+            )
+            tbl_check = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='account_snapshots'"
+            ).fetchone()
+            if tbl_check is None:
+                return 0
+            row = conn.execute("SELECT COUNT(*) FROM account_snapshots").fetchone()
+            return int(row[0]) if row else 0
+        except Exception as exc:
+            log.debug("[FIX-004] _count_all_snapshots error: %s", exc)
+            return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as _exc:
+                    log.debug("[PHASE7] cleanup: %s", _exc)
 
     # ── Core drawdown check ───────────────────────────────────────────────────
 
@@ -334,6 +345,51 @@ class CircuitBreaker:
             )
             return 0.0
 
+        # ── [FIX-004] DB COLD-START Grace Period ─────────────────────────────
+        # On the very first call, count total rows in account_snapshots.
+        # If the table is completely empty (fresh deployment), activate a
+        # P7_COLD_START_GRACE_SECS (default 3600s = 60 min) grace window
+        # during which ALL drawdown checks are bypassed.  This prevents a
+        # spurious circuit-breaker trip on a brand-new install before any
+        # real equity data has accumulated.
+        if not self._cold_start_checked:
+            self._cold_start_checked = True
+            total_rows = await loop.run_in_executor(None, self._count_all_snapshots)
+            if total_rows == 0:
+                self._cold_start_grace_until = time.time() + P7_COLD_START_GRACE_SECS
+                log.warning(
+                    "[FIX-004] CircuitBreaker: account_snapshots table is empty — "
+                    "activating Cold-Start Grace Period for %.0f minutes (%.0f s). "
+                    "Drawdown checks bypassed until equity history is populated.",
+                    P7_COLD_START_GRACE_SECS / 60.0,
+                    P7_COLD_START_GRACE_SECS,
+                )
+            else:
+                log.info(
+                    "[FIX-004] CircuitBreaker: DB cold-start check complete — "
+                    "%d existing rows found, Grace Period not needed.",
+                    total_rows,
+                )
+
+        if self._cold_start_grace_until > 0:
+            remaining = self._cold_start_grace_until - time.time()
+            if remaining > 0:
+                log.debug(
+                    "[FIX-004] Cold-Start Grace Period active — %.0f s remaining. "
+                    "Bypassing drawdown checks.",
+                    remaining,
+                )
+                return 0.0
+            else:
+                # Grace period just expired — log once and clear.
+                if remaining > -CB_MONITOR_INTERVAL:
+                    log.info(
+                        "[FIX-004] Cold-Start Grace Period EXPIRED — "
+                        "resuming normal drawdown monitoring.",
+                    )
+                self._cold_start_grace_until = 0.0
+        # ── [/FIX-004] ───────────────────────────────────────────────────────
+
         # ── Grace window ──────────────────────────────────────────────────────
         elapsed_since_start = time.time() - self._start_time
         if elapsed_since_start < CB_GRACE_SECS:
@@ -362,7 +418,7 @@ class CircuitBreaker:
                 and isinstance(latest_eq, float)
                 and prev_eq > 0.0
             ):
-                single_drop_pct = float((_D(prev_eq) - _D(latest_eq)) / _D(prev_eq) * Decimal("100")) if _D(prev_eq) > 0 else 0.0
+                single_drop_pct = (prev_eq - latest_eq) / prev_eq * 100.0
                 if single_drop_pct > CB_MAX_SINGLE_DROP_PCT:
                     log.warning(
                         "[P7] CircuitBreaker: single-sample drop %.2f%% "
@@ -403,7 +459,7 @@ class CircuitBreaker:
             )
             return 0.0
 
-        drawdown_pct = float((_D(peak) - _D(latest)) / _D(peak) * Decimal("100")) if _D(peak) > 0 else 0.0
+        drawdown_pct = (peak - latest) / peak * 100.0
 
         # ── Update live metrics under lock ───────────────────────────────────
         # [FIX-LOCK-REENTRANT] Capture state into locals, then drop the lock
@@ -471,7 +527,13 @@ class CircuitBreaker:
         tripped_at  = float(self.tripped_at)
 
         def _write_sync() -> None:
-            tmp = status_path + ".tmp"
+            # [FIX-ATOMIC] Delegate the write to pt_utils.atomic_write_json
+            # (NamedTemporaryFile random-suffix + fsync + os.replace, 3-attempt
+            # retry).  The previous implementation used a fixed ".tmp" filename
+            # (status_path + ".tmp") which caused WinError 5 / Access is denied
+            # on Windows whenever another writer or the OS AV scanner held a lock
+            # on the predictable temp name.  Using the canonical pt_utils helper
+            # eliminates that race without altering the read-modify-write logic.
             try:
                 try:
                     with open(status_path, "r", encoding="utf-8") as fh:
@@ -486,19 +548,18 @@ class CircuitBreaker:
                 status["p7_latest_equity"] = round(latest_eq, 4)
                 status["p7_tripped_at"]    = tripped_at
 
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(status, fh, indent=2)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-
-                os.replace(tmp, status_path)
+                ok = atomic_write_json(status_path, status)
+                if not ok:
+                    log.error(
+                        "[P7] CircuitBreaker: atomic_write_json exhausted all "
+                        "retries for %s — status patch NOT applied.", status_path
+                    )
 
             except Exception as exc:
-                log.error("[P7] CircuitBreaker: failed to patch status JSON — %s", exc)
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+                log.error(
+                    "[P7] CircuitBreaker: failed to patch status JSON — %s",
+                    exc, exc_info=True,
+                )
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _write_sync)
@@ -523,7 +584,7 @@ class CircuitBreaker:
                 )
             except Exception as exc:
                 log.error(
-                    "[P7] CircuitBreaker monitor unexpected error: %s", exc
+                    "[P7] CircuitBreaker monitor unexpected error: %s", exc, exc_info=True
                 )
             await asyncio.sleep(CB_MONITOR_INTERVAL)
 
@@ -793,7 +854,20 @@ class KellySizer:
             )
             return 0.0
 
-        adjusted = float(max(_D(min_alloc), min(_D(base_kelly) * _D(multiplier), _D(max_alloc))))
+        # [CORE_DEFECT_001] Decimal sizing math (allocation fraction)
+        try:
+            d_min = Decimal(str(min_alloc))
+            d_max = Decimal(str(max_alloc))
+            d_base = Decimal(str(base_kelly))
+            d_mult = Decimal(str(multiplier))
+            d_adj = d_base * d_mult
+            if d_adj > d_max:
+                d_adj = d_max
+            if d_adj < d_min:
+                d_adj = d_min
+            adjusted = float(d_adj)
+        except Exception:
+            adjusted = max(float(min_alloc), min(float(base_kelly) * float(multiplier), float(max_alloc)))
         log.debug(
             "[P7] KellySizer — score=%.4f  mult=%.4f  "
             "base=%.4f → adj=%.6f  (min=%.4f  max=%.4f  equity=$%.2f  src=%s)",
@@ -816,7 +890,20 @@ class KellySizer:
             adjusted = 0.0
             label    = "🚫 PANIC BLOCK"
         else:
-            adjusted = float(max(_D(min_alloc), min(_D(base_kelly) * _D(multiplier), _D(max_alloc))))
+            # [CORE_DEFECT_001] Decimal sizing math (allocation fraction)
+            try:
+                d_min = Decimal(str(min_alloc))
+                d_max = Decimal(str(max_alloc))
+                d_base = Decimal(str(base_kelly))
+                d_mult = Decimal(str(multiplier))
+                d_adj = d_base * d_mult
+                if d_adj > d_max:
+                    d_adj = d_max
+                if d_adj < d_min:
+                    d_adj = d_min
+                adjusted = float(d_adj)
+            except Exception:
+                adjusted = max(float(min_alloc), min(float(base_kelly) * float(multiplier), float(max_alloc)))
             if multiplier >= KELLY_BULL_MULTIPLIER:
                 label = "🚀 Bullish Boost"
             elif multiplier <= KELLY_BEAR_FLOOR:

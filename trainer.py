@@ -17,9 +17,13 @@ from typing import List, Optional
 import aiohttp
 import numpy as np
 
+# [P0-FIX-1/10] Logging owned by the launcher (main.py or __main__ guard below).
+# trainer.py uses getLogger only when imported as a library.
 log = logging.getLogger("trainer")
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+log.addHandler(logging.NullHandler())  # prevents "No handler found" warnings
+
+# [P0-FIX-11] Shared resilience utilities — atomic writes + safe env parsing.
+from pt_utils import atomic_write_json, _env_float, _env_int
 
 KUCOIN_REST  = "https://api.kucoin.com"
 TF_CHOICES   = ["1hour", "2hour", "4hour", "8hour", "12hour", "1day", "1week"]
@@ -64,8 +68,8 @@ async def fetch_candles(session: aiohttp.ClientSession, coin: str, tf: str,
         for row in data:
             try:
                 rows.append([float(x) for x in row[:6]])
-            except Exception:
-                pass
+            except Exception as _exc:
+                log.debug("[TRAINER] data skip: %s", _exc)
 
         # KuCoin returns newest-first; if we got < 1500 rows we're done
         if len(data) < 1499:
@@ -109,24 +113,30 @@ async def train_symbol_tf(session: aiohttp.ClientSession,
 # ── Write legacy gate files ───────────────────────────────────────────────────
 def _write_status(folder: str, coin: str, state: str, started: int,
                   finished: Optional[int] = None):
+    """[P0-FIX-10] Atomic write — no silent failure, no partial JSON on crash."""
     d = {"coin": coin, "state": state,
          "started_at": started, "timestamp": int(time.time())}
     if finished:
         d["finished_at"] = finished
-    try:
-        with open(os.path.join(folder, "trainer_status.json"), "w") as f:
-            json.dump(d, f)
-    except Exception:
-        pass
+    _path = os.path.join(folder, "trainer_status.json")
+    ok = atomic_write_json(_path, d)
+    if not ok:
+        log.error("[TRAINER] Failed to write trainer_status.json for %s at %s", coin, _path)
 
 
 def _write_freshness(folder: str):
+    """[P0-FIX-10] Atomic write for freshness timestamp — explicit on failure."""
     ts = int(time.time())
-    try:
-        with open(os.path.join(folder, "trainer_last_training_time.txt"), "w") as f:
-            f.write(str(ts))
-    except Exception:
-        pass
+    _path = os.path.join(folder, "trainer_last_training_time.txt")
+    # Wrap as JSON-compatible dict for atomic_write_json durability.
+    ok = atomic_write_json(_path.replace(".txt", ".json"), {"ts": ts, "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))})
+    if not ok:
+        # Plain-text fallback — still explicit on failure
+        try:
+            with open(_path, "w", encoding="utf-8") as _f:
+                _f.write(str(ts))
+        except OSError as _exc:
+            log.error("[TRAINER] Failed to write freshness file at %s: %s", _path, _exc)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -185,5 +195,15 @@ async def train(coins: List[str], engine=None):
 
 
 if __name__ == "__main__":
+    # [P0-FIX-1] basicConfig only when trainer runs as the entry point (standalone).
+    # When imported as a library, the launcher owns logging.
+    if not logging.getLogger("trainer").handlers or all(
+        isinstance(h, logging.NullHandler)
+        for h in logging.getLogger("trainer").handlers
+    ):
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        )
     coins = [a.strip().upper() for a in sys.argv[1:] if a.strip()] or ["BTC"]
     asyncio.run(train(coins))

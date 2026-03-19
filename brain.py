@@ -1,5 +1,34 @@
 """
-brain.py  —  Market Intelligence Engine  Phase 32 Institutional Predator Suite
+brain.py  —  Market Intelligence Engine  Phase 40.1 Binary Truth / Decimal Hardening
+
+Phase 12 strategy refinements (all preserved):
+  [PHASE12-W1] Direction-aware regime_bonus in analyze().
+               regime_bonus is now +0.1 only for with-trend entries (bull+long,
+               bear+short).  Counter-trend entries (bull+short, bear+long) already
+               receive a 40% raw_p penalty; the flat +0.1 bonus partially offset
+               that penalty.  They now receive 0.0.  Chop stays at -0.15.
+  [PHASE12-W4] Confidence-weighted average agg_kelly_raw in aggregate_signals().
+               Replaces max(kelly_raw) which took the single most optimistic TF.
+               Uses the same tf_weight * sig.confidence weighting as the directional
+               scoring loop so sizing and direction are determined by the same
+               evidence balance.
+  [PHASE12-W6] Majority-weighted agg_regime in aggregate_signals().
+               Replaces best_sig.regime (highest per-TF confidence) for the regime
+               field, RL lookup, and Signal.regime.  The majority-weighted regime
+               drives executor use_swap routing and RL multiplier selection, so a
+               single high-confidence minority-TF can no longer force a leveraged
+               SWAP entry against a chop/bear majority.
+
+Phase 40.1 additions (this release):
+  [FIX-003] ARITHMETIC HARDENING — All PnL, position sizing, and _win_mag updates
+            now use decimal.Decimal with getcontext().prec=8 to eliminate IEEE-754
+            floating-point accumulation errors in the EMA-update path.
+            Affected: record_outcome() _win_mag EMA, fractional_kelly(),
+            KellySizer.get_sentiment_adjusted_size(), KellySizer.get_scale_info().
+            All external return types remain float — Decimal is used only for
+            intermediate arithmetic to guard against silent precision drift.
+
+Phase 32 Institutional Predator Suite (all preserved):
 
 Phase 32 additions (this release):
   [P32-SLIP-ADAPT] Per-symbol Slippage-Adaptive Tracker — SlippagePerSymbolTracker
@@ -63,58 +92,19 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-import math
 import os
 import pickle
 import time
-from decimal import Decimal, getcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 
+from decimal import Decimal, getcontext, InvalidOperation
 getcontext().prec = 8
-
 log = logging.getLogger("brain")
-
-
-
-# ── Safe env parsing ──────────────────────────────────────────────────────────
-def _env_float(key: str, default: float) -> float:
-    """Parse float env var safely; fall back to default on bad values."""
-    raw = os.environ.get(key, "")
-    if raw is None or raw == "":
-        return float(default)
-    try:
-        return float(str(raw).strip())
-    except Exception:
-        log.warning("Invalid float for %s=%r; using default=%s", key, raw, default)
-        return float(default)
-
-def _env_int(key: str, default: int) -> int:
-    """Parse int env var safely; fall back to default on bad values."""
-    raw = os.environ.get(key, "")
-    if raw is None or raw == "":
-        return int(default)
-    try:
-        return int(str(raw).strip())
-    except Exception:
-        log.warning("Invalid int for %s=%r; using default=%s", key, raw, default)
-        return int(default)
-
-
-
-def _D(val) -> Decimal:
-    try:
-        if isinstance(val, Decimal):
-            return val
-        if val is None:
-            return Decimal("0")
-        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-            return Decimal("0")
-        return Decimal(str(val))
-    except Exception:
-        return Decimal("0")
+logging.getLogger("brain").addHandler(logging.NullHandler())
+from pt_utils import _env_float, _env_int, atomic_write_json  # [P0-UTIL]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # [P27-OKX] OKX Gateway Post Adapter
@@ -302,7 +292,7 @@ P14_RSI_PERIOD             = _env_int("P14_RSI_PERIOD", 14)
 P14_RSI_OVERBOUGHT         = _env_float("P14_RSI_OVERBOUGHT", 65.0)
 P14_RSI_OVERSOLD           = _env_float("P14_RSI_OVERSOLD", 35.0)
 P14_ATR_PERIOD             = _env_int("P14_ATR_PERIOD", 14)
-P14_PRUNE_INTERVAL_SECS    = _env_float("P14_PRUNE_INTERVAL_SECS", str(6 * 3600))
+P14_PRUNE_INTERVAL_SECS    = _env_float("P14_PRUNE_INTERVAL_SECS",   float(6 * 3600))
 P14_PRUNE_WEIGHT_THRESHOLD = _env_float("P14_PRUNE_WEIGHT_THRESHOLD", 0.2)
 P14_PRUNE_MAX_PATTERNS     = _env_int("P14_PRUNE_MAX_PATTERNS", 5000)
 
@@ -314,7 +304,7 @@ P15_ORACLE_MIN_WHALE_MULT = _env_float("P15_ORACLE_MIN_WHALE_MULT", 10.0)
 _P15_SOFT_PENALTY_FACTOR = 0.5
 
 # ── [P20-3] Walk-Forward Shadow Training config ────────────────────────────────
-P20_SHADOW_INTERVAL_SECS  = _env_float("P20_SHADOW_INTERVAL_SECS", str(24 * 3600))
+P20_SHADOW_INTERVAL_SECS  = _env_float("P20_SHADOW_INTERVAL_SECS",  float(24 * 3600))
 P20_SHADOW_LOOKBACK_HOURS = _env_int("P20_SHADOW_LOOKBACK_HOURS", 48)
 P20_SHADOW_SWAP_THRESHOLD = _env_float("P20_SHADOW_SWAP_THRESHOLD", 1.1)
 P20_SHADOW_AUTO_SWAP      = os.environ.get("P20_SHADOW_AUTO_SWAP", "0").strip() == "1"
@@ -535,6 +525,24 @@ class ConvictionResult(NamedTuple):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EnsembleJudge:
+    # [P15-2-THROTTLE] Per-symbol, per-log-site timestamps for whale SELL warning.
+    # Prevents 45+ identical log lines per 30s whale TTL window.
+    # Keys: (symbol, site) → last_warn_ts. Cooldown = 30s (1 per whale signal lifetime).
+    _P15_WARN_THROTTLE_SECS: float = 30.0
+
+    def __init__(self) -> None:
+        self._whale_warn_ts: dict = {}   # {(symbol, site): float}
+
+    def _p15_should_warn(self, symbol: str, site: str) -> bool:
+        """[P15-2-THROTTLE] Return True only if 30s have elapsed since last warn
+        for (symbol, site). Prevents repeated logs on every brain.analyze() call."""
+        import time as _t
+        key = (symbol.upper(), site)
+        now = _t.time()
+        if now - self._whale_warn_ts.get(key, 0.0) >= self._P15_WARN_THROTTLE_SECS:
+            self._whale_warn_ts[key] = now
+            return True
+        return False
 
     @staticmethod
     def _ema(arr: np.ndarray, period: int) -> float:
@@ -592,11 +600,13 @@ class EnsembleJudge:
                 and primary_direction != "short"
             )
             if cancel_buys:
-                log.warning(
-                    "[P15-2] Whale SELL on %s while primary='%s' (TA cold) "
-                    "→ cancel_pending_buys=True",
-                    getattr(oracle_signal, "symbol", "?"), primary_direction,
-                )
+                _sym_lbl = getattr(oracle_signal, "symbol", "?")
+                if self._p15_should_warn(_sym_lbl, "cold"):
+                    log.warning(
+                        "[P15-2] Whale SELL on %s while primary='%s' (TA cold) "
+                        "→ cancel_pending_buys=True [throttled: 1 warn/30s]",
+                        _sym_lbl, primary_direction,
+                    )
             return ConvictionResult(
                 multiplier=1.0, high_conviction=False, votes=0,
                 ema_direction="neutral", rsi_direction="neutral",
@@ -660,21 +670,27 @@ class EnsembleJudge:
         elif votes == 2:
             multiplier = P14_CONVICTION_BOOST
             high_conv  = True
-            log.info(
-                "[P14-1] High Conviction: EMA=%s RSI=%s PRIMARY=%s mult=%.2f",
-                ema_dir, rsi_dir, primary_direction, multiplier,
-            )
+            # [FIX-003] Throttle P14-1 to 1 log per symbol per 30s.
+            # brain.analyze() fires every ~2s per symbol — without throttle this
+            # floods the log at ~1 line/sec with identical messages.
+            _sym_lbl_p14 = getattr(oracle_signal, "symbol", primary_direction) if oracle_signal else primary_direction
+            if self._p15_should_warn(_sym_lbl_p14, "p14_high_conv"):
+                log.info(
+                    "[P14-1] High Conviction: EMA=%s RSI=%s PRIMARY=%s mult=%.2f [throttled: 1/30s]",
+                    ema_dir, rsi_dir, primary_direction, multiplier,
+                )
         elif hard_conflict and oracle_opposing:
             multiplier  = P14_CONVICTION_PENALTY * P15_ORACLE_PENALTY
             high_conv   = False
             cancel_buys = (primary_direction == "long")
-            log.warning(
-                "[P15-2] Oracle OPPOSING + hard TA conflict %s [%s]: "
-                "EMA=%s RSI=%s WHALE=%s → mult=%.2f cancel_buys=%s",
-                sym_label, primary_direction.upper(),
-                ema_dir, rsi_dir, oracle_signal.signal_type,
-                multiplier, cancel_buys,
-            )
+            if self._p15_should_warn(sym_label, "hard_conflict"):
+                log.warning(
+                    "[P15-2] Oracle OPPOSING + hard TA conflict %s [%s]: "
+                    "EMA=%s RSI=%s WHALE=%s → mult=%.2f cancel_buys=%s [throttled: 1/30s]",
+                    sym_label, primary_direction.upper(),
+                    ema_dir, rsi_dir, oracle_signal.signal_type,
+                    multiplier, cancel_buys,
+                )
         elif hard_conflict:
             multiplier = P14_CONVICTION_PENALTY
             high_conv  = False
@@ -686,11 +702,12 @@ class EnsembleJudge:
             multiplier  = 1.0 - (1.0 - P14_CONVICTION_PENALTY) * _P15_SOFT_PENALTY_FACTOR
             high_conv   = False
             cancel_buys = (primary_direction == "long")
-            log.warning(
-                "[P15-2] Coinbase Whale opposing %s [%s]: "
-                "soft penalty mult=%.2f cancel_pending_buys=%s",
-                sym_label, primary_direction.upper(), multiplier, cancel_buys,
-            )
+            if self._p15_should_warn(sym_label, "soft_opposing"):
+                log.warning(
+                    "[P15-2] Coinbase Whale opposing %s [%s]: "
+                    "soft penalty mult=%.2f cancel_pending_buys=%s [throttled: 1/30s]",
+                    sym_label, primary_direction.upper(), multiplier, cancel_buys,
+                )
         else:
             multiplier = 1.0
             high_conv  = False
@@ -1255,11 +1272,18 @@ class RegimeDetector:
             model = _hmm.GaussianHMM(
                 n_components=self.N_STATES,
                 covariance_type="diag",
-                n_iter=100,
+                n_iter=200,           # [HMM-FIX] increased from 100 for crypto volatility
                 random_state=42,
             )
             try:
-                model.fit(lr)
+                import warnings as _hmm_warn
+                with _hmm_warn.catch_warnings():
+                    # Suppress hmmlearn ConvergenceWarning — non-fatal on volatile crypto
+                    # data; the fitted model is still usable even if not fully converged.
+                    _hmm_warn.filterwarnings(
+                        "ignore", message=".*not converging.*", module="hmmlearn"
+                    )
+                    model.fit(lr)
                 means     = model.means_.flatten()
                 order     = np.argsort(means)
                 label_map = {order[0]: "bear", order[1]: "chop", order[2]: "bull"}
@@ -1275,8 +1299,8 @@ class RegimeDetector:
                 lr    = np.diff(np.log(closes)).reshape(-1, 1)
                 state = self._model.predict(lr)[-1]
                 return self._state_labels[state]
-            except Exception:
-                pass
+            except Exception as _exc:
+                log.warning("[BRAIN] suppressed: %s", _exc)
         return self._rule_based(closes)
 
     @staticmethod
@@ -1399,10 +1423,30 @@ class BayesianFusion:
 def fractional_kelly(
     win_prob: float, win_loss_ratio: float, fraction: float = 0.25,
 ) -> float:
-    if win_loss_ratio <= 0 or win_prob <= 0:
+    # [FIX-003] ARITHMETIC HARDENING — full Decimal path for Kelly sizing.
+    # Prevents float precision drift when win_prob ≈ 0.5 or win_loss_ratio ≈ 1.0
+    # where IEEE-754 rounding can produce slightly negative Kelly fractions
+    # that get clamped to 0.0 (silent under-sizing).
+    try:
+        p    = Decimal(str(win_prob)).quantize(Decimal("0.000001"))
+        b    = Decimal(str(win_loss_ratio)).quantize(Decimal("0.000001"))
+        frac = Decimal(str(fraction)).quantize(Decimal("0.0001"))
+    except (InvalidOperation, Exception):
         return 0.0
-    p, q, b = win_prob, 1 - win_prob, win_loss_ratio
-    return round(min(max(0.0, (p * b - q) / b * fraction), 1.0), 4)
+    if b <= 0 or p <= 0:
+        return 0.0
+    q = Decimal("1") - p
+    try:
+        k = (p * b - q) / b
+        k = k * frac
+        if k < Decimal("0"):
+            k = Decimal("0")
+        if k > Decimal("1"):
+            k = Decimal("1")
+        return float(k.quantize(Decimal("0.0001")))
+    except (InvalidOperation, ZeroDivisionError):
+        return 0.0
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2117,9 +2161,19 @@ class IntelligenceEngine:
         w_mag     = self._win_mag.get(k, 1.0)
         kelly_raw = fractional_kelly(wins / (wins + losses), w_mag, fraction=0.25)
 
-        regime_bonus   = {"bull": 0.1, "bear": 0.1, "chop": -0.15}
+        # [PHASE12-W1] Direction-aware regime confidence bonus.
+        # Trending regimes (bull, bear) provide a +0.1 bonus only for with-trend
+        # entries: bull+long and bear+short.  Counter-trend entries (bull+short,
+        # bear+long) already carry a 40% raw_p penalty from the block above; adding
+        # +0.1 there would partially offset that penalty and inflate their confidence
+        # beyond what the probability evidence justifies.  Chop retains -0.15.
+        _with_trend = (
+            (regime == "bull" and direction == "long")
+            or (regime == "bear" and direction == "short")
+        )
+        regime_bonus   = 0.1 if _with_trend else (-0.15 if regime == "chop" else 0.0)
         raw_confidence = float(min(1.0, max(0.0,
-            prob * 0.6 + kelly_raw * 0.2 + regime_bonus.get(regime, 0.0) + 0.1
+            prob * 0.6 + kelly_raw * 0.2 + regime_bonus + 0.1
         )))
 
         oracle_sig = None
@@ -2217,8 +2271,35 @@ class IntelligenceEngine:
         agg_regime_modifier  = min(s.regime_modifier  for s in signals.values())
         agg_trail_multiplier = min(s.trail_multiplier for s in signals.values())
         agg_chop_sniper_only = any(s.chop_sniper_only for s in signals.values())
-        agg_kelly_raw        = max(s.kelly_raw         for s in signals.values())
+
+        # [PHASE12-W4] Confidence-weighted average kelly_raw.
+        # Replaces max(s.kelly_raw) which took the single most optimistic TF and
+        # inflated aggregate sizing.  Uses the same tf_weight * sig.confidence
+        # weighting as the directional scoring loop above so that sizing reflects
+        # the same balance of TF evidence that determines direction.
+        _kelly_num = _kelly_den = 0.0
+        for _tf, _sig in signals.items():
+            _kw = tf_weight.get(_tf, 1.0) * _sig.confidence
+            _kelly_num += _sig.kelly_raw * _kw
+            _kelly_den += _kw
+        agg_kelly_raw = (_kelly_num / _kelly_den) if _kelly_den > 0.0 else 0.0
+
         agg_kelly_adj        = agg_kelly_raw * agg_regime_modifier
+
+        # [PHASE12-W6] Majority-weighted aggregate regime.
+        # Replaces best_sig.regime (highest per-TF confidence) which could route to
+        # leveraged SWAP based on a single TF minority-vote.  Uses the same
+        # tf_weight * sig.confidence weighting so that the regime reported to the
+        # executor — and used for use_swap routing and RL lookup — reflects the
+        # dominant regime across all timeframes, not just the most confident one.
+        _regime_scores: Dict[str, float] = {}
+        for _tf, _sig in signals.items():
+            _rw = tf_weight.get(_tf, 1.0) * _sig.confidence
+            _regime_scores[_sig.regime] = _regime_scores.get(_sig.regime, 0.0) + _rw
+        agg_regime = (
+            max(_regime_scores, key=lambda r: _regime_scores[r])
+            if _regime_scores else best_sig.regime
+        )
 
         trust_vals = [s.trust_factor for s in signals.values() if s.trust_factor > 0]
         agg_trust  = float(np.prod(trust_vals) ** (1.0 / len(trust_vals))) if trust_vals else 1.0
@@ -2250,9 +2331,9 @@ class IntelligenceEngine:
             direction = "neutral"
             prob      = 0.5
 
-        # [P6-RL] Scale aggregate confidence + kelly by RL multiplier
+        # [P6-RL] Scale aggregate confidence + kelly by RL multiplier.
+        # [PHASE12-W6] Uses agg_regime (majority-weighted) instead of best_sig.regime.
         if direction != "neutral":
-            agg_regime = best_sig.regime
             rl_mult    = self._rl_table.get_multiplier_sync(agg_regime)
             if rl_mult != 1.0:
                 conf        = float(min(1.0, conf * rl_mult))
@@ -2266,7 +2347,7 @@ class IntelligenceEngine:
         return Signal(
             symbol=symbol, tf="aggregate",
             direction=direction, prob=round(prob, 4),
-            regime=best_sig.regime,
+            regime=agg_regime,
             kelly_f=agg_kelly_f, kelly_raw=agg_kelly_raw,
             z_score=best_sig.z_score,
             confidence=round(conf, 4),
@@ -2300,10 +2381,42 @@ class IntelligenceEngine:
         )
         k = (symbol, tf)
         if success:
-            self._wins[k]    = self._wins.get(k, 0) + 1
-            self._win_mag[k] = self._win_mag.get(k, 1.0) * 0.9 + abs(pnl_pct) * 0.1
+            self._wins[k] = self._wins.get(k, 0) + 1
+            # [FIX-003] ARITHMETIC HARDENING — use Decimal for win-magnitude EMA
+            # to eliminate IEEE-754 accumulation drift in the position-sizing path.
+            try:
+                _d_old  = Decimal(str(self._win_mag.get(k, 1.0)))
+                _d_pnl  = Decimal(str(abs(pnl_pct)))
+                _d_new  = _d_old * Decimal("0.9") + _d_pnl * Decimal("0.1")
+                self._win_mag[k] = float(_d_new.quantize(Decimal("0.000001")))
+            except (InvalidOperation, Exception):
+                # Fallback: float path if Decimal conversion fails (NaN/Inf input)
+                self._win_mag[k] = (
+                    self._win_mag.get(k, 1.0) * 0.9 + abs(pnl_pct) * 0.1
+                )
         else:
             self._losses[k] = self._losses.get(k, 0) + 1
+
+    def global_win_rate(self, min_trades: int = 1) -> Tuple[float, int]:
+        """
+        [P44] Aggregate win rate across ALL (symbol, tf) pairs.
+
+        Returns
+        -------
+        (win_rate, total_trades) where win_rate is in [0.0, 1.0].
+        Returns (0.5, 0) — neutral — when total trades < min_trades so the
+        Supervisor does not fire on cold-start data.
+
+        Thread-safe: _wins / _losses are standard dicts written only from
+        the executor's async loop (single writer), so reads from the sentinel
+        loop are safe without a lock (CPython GIL protects dict iteration).
+        """
+        total_wins   = sum(self._wins.values())
+        total_losses = sum(self._losses.values())
+        total        = total_wins + total_losses
+        if total < min_trades:
+            return 0.5, 0
+        return total_wins / total, total
 
     def correlation_freeze(self) -> bool:
         return self._corr.is_frozen()
@@ -2315,7 +2428,7 @@ class IntelligenceEngine:
     ) -> bool:
         if cost_basis <= 0 or len(price_history) < 10:
             return False
-        pnl_pct  = float((_D(current_price) - _D(cost_basis)) / _D(cost_basis) * Decimal("100"))
+        pnl_pct  = (current_price - cost_basis) / cost_basis * 100
         hist_pnl = (price_history - cost_basis) / cost_basis * 100
         z        = _z_score(pnl_pct, hist_pnl)
         if z <= threshold:

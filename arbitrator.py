@@ -78,12 +78,16 @@ except ImportError:
 import aiohttp
 
 log = logging.getLogger("arbitrator")
+logging.getLogger("arbitrator").addHandler(logging.NullHandler())
+from pt_utils import _env_float, _env_int, atomic_write_json  # [P0-UTIL]
+
+# [P0-FIX-11] env helpers → pt_utils
 
 # ── Phase 6 Config ─────────────────────────────────────────────────────────────
-ARB_SPREAD_MIN_PCT = float(os.environ.get("ARB_SPREAD_MIN_PCT", "0.15"))
-ARB_POLL_INTERVAL  = float(os.environ.get("ARB_POLL_INTERVAL",  "5.0"))
-ARB_FETCH_TIMEOUT  = float(os.environ.get("ARB_FETCH_TIMEOUT",  "8.0"))
-ARB_MAX_PRICE_AGE  = float(os.environ.get("ARB_MAX_PRICE_AGE",  "30.0"))
+ARB_SPREAD_MIN_PCT = _env_float("ARB_SPREAD_MIN_PCT", 0.15)
+ARB_POLL_INTERVAL  = _env_float("ARB_POLL_INTERVAL", 5.0)
+ARB_FETCH_TIMEOUT  = _env_float("ARB_FETCH_TIMEOUT", 8.0)
+ARB_MAX_PRICE_AGE  = _env_float("ARB_MAX_PRICE_AGE", 30.0)
 
 _BINANCE_KEY    = os.environ.get("BINANCE_API_KEY",  "")
 _BINANCE_SECRET = os.environ.get("BINANCE_SECRET",   "")
@@ -98,21 +102,21 @@ _OKX_DEMO       = os.environ.get("OKX_DEMO_MODE", "0").strip() == "1"
 CB_WS_URL             = os.environ.get("CB_WS_URL",             "wss://advanced-trade-ws.coinbase.com")
 CB_API_KEY            = os.environ.get("COINBASE_API_KEY",      "")
 CB_API_SECRET_RAW     = os.environ.get("COINBASE_API_SECRET",   "")
-CB_WHALE_MULTIPLIER   = float(os.environ.get("CB_WHALE_MULTIPLIER",   "10.0"))
-CB_AVG_WINDOW_SECS    = float(os.environ.get("CB_AVG_WINDOW_SECS",    "86400.0"))
-CB_RECONNECT_DELAY    = float(os.environ.get("CB_RECONNECT_DELAY",    "5.0"))
-CB_SIGNAL_TTL_SECS    = float(os.environ.get("CB_SIGNAL_TTL_SECS",    "30.0"))
-CB_MIN_WARM_TRADES    = int  (os.environ.get("CB_MIN_WARM_TRADES",    "30"))
-CB_MIN_AVG_SIZE_BTC   = float(os.environ.get("CB_MIN_AVG_SIZE_BTC",  "0.01"))
+CB_WHALE_MULTIPLIER   = _env_float("CB_WHALE_MULTIPLIER", 10.0)
+CB_AVG_WINDOW_SECS    = _env_float("CB_AVG_WINDOW_SECS", 86400.0)
+CB_RECONNECT_DELAY    = _env_float("CB_RECONNECT_DELAY", 5.0)
+CB_SIGNAL_TTL_SECS    = _env_float("CB_SIGNAL_TTL_SECS", 30.0)
+CB_MIN_WARM_TRADES    = _env_int("CB_MIN_WARM_TRADES", 30)
+CB_MIN_AVG_SIZE_BTC   = _env_float("CB_MIN_AVG_SIZE_BTC", 0.01)
 
 # ── [P15-4] Global Tape / High-Volatility Mode ────────────────────────────────
-GLOBAL_TAPE_HV_TPS      = float(os.environ.get("P15_GLOBAL_TAPE_HV_TPS",    "200.0"))
-GLOBAL_TAPE_WINDOW_SECS = float(os.environ.get("P15_GLOBAL_TAPE_WIN_SECS",  "5.0"))
-HV_MODE_STOP_WIDE_PCT   = float(os.environ.get("P15_HV_STOP_WIDE_PCT",      "0.3"))
+GLOBAL_TAPE_HV_TPS      = _env_float("P15_GLOBAL_TAPE_HV_TPS", 200.0)
+GLOBAL_TAPE_WINDOW_SECS = _env_float("P15_GLOBAL_TAPE_WIN_SECS", 5.0)
+HV_MODE_STOP_WIDE_PCT   = _env_float("P15_HV_STOP_WIDE_PCT", 0.3)
 
 # ── [P16] Arbitrage Bridge Config ─────────────────────────────────────────────
-P16_WHALE_TRIGGER_MULT   = float(os.environ.get("P16_WHALE_TRIGGER_MULT",  "10.0"))
-P16_BRIDGE_COOLDOWN_SECS = float(os.environ.get("P16_BRIDGE_COOLDOWN_SECS", "30.0"))
+P16_WHALE_TRIGGER_MULT   = _env_float("P16_WHALE_TRIGGER_MULT", 10.0)
+P16_BRIDGE_COOLDOWN_SECS = _env_float("P16_BRIDGE_COOLDOWN_SECS", 30.0)
 
 # ── [P15-2] Oracle conviction multipliers ────────────────────────────────────
 ORACLE_WHALE_BUY  = "WHALE_SWEEP_BUY"
@@ -215,6 +219,11 @@ class OracleSignal:
     ts:               float = field(default_factory=time.time)
     ttl:              float = CB_SIGNAL_TTL_SECS
     cancel_buys_flag: bool  = False
+    # [P53] Mesh consensus metadata — read by engine_supervisor._gui_bridge to
+    # feed feed_coinbase_signal() without re-deriving.  Default values keep full
+    # backward-compat with every existing caller (no required arg added).
+    mesh_node_id:  str   = "coinbase_oracle"  # canonical NODE_COINBASE id
+    vpin_estimate: float = 0.30               # conservative default; Phase 55 → bridge VPIN
 
     def is_valid(self) -> bool:
         return (time.time() - self.ts) < self.ttl
@@ -565,6 +574,11 @@ class CoinbaseOracle:
         sig_type        = ORACLE_WHALE_BUY if side == "BUY" else ORACLE_WHALE_SELL
         cancel_buys_flg = (sig_type == ORACLE_WHALE_SELL)
 
+        # [P53] Derive conservative VPIN estimate from the multiplier.
+        # A large ratio (≥10×) = dominant directional flow = lower toxicity proxy.
+        # Clamped to [0.10, 0.55]: never auto-blocks, never falsely clean.
+        _vpin_est = round(max(0.10, min(0.55, 0.55 - (ratio - CB_WHALE_MULTIPLIER) * 0.03)), 4)
+
         sig = OracleSignal(
             symbol           = sym,
             signal_type      = sig_type,
@@ -574,6 +588,8 @@ class CoinbaseOracle:
             ts               = time.time(),
             ttl              = CB_SIGNAL_TTL_SECS,
             cancel_buys_flag = cancel_buys_flg,
+            mesh_node_id     = "coinbase_oracle",  # [P53] canonical NODE_COINBASE
+            vpin_estimate    = _vpin_est,           # [P53] toxicity proxy for mesh feed
         )
         self._signals[sym] = sig
 
@@ -640,6 +656,18 @@ class GlobalTapeAggregator:
 
     def binance_tps(self) -> float:
         return 0.0
+
+    def get_binance_pressure(self, symbol: str) -> None:
+        """[P53] Stub — real Binance tape feed not yet implemented.
+
+        Returns None so engine_supervisor P53 Binance node skips feed
+        rather than raising AttributeError.  When a Binance WebSocket
+        aggregator is wired in, return an object with attributes:
+            direction  : "long" | "short" | "neutral"
+            confidence : float  0–1
+            vpin_estimate : float  0–1
+        """
+        return None
 
     def combined_tps(self) -> float:
         return self.coinbase_tps() + self.binance_tps()
@@ -815,8 +843,8 @@ class Arbitrator:
         for ex in self._exs.values():
             try:
                 await ex.close()
-            except Exception:
-                pass
+            except Exception as _exc:
+                log.debug("[ARBITRATOR] cleanup: %s", _exc)
         log.info("Arbitrator closed.")
 
     @staticmethod
